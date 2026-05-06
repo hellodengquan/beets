@@ -131,7 +131,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: uv sync --extra docs --group lint
+        run: uv sync --group docs --group lint
 
       - name: Add Sphinx problem matchers
         run: |
