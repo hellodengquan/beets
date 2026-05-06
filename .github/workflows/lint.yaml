@@ -106,7 +106,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: poe install --only-group typing
+        run: poe install --only-group docs --only-group typing
 
       - name: Type check code
         uses: liskin/gh-problem-matcher-wrap@v3
@@ -131,7 +131,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: poe install --group docs --group lint
+        run: poe install --only-group docs --only-group lint
 
       - name: Add Sphinx problem matchers
         run: |
