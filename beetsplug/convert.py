@@ -33,7 +33,7 @@ from beets import plugins, ui, util
 from beets.exceptions import UserError
 from beets.library import Item, parse_query_string
 from beets.plugins import BeetsPlugin
-from beets.util import par_map
+from beets.util import par_map, preview
 from beets.util.artresizer import ArtResizer
 from beets.util.m3u import M3UFile
 from beets.util.pathformats import get_path_formats
@@ -213,6 +213,15 @@ class ConvertPlugin(BeetsPlugin):
             help=(
                 "force transcoding. Ignores no_convert, "
                 "never_convert_lossy_files, and max_bitrate"
+            ),
+        )
+        cmd.parser.add_option(
+            "--preview",
+            action="store_true",
+            default=False,
+            help=(
+                "preview destination paths with conflict and missing "
+                "field detection"
             ),
         )
         cmd.parser.add_album_option()
@@ -605,6 +614,28 @@ class ConvertPlugin(BeetsPlugin):
         self, lib: Library, opts: optparse.Values, args: list[str]
     ) -> None:
         self.config.set(vars(opts))
+
+        if opts.preview:
+            ext = self.command.ext
+            keep_new = self.config["keep_new"].get(bool)
+            transcode = self.should_transcode
+
+            def dest_getter(item):
+                dest = self.get_item_destination(item)
+                if not keep_new and transcode(item):
+                    dest = replace_ext(dest, ext)
+                return dest
+
+            preview.preview_paths(
+                lib,
+                args,
+                opts.album,
+                dest_getter,
+                path_formats=self.path_formats,
+                empty_msg="No matching items to convert.",
+            )
+            return
+
         pretend = self.pretend
 
         if opts.album:
