@@ -33,10 +33,11 @@ from beets import plugins, ui, util
 from beets.exceptions import UserError
 from beets.library import Item, parse_query_string
 from beets.plugins import BeetsPlugin
-from beets.util import par_map, preview
+from beets.util import par_map
 from beets.util.artresizer import ArtResizer
 from beets.util.m3u import M3UFile
 from beets.util.pathformats import get_path_formats
+from beets.util.preview import preview_paths
 from beetsplug._utils import art
 
 if TYPE_CHECKING:
@@ -626,7 +627,7 @@ class ConvertPlugin(BeetsPlugin):
                     dest = replace_ext(dest, ext)
                 return dest
 
-            preview.preview_paths(
+            preview_paths(
                 lib,
                 args,
                 opts.album,

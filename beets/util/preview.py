@@ -31,7 +31,7 @@ def _get_matched_path_format(obj, path_formats: list[PathFormat]):
     """Return the (query_string, path_format) that matches obj.
 
     Always falls back to the 'default' rule if no query-based rule matches.
-    Raises AssertionError if there is no 'default' rule in path_formats.
+    Raises UserError if there is no 'default' rule in path_formats.
     """
     from beets.library.queries import parse_query_string
 
@@ -44,7 +44,10 @@ def _get_matched_path_format(obj, path_formats: list[PathFormat]):
     for query, path_format in path_formats:
         if query == PF_KEY_DEFAULT:
             return query, path_format
-    raise AssertionError("no default path format")
+    raise UserError(
+        "No default path format found. "
+        "Please add a 'default' rule to your paths configuration."
+    )
 
 
 def _check_missing_fields(obj, field_names):

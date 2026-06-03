@@ -7,14 +7,9 @@ from typing import TYPE_CHECKING
 
 from beets import logging, ui
 from beets.exceptions import UserError
-from beets.util import (
-    MoveOperation,
-    displayable_path,
-    normpath,
-    preview,
-    syspath,
-)
+from beets.util import MoveOperation, displayable_path, normpath, syspath
 from beets.util.diff import colordiff
+from beets.util.preview import preview_paths
 
 from .utils import do_query
 
@@ -157,7 +152,7 @@ def move_func(lib, opts, args):
         def dest_getter(obj):
             return obj.destination(basedir=dest_bytes)
 
-        preview.preview_paths(lib, args, opts.album, dest_getter)
+        preview_paths(lib, args, opts.album, dest_getter)
         return
 
     move_items(

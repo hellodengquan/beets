@@ -51,7 +51,7 @@ from typing import (
 from unidecode import unidecode
 
 import beets
-from beets.util import hidden, preview  # noqa: F401
+from beets.util import hidden
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
