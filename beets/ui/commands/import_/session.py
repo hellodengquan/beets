@@ -198,6 +198,8 @@ class TerminalImportSession(importer.ImportSession):
                         ui.print_(colorize("red", "Import cancelled."))
                         return
 
+            self._preflight_tasks = all_tasks
+
         super().run()
 
     def choose_match(self, task):

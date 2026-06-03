@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 from beets import config
 from beets.importer import Action
 from beets.importer import tasks as importer_tasks
+from beets.importer.session import ImportSession
 from beets.importer.preflight import (
     REQUIRED_ALBUM_FIELDS,
     REQUIRED_ITEM_FIELDS,
@@ -666,6 +667,110 @@ class TestRunPreflight(ImportTestCase):
         summary = run_preflight(tasks, self.lib)
 
         self.assertEqual(summary.risk_level, "medium")
+
+
+class TestTaskSourceCache(ImportTestCase):
+    """Tests for ImportSession._task_source caching mechanism."""
+
+    db_on_disk = True
+
+    def setUp(self):
+        super().setUp()
+        self.prepare_album_for_import(2)
+        self.media_paths = [
+            bytestring_path(str(m.path)) for m in self.import_media
+        ]
+        self.album_path = bytestring_path(
+            os.path.dirname(str(self.import_media[0].path))
+        )
+        self.session = ImportSession(
+            self.lib, None, [self.album_path], None
+        )
+
+    def test_task_source_no_cache_uses_read_tasks(self):
+        self.assertIsNone(self.session._preflight_tasks)
+        self.session.set_config(config["import"])
+        tasks = list(self.session._task_source())
+        self.assertIsInstance(tasks, list)
+        self.assertTrue(len(tasks) > 0)
+
+    def test_task_source_with_cache_yields_cached_tasks(self):
+        cached = [MagicMock(name="task1"), MagicMock(name="task2")]
+        self.session._preflight_tasks = cached
+
+        yielded = list(self.session._task_source())
+
+        self.assertEqual(yielded, cached)
+
+    def test_task_source_clears_cache_after_use(self):
+        cached = [MagicMock(name="task1")]
+        self.session._preflight_tasks = cached
+
+        list(self.session._task_source())
+
+        self.assertIsNone(self.session._preflight_tasks)
+
+    def test_task_source_cache_consumed_once(self):
+        cached = [MagicMock(name="task1"), MagicMock(name="task2")]
+        self.session._preflight_tasks = cached
+
+        first = list(self.session._task_source())
+        self.assertEqual(first, cached)
+
+        self.session.set_config(config["import"])
+        second = list(self.session._task_source())
+        self.assertNotEqual(second, cached)
+
+    def test_task_source_empty_cache_falls_through(self):
+        self.session._preflight_tasks = []
+
+        tasks = list(self.session._task_source())
+
+        self.assertEqual(tasks, [])
+
+    def test_preflight_tasks_set_on_session_after_preflight(self):
+        from beets.ui.commands.import_.session import TerminalImportSession
+
+        session = TerminalImportSession(
+            self.lib, None, [self.album_path], None,
+            preflight_explicit=True,
+        )
+        session.set_config(config["import"])
+
+        self.assertIsNone(session._preflight_tasks)
+
+        task_gen = importer_tasks.SingletonImportTask(
+            None,
+            self._create_item_for_path(
+                self.media_paths[0],
+                artist="Artist",
+                title="Title",
+            ),
+        )
+
+        all_tasks = [task_gen]
+        real_tasks = [
+            t for t in all_tasks
+            if not isinstance(t, importer_tasks.SentinelImportTask)
+        ]
+
+        if real_tasks:
+            run_preflight(real_tasks, self.lib)
+
+        session._preflight_tasks = all_tasks
+
+        self.assertIsNotNone(session._preflight_tasks)
+        self.assertEqual(len(session._preflight_tasks), 1)
+
+    def _create_item_for_path(self, path, **kwargs):
+        from beets.library import Item
+
+        item = Item(self.lib, **kwargs)
+        if isinstance(path, bytes):
+            item.path = path
+        else:
+            item.path = bytestring_path(str(path))
+        return item
 
 
 def suite():

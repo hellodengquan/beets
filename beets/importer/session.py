@@ -57,6 +57,7 @@ class ImportSession:
     _is_resuming: dict[bytes, bool]
     _merged_items: set[PathBytes]
     _merged_dirs: set[PathBytes]
+    _preflight_tasks: list | None
 
     def __init__(
         self,
@@ -85,6 +86,7 @@ class ImportSession:
         self._is_resuming = {}
         self._merged_items = set()
         self._merged_dirs = set()
+        self._preflight_tasks = None
 
         # Normalize the paths.
         self.paths = list(map(normpath, paths or []))
@@ -188,16 +190,30 @@ class ImportSession:
     def choose_item(self, task: ImportTask):
         raise NotImplementedError
 
+    def _task_source(self):
+        """Return a generator that yields import tasks.
+
+        If ``_preflight_tasks`` has been set by a subclass (e.g. after
+        a preflight check consumed the task generator), those cached
+        tasks are yielded directly, avoiding a redundant filesystem
+        scan.  Otherwise, tasks are read from the filesystem or the
+        library query as usual.
+        """
+        if self._preflight_tasks is not None:
+            yield from self._preflight_tasks
+            self._preflight_tasks = None
+        elif self.query is None:
+            yield from stagefuncs.read_tasks(self)
+        else:
+            yield from stagefuncs.query_tasks(self)
+
     def run(self):
         """Run the import task."""
         self.logger.info("import started {}", time.asctime())
         self.set_config(config["import"])
 
         # Set up the pipeline.
-        if self.query is None:
-            stages = [stagefuncs.read_tasks(self)]
-        else:
-            stages = [stagefuncs.query_tasks(self)]
+        stages = [self._task_source()]
 
         # In pretend mode, just log what would otherwise be imported.
         if self.config["pretend"]:
