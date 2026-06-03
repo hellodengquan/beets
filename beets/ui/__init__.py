@@ -776,11 +776,15 @@ def _setup(
 
     plugins.load_plugins()
 
-    # Get the default subcommands.
     from beets.ui.commands import default_commands
 
-    subcommands = list(default_commands)
-    subcommands.extend(plugins.commands())
+    builtin_commands = list(default_commands)
+    plugin_commands = plugins.register_plugin_commands(
+        builtin_commands=builtin_commands,
+        fail_on_duplicate=False,
+    )
+
+    subcommands = builtin_commands + plugin_commands
 
     lib = _open_library(config)
     plugins.send("library_opened", lib=lib)

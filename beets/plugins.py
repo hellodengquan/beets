@@ -113,6 +113,41 @@ class PluginConflictError(Exception):
     """
 
 
+class DuplicateCommandError(Exception):
+    """Indicates that a plugin tries to register a command that already exists.
+
+    This can happen when two plugins define commands with the same name
+    or alias, or when a plugin command conflicts with a built-in command.
+    """
+
+    def __init__(
+        self,
+        command_name: str,
+        plugin_name: str,
+        existing_plugin: str | None = None,
+        is_builtin: bool = False,
+    ):
+        if is_builtin:
+            message = (
+                f"Plugin '{plugin_name}' cannot register command '{command_name}': "
+                "the command name conflicts with a built-in beets command"
+            )
+        else:
+            message = (
+                f"Plugin '{plugin_name}' cannot register command '{command_name}': "
+                f"the command is already registered by plugin '{existing_plugin}'"
+            )
+        super().__init__(message)
+
+
+class DisabledPluginNotification:
+    """Provides information about why a plugin was disabled."""
+
+    def __init__(self, name: str, reason: str):
+        self.name = name
+        self.reason = reason
+
+
 class PluginImportError(ImportError):
     """Indicates that a plugin could not be imported.
 
@@ -477,6 +512,8 @@ def _get_plugin(name: str) -> BeetsPlugin | None:
 
 
 _instances: list[BeetsPlugin] = []
+_disabled_plugins: list[DisabledPluginNotification] = []
+_command_registry: dict[str, str] = {}
 
 
 def load_plugins() -> None:
@@ -486,12 +523,133 @@ def load_plugins() -> None:
     instances globally. Emits a pluginload event after successful initialization
     to notify other components.
     """
+    global _disabled_plugins
     if not _instances:
+        beets.config.add({"disabled_plugins": []})
+        all_configured_plugins = unique_list(beets.config["plugins"].as_str_seq())
+        disabled_set = set(beets.config["disabled_plugins"].as_str_seq())
+
+        for name in disabled_set:
+            _disabled_plugins.append(
+                DisabledPluginNotification(name, "explicitly disabled via configuration")
+            )
+            log.info("Plugin '{}' is disabled", name)
+
         names = get_plugin_names()
         log.debug("Loading plugins: {}", ", ".join(sorted(names)))
-        _instances.extend(filter(None, map(_get_plugin, names)))
+
+        for name in all_configured_plugins:
+            if name not in names and name not in disabled_set:
+                _disabled_plugins.append(
+                    DisabledPluginNotification(name, "failed to load or import")
+                )
+
+        loaded_names = set()
+        for plugin in map(_get_plugin, names):
+            if plugin:
+                _instances.append(plugin)
+                loaded_names.add(plugin.name)
+
+        for name in names:
+            if name not in loaded_names:
+                _disabled_plugins.append(
+                    DisabledPluginNotification(name, "plugin class not found or invalid")
+                )
 
         send("pluginload")
+
+
+def get_disabled_plugins() -> list[DisabledPluginNotification]:
+    """Return a list of plugins that were not loaded and why."""
+    return list(_disabled_plugins)
+
+
+def get_registered_commands() -> dict[str, str]:
+    """Return the current command registry mapping command names to plugin names."""
+    return dict(_command_registry)
+
+
+def register_plugin_commands(
+    builtin_commands: Sequence["Subcommand"] | None = None,
+    fail_on_duplicate: bool = False,
+) -> list["Subcommand"]:
+    """Unified entry point for registering all plugin commands.
+
+    This function collects commands from all loaded plugins, checks for
+    duplicates (both between plugins and against built-in commands),
+    and provides clear feedback about any conflicts.
+
+    Args:
+        builtin_commands: A list of built-in commands to check against for
+            conflicts. If provided, plugin commands will be validated against
+            these commands' names and aliases.
+        fail_on_duplicate: If True, raise DuplicateCommandError on conflicts.
+            If False, log a warning and skip the duplicate command.
+
+    Returns:
+        A list of Subcommand objects from plugins, with duplicates removed.
+
+    Raises:
+        DuplicateCommandError: If fail_on_duplicate is True and a duplicate
+            command is detected.
+    """
+    global _command_registry
+    _command_registry = {}
+
+    builtin_names: set[str] = set()
+    if builtin_commands:
+        for cmd in builtin_commands:
+            builtin_names.add(cmd.name)
+            builtin_names.update(cmd.aliases)
+
+    result: list[Subcommand] = []
+
+    for plugin in find_plugins():
+        plugin_commands = plugin.commands()
+        if not plugin_commands:
+            continue
+
+        for cmd in plugin_commands:
+            all_names = {cmd.name} | set(cmd.aliases)
+
+            for name in all_names:
+                if name in builtin_names:
+                    error_msg = (
+                        f"Plugin '{plugin.name}' defines command '{name}' "
+                        "which conflicts with a built-in beets command"
+                    )
+                    if fail_on_duplicate:
+                        raise DuplicateCommandError(
+                            name, plugin.name, is_builtin=True
+                        )
+                    else:
+                        log.warning(error_msg + " - skipping")
+                        break
+
+                if name in _command_registry:
+                    existing_plugin = _command_registry[name]
+                    error_msg = (
+                        f"Plugin '{plugin.name}' defines command '{name}' "
+                        f"which is already defined by plugin '{existing_plugin}'"
+                    )
+                    if fail_on_duplicate:
+                        raise DuplicateCommandError(
+                            name, plugin.name, existing_plugin=existing_plugin
+                        )
+                    else:
+                        log.warning(error_msg + " - skipping")
+                        break
+            else:
+                for name in all_names:
+                    _command_registry[name] = plugin.name
+                result.append(cmd)
+                log.debug(
+                    "Registered command '{}' from plugin '{}'",
+                    cmd.name,
+                    plugin.name,
+                )
+
+    return result
 
 
 def find_plugins() -> Iterable[BeetsPlugin]:

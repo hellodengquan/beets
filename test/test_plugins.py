@@ -602,3 +602,165 @@ class TestMusicBrainzPluginLoading:
             "musicbrainz.enabled' configuration option is deprecated"
             in caplog.text
         )
+
+
+class TestPluginCommandRegistration(PytestPluginTestHelper):
+    """Tests for the unified plugin command registration system."""
+
+    def test_duplicate_command_between_plugins_warning(self, caplog):
+        """Test that duplicate commands between plugins produce a warning."""
+
+        class PluginA(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("testcmd", help="test command A")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        class PluginB(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("testcmd", help="test command B")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(PluginA)
+        self.register_plugin(PluginB)
+
+        with caplog.at_level(logging.WARNING):
+            registered = plugins.register_plugin_commands(fail_on_duplicate=False)
+
+        assert len(registered) == 1
+        assert "already defined by plugin" in caplog.text
+
+    def test_duplicate_command_between_plugins_error(self):
+        """Test that duplicate commands between plugins raise an error when fail_on_duplicate is True."""
+
+        class PluginA(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("testcmd", help="test command A")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        class PluginB(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("testcmd", help="test command B")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(PluginA)
+        self.register_plugin(PluginB)
+
+        with pytest.raises(
+            plugins.DuplicateCommandError, match="already registered by plugin"
+        ):
+            plugins.register_plugin_commands(fail_on_duplicate=True)
+
+    def test_duplicate_alias_between_plugins_warning(self, caplog):
+        """Test that duplicate aliases between plugins produce a warning."""
+
+        class PluginA(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("cmda", help="command A", aliases=["tc"])
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        class PluginB(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("cmdb", help="command B", aliases=["tc"])
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(PluginA)
+        self.register_plugin(PluginB)
+
+        with caplog.at_level(logging.WARNING):
+            registered = plugins.register_plugin_commands(fail_on_duplicate=False)
+
+        assert len(registered) == 1
+        assert "already defined by plugin" in caplog.text
+
+    def test_duplicate_with_builtin_command_warning(self, caplog):
+        """Test that commands conflicting with built-in commands produce a warning."""
+
+        class TestPlugin(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("import", help="override import")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(TestPlugin)
+
+        builtin_cmd = ui.Subcommand("import", help="builtin import")
+        builtin_cmd.func = lambda lib, opts, args: None
+
+        with caplog.at_level(logging.WARNING):
+            registered = plugins.register_plugin_commands(
+                builtin_commands=[builtin_cmd], fail_on_duplicate=False
+            )
+
+        assert len(registered) == 0
+        assert "conflicts with a built-in beets command" in caplog.text
+
+    def test_get_registered_commands(self):
+        """Test that get_registered_commands returns the command registry."""
+
+        class TestPlugin(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("mycmd", help="my command", aliases=["mc"])
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(TestPlugin)
+        plugins.register_plugin_commands(fail_on_duplicate=False)
+
+        registry = plugins.get_registered_commands()
+        assert "mycmd" in registry
+        assert "mc" in registry
+        assert registry["mycmd"] == "test_plugins"
+        assert registry["mc"] == "test_plugins"
+
+
+class TestDisabledPluginsNotification(PytestPluginTestHelper):
+    """Tests for disabled plugin notification system."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_state(self):
+        """Reset plugin state before each test."""
+        plugins._instances.clear()
+        plugins._disabled_plugins.clear()
+        yield
+        plugins._instances.clear()
+        plugins._disabled_plugins.clear()
+
+    def test_disabled_plugin_logged(self, caplog):
+        """Test that disabled plugins are logged."""
+        self.config["plugins"] = ["test_plugin"]
+        self.config["disabled_plugins"] = ["test_plugin"]
+
+        with caplog.at_level(logging.INFO):
+            plugins.load_plugins()
+
+        assert "Plugin 'test_plugin' is disabled" in caplog.text
+
+    def test_get_disabled_plugins_returns_list(self):
+        """Test that get_disabled_plugins returns a list of notifications."""
+        self.config["plugins"] = ["test_plugin"]
+        self.config["disabled_plugins"] = ["test_plugin"]
+
+        plugins.load_plugins()
+
+        disabled = plugins.get_disabled_plugins()
+        assert isinstance(disabled, list)
+        assert len(disabled) >= 1
+
+    def test_disabled_plugin_notification_has_reason(self):
+        """Test that disabled plugin notifications have a reason."""
+        self.config["plugins"] = ["test_plugin"]
+        self.config["disabled_plugins"] = ["test_plugin"]
+
+        plugins.load_plugins()
+
+        disabled = plugins.get_disabled_plugins()
+        for notification in disabled:
+            assert hasattr(notification, "name")
+            assert hasattr(notification, "reason")
+            assert notification.reason is not None
