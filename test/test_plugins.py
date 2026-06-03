@@ -764,3 +764,157 @@ class TestDisabledPluginsNotification(PytestPluginTestHelper):
             assert hasattr(notification, "name")
             assert hasattr(notification, "reason")
             assert notification.reason is not None
+
+
+class TestCommandConflictTracking(PytestPluginTestHelper):
+    """Tests for the CommandConflict data class and get_command_conflicts."""
+
+    def test_get_command_conflicts_empty_when_no_conflicts(self):
+        """Test that get_command_conflicts returns empty when there are none."""
+
+        class TestPlugin(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("uniquecmd", help="unique")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(TestPlugin)
+        plugins.register_plugin_commands(fail_on_duplicate=False)
+
+        assert plugins.get_command_conflicts() == []
+
+    def test_get_command_conflicts_captures_plugin_duplicate(self):
+        """Test that get_command_conflicts captures conflicts between plugins."""
+
+        class PluginA(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("dupcmd", help="a")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        class PluginB(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("dupcmd", help="b")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(PluginA)
+        self.register_plugin(PluginB)
+        plugins.register_plugin_commands(fail_on_duplicate=False)
+
+        conflicts = plugins.get_command_conflicts()
+        assert len(conflicts) == 1
+        assert conflicts[0].command_name == "dupcmd"
+        assert conflicts[0].is_builtin is False
+        assert conflicts[0].existing_plugin is not None
+
+    def test_get_command_conflicts_captures_builtin_duplicate(self):
+        """Test that get_command_conflicts captures conflicts with builtins."""
+
+        class TestPlugin(plugins.BeetsPlugin):
+            def commands(self):
+                cmd = ui.Subcommand("import", help="override")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(TestPlugin)
+
+        builtin_cmd = ui.Subcommand("import", help="builtin import")
+        builtin_cmd.func = lambda lib, opts, args: None
+        plugins.register_plugin_commands(
+            builtin_commands=[builtin_cmd], fail_on_duplicate=False
+        )
+
+        conflicts = plugins.get_command_conflicts()
+        assert len(conflicts) == 1
+        assert conflicts[0].command_name == "import"
+        assert conflicts[0].is_builtin is True
+
+    def test_command_conflict_str_builtin(self):
+        """Test CommandConflict __str__ for builtin conflict."""
+        conflict = plugins.CommandConflict(
+            "import", "myplug", is_builtin=True
+        )
+        assert "conflicts with a built-in beets command" in str(conflict)
+
+    def test_command_conflict_str_plugin(self):
+        """Test CommandConflict __str__ for plugin conflict."""
+        conflict = plugins.CommandConflict(
+            "cmd", "plug_b", existing_plugin="plug_a"
+        )
+        assert "conflicts with plugin 'plug_a'" in str(conflict)
+
+
+class TestPrintPluginNotices(PytestPluginTestHelper):
+    """Tests for _print_plugin_notices CLI-visible output."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_state(self):
+        """Reset plugin state before each test."""
+        plugins._instances.clear()
+        plugins._disabled_plugins.clear()
+        plugins._command_conflicts.clear()
+        yield
+        plugins._instances.clear()
+        plugins._disabled_plugins.clear()
+        plugins._command_conflicts.clear()
+
+    def test_print_plugin_notices_disabled_plugins(self, capsys):
+        """Test that _print_plugin_notices prints disabled plugins to stderr."""
+        from beets.ui import _print_plugin_notices
+
+        plugins._disabled_plugins.append(
+            plugins.DisabledPluginNotification(
+                "myplug", "explicitly disabled via configuration"
+            )
+        )
+
+        _print_plugin_notices()
+
+        captured = capsys.readouterr()
+        assert "Disabled plugins:" in captured.err
+        assert "myplug" in captured.err
+        assert "explicitly disabled via configuration" in captured.err
+
+    def test_print_plugin_notices_command_conflicts(self, capsys):
+        """Test that _print_plugin_notices prints conflicts to stderr."""
+        from beets.ui import _print_plugin_notices
+
+        plugins._command_conflicts.append(
+            plugins.CommandConflict("dupcmd", "plug_b", existing_plugin="plug_a")
+        )
+
+        _print_plugin_notices()
+
+        captured = capsys.readouterr()
+        assert "Command conflicts detected:" in captured.err
+        assert "dupcmd" in captured.err
+        assert "plug_a" in captured.err
+
+    def test_print_plugin_notices_no_output_when_all_ok(self, capsys):
+        """Test that _print_plugin_notices produces no output when there are no issues."""
+        from beets.ui import _print_plugin_notices
+
+        _print_plugin_notices()
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_print_plugin_notices_both(self, capsys):
+        """Test that _print_plugin_notices prints both sections when both exist."""
+        from beets.ui import _print_plugin_notices
+
+        plugins._disabled_plugins.append(
+            plugins.DisabledPluginNotification("plug1", "disabled for test")
+        )
+        plugins._command_conflicts.append(
+            plugins.CommandConflict("cmd1", "plug2", existing_plugin="plug3")
+        )
+
+        _print_plugin_notices()
+
+        captured = capsys.readouterr()
+        assert "Disabled plugins:" in captured.err
+        assert "Command conflicts detected:" in captured.err
+        assert "plug1" in captured.err
+        assert "cmd1" in captured.err

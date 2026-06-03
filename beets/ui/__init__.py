@@ -792,6 +792,30 @@ def _setup(
     return subcommands, lib
 
 
+def _print_plugin_notices() -> None:
+    """Print notices about disabled plugins and command conflicts to stderr.
+
+    This ensures users can see plugin status issues even without verbose
+    logging enabled.
+    """
+    disabled = plugins.get_disabled_plugins()
+    if disabled:
+        print("", file=sys.stderr)
+        print("Disabled plugins:", file=sys.stderr)
+        for notice in disabled:
+            print(f"  {notice.name} ({notice.reason})", file=sys.stderr)
+
+    conflicts = plugins.get_command_conflicts()
+    if conflicts:
+        print("", file=sys.stderr)
+        print("Command conflicts detected:", file=sys.stderr)
+        for conflict in conflicts:
+            print(f"  {conflict}", file=sys.stderr)
+
+    if disabled or conflicts:
+        print("", file=sys.stderr)
+
+
 def _configure(options):
     """Amend the global configuration object with command line options."""
     # Add any additional config files specified with --config. This
@@ -944,6 +968,7 @@ def _raw_main(args: list[str] | None) -> None:
         return config_edit(options)
 
     subcommands, lib = _setup(options)
+    _print_plugin_notices()
     parser.add_subcommand(*subcommands)
 
     subcommand, suboptions, subargs = parser.parse_subcommand(subargs)
