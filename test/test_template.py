@@ -16,6 +16,8 @@
 
 import unittest
 
+import pytest
+
 from beets.util import functemplate
 
 
@@ -270,135 +272,156 @@ class EvalTest(unittest.TestCase):
         assert self._eval("%len{}") == "0"
 
 
-class BoundaryTest(unittest.TestCase):
-    def _eval(self, template, values=None, functions=None):
-        values = values or {"foo": "bar", "baz": "BaR"}
-        functions = functions or {"lower": str.lower, "len": len}
-        return functemplate.Template(template).substitute(values, functions)
-
-    def test_empty_template(self):
-        assert self._eval("") == ""
-
-    def test_whitespace_only_template(self):
-        assert self._eval("   ") == "   "
-        assert self._eval("\n\t") == "\n\t"
-
-    def test_undefined_variable_fallback(self):
-        assert self._eval("$undefined") == "$undefined"
-
-    def test_undefined_variable_in_braces_fallback(self):
-        assert self._eval("${undefined}") == "${undefined}"
-
-    def test_undefined_function_fallback(self):
-        assert self._eval("%undefined{}") == "%undefined{}"
-
-    def test_undefined_function_with_args_fallback(self):
-        assert self._eval("%undefined{foo,bar}") == "%undefined{foo,bar}"
-
-    def test_mixed_defined_and_undefined_variables(self):
-        assert self._eval("$foo $undefined $baz") == "bar $undefined BaR"
-
-    def test_mixed_defined_and_undefined_functions(self):
-        assert self._eval("%lower{FOO} %undefined{TEST}") == "foo %undefined{TEST}"
-
-    def test_empty_values_dict(self):
-        result = functemplate.Template("$foo").substitute({}, {})
-        assert result == "$foo"
-
-    def test_empty_functions_dict(self):
-        result = functemplate.Template("%lower{FOO}").substitute({}, {})
-        assert result == "%lower{FOO}"
-
-    def test_function_exception_fallback(self):
-        def bad_func(x):
-            raise RuntimeError("test error")
-
-        result = functemplate.Template("%bad{foo}").substitute({}, {"bad": bad_func})
-        assert isinstance(result, str)
-        assert "RuntimeError" in result or "test error" in result
-
-    def test_none_value_handling(self):
-        result = functemplate.Template("$val").substitute({"val": None}, {})
-        assert "None" in result or result == "$val"
-
-    def test_numeric_value_conversion(self):
-        result = functemplate.Template("$num").substitute({"num": 42}, {})
-        assert result == "42"
-
-    def test_boolean_value_conversion(self):
-        result = functemplate.Template("$bool").substitute({"bool": True}, {})
-        assert result == "True"
-
-    def test_special_characters_in_values(self):
-        values = {"special": "$%{},/\\\n\t"}
-        result = functemplate.Template("$special").substitute(values, {})
-        assert result == "$%{},/\\\n\t"
-
-    def test_unicode_values(self):
-        values = {"unicode": "你好世界 🌍"}
-        result = functemplate.Template("$unicode").substitute(values, {})
-        assert result == "你好世界 🌍"
-
-    def test_function_returning_none(self):
-        def none_func(x):
-            return None
-
-        result = functemplate.Template("%none{test}").substitute({}, {"none": none_func})
-        assert "None" in result
-
-    def test_function_with_many_args(self):
-        def concat(*args):
-            return "|".join(args)
-
-        result = functemplate.Template("%concat{a,b,c,d,e}").substitute(
-            {}, {"concat": concat}
-        )
-        assert result == "a|b|c|d|e"
-
-    def test_deeply_nested_functions(self):
-        template = "%lower{%lower{%lower{%lower{FOO}}}}"
-        result = self._eval(template)
-        assert result == "foo"
-
-    def test_long_template(self):
-        long_text = "A" * 1000 + "$foo" + "B" * 1000
-        result = self._eval(long_text)
-        assert len(result) >= 2000
-        assert "bar" in result or "$foo" in result
-
-    def test_consecutive_escaped_characters(self):
-        assert self._eval("$$$$$$") == "$$$"
-
-    def test_escape_at_boundaries(self):
-        assert self._eval("$$foo") == "$foo"
-        assert self._eval("foo$$") == "foo$"
-        assert self._eval("$$$foo") == "$bar"
+DEFAULT_VALUES = {"foo": "bar", "baz": "BaR"}
+DEFAULT_FUNCTIONS = {"lower": str.lower, "len": len}
 
 
-class FallbackMechanismTest(unittest.TestCase):
-    def test_compiled_fallback_to_interpret(self):
-        def bad_func(x):
-            raise ValueError("compiled error")
+def _eval_template(template_str, values=None, functions=None):
+    values = values or DEFAULT_VALUES
+    functions = functions or DEFAULT_FUNCTIONS
+    return functemplate.Template(template_str).substitute(values, functions)
 
-        template = functemplate.Template("%bad{test}")
-        result = template.substitute({}, {"bad": bad_func})
 
-        assert isinstance(result, str)
-        assert "ValueError" in result or "compiled error" in result
+@pytest.mark.parametrize(
+    "template_str,expected",
+    [
+        ("", ""),
+        ("   ", "   "),
+        ("\n\t", "\n\t"),
+        ("$undefined", "$undefined"),
+        ("${undefined}", "${undefined}"),
+        ("%undefined{}", "%undefined{}"),
+        ("%undefined{foo,bar}", "%undefined{foo,bar}"),
+        ("$$$$$$", "$$$"),
+        ("$$foo", "$foo"),
+        ("foo$$", "foo$"),
+    ],
+    ids=[
+        "empty",
+        "whitespace",
+        "newline_tab",
+        "undefined_var",
+        "undefined_var_braces",
+        "undefined_func",
+        "undefined_func_args",
+        "consecutive_escaped",
+        "escape_at_start",
+        "escape_at_end",
+    ],
+)
+def test_boundary_template_substitution(template_str, expected):
+    assert _eval_template(template_str) == expected
 
-    def test_missing_key_in_compiled_fallback(self):
-        template = functemplate.Template("$missing")
-        result = template.substitute({}, {})
 
-        assert result == "$missing"
+def test_boundary_mixed_defined_and_undefined_variables():
+    assert _eval_template("$foo $undefined $baz") == "bar $undefined BaR"
 
-    def test_compiled_and_interpret_consistency(self):
-        values = {"foo": "bar", "num": 42}
-        functions = {"upper": str.upper, "len": len}
-        template_str = "$foo %upper{hello} $num %len{test}"
 
-        template = functemplate.Template(template_str)
-        compiled_result = template.substitute(values, functions)
-        interpret_result = template.interpret(values, functions)
+def test_boundary_mixed_defined_and_undefined_functions():
+    assert _eval_template("%lower{FOO} %undefined{TEST}") == "foo %undefined{TEST}"
 
-        assert compiled_result == interpret_result
+
+def test_boundary_empty_values_dict():
+    result = functemplate.Template("$foo").substitute({}, {})
+    assert result == "$foo"
+
+
+def test_boundary_empty_functions_dict():
+    result = functemplate.Template("%lower{FOO}").substitute({}, {})
+    assert result == "%lower{FOO}"
+
+
+def test_boundary_function_exception_fallback():
+    def bad_func(x):
+        raise RuntimeError("test error")
+
+    result = functemplate.Template("%bad{foo}").substitute({}, {"bad": bad_func})
+    assert isinstance(result, str)
+    assert "RuntimeError" in result or "test error" in result
+
+
+@pytest.mark.parametrize(
+    "var_name,var_value,expected",
+    [
+        ("num", 42, "42"),
+        ("bool", True, "True"),
+        ("special", "$%{},/\\\n\t", "$%{},/\\\n\t"),
+        ("unicode", "你好世界 🌍", "你好世界 🌍"),
+    ],
+    ids=["numeric", "boolean", "special_chars", "unicode"],
+)
+def test_boundary_value_types(var_name, var_value, expected):
+    result = functemplate.Template(f"${var_name}").substitute(
+        {var_name: var_value}, {}
+    )
+    assert result == expected
+
+
+def test_boundary_none_value_handling():
+    result = functemplate.Template("$val").substitute({"val": None}, {})
+    assert "None" in result or result == "$val"
+
+
+def test_boundary_function_returning_none():
+    def none_func(x):
+        return None
+
+    result = functemplate.Template("%none{test}").substitute({}, {"none": none_func})
+    assert "None" in result
+
+
+def test_boundary_function_with_many_args():
+    def concat(*args):
+        return "|".join(args)
+
+    result = functemplate.Template("%concat{a,b,c,d,e}").substitute(
+        {}, {"concat": concat}
+    )
+    assert result == "a|b|c|d|e"
+
+
+def test_boundary_deeply_nested_functions():
+    template = "%lower{%lower{%lower{%lower{FOO}}}}"
+    result = _eval_template(template)
+    assert result == "foo"
+
+
+def test_boundary_long_template():
+    long_text = "A" * 1000 + "$foo" + "B" * 1000
+    result = _eval_template(long_text)
+    assert len(result) >= 2000
+    assert "bar" in result or "$foo" in result
+
+
+def test_boundary_escape_at_boundaries_variable():
+    assert _eval_template("$$$foo") == "$bar"
+
+
+def test_fallback_compiled_fallback_to_interpret():
+    def bad_func(x):
+        raise ValueError("compiled error")
+
+    template = functemplate.Template("%bad{test}")
+    result = template.substitute({}, {"bad": bad_func})
+
+    assert isinstance(result, str)
+    assert "ValueError" in result or "compiled error" in result
+
+
+def test_fallback_missing_key_in_compiled_fallback():
+    template = functemplate.Template("$missing")
+    result = template.substitute({}, {})
+
+    assert result == "$missing"
+
+
+def test_fallback_compiled_and_interpret_consistency():
+    values = {"foo": "bar", "num": 42}
+    functions = {"upper": str.upper, "len": len}
+    template_str = "$foo %upper{hello} $num %len{test}"
+
+    template = functemplate.Template(template_str)
+    compiled_result = template.substitute(values, functions)
+    interpret_result = template.interpret(values, functions)
+
+    assert compiled_result == interpret_result
