@@ -125,7 +125,7 @@ def _check_path_conflict(item: Item, lib_dir: bytes) -> bool:
         return False
     try:
         item_path = util.normpath(item.path)
-        return lib_dir in util.ancestry(item_path)
+        return item_path == lib_dir or lib_dir in util.ancestry(item_path)
     except Exception:
         return False
 

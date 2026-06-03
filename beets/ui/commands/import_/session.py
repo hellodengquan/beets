@@ -162,13 +162,7 @@ class TerminalImportSession(importer.ImportSession):
 
     def run(self):
         """Run the import task with preflight check."""
-        self.logger.info("import started {}", time.asctime())
         self.set_config(config["import"])
-
-        if self.query is None:
-            task_generator = stagefuncs.read_tasks(self)
-        else:
-            task_generator = stagefuncs.query_tasks(self)
 
         should_preflight = config["import"]["preflight"].get(bool)
         is_quiet = config["import"]["quiet"].get(bool)
@@ -181,6 +175,11 @@ class TerminalImportSession(importer.ImportSession):
                 should_preflight = False
 
         if should_preflight:
+            if self.query is None:
+                task_generator = stagefuncs.read_tasks(self)
+            else:
+                task_generator = stagefuncs.query_tasks(self)
+
             all_tasks = list(task_generator)
             real_tasks = [
                 t for t in all_tasks
@@ -199,47 +198,7 @@ class TerminalImportSession(importer.ImportSession):
                         ui.print_(colorize("red", "Import cancelled."))
                         return
 
-                def task_replay():
-                    yield from all_tasks
-
-                task_generator = task_replay()
-
-        if self.query is None:
-            stages = [task_generator]
-        else:
-            stages = [task_generator]
-
-        if self.config["pretend"]:
-            stages += [stagefuncs.log_files(self)]
-        else:
-            if self.config["group_albums"] and not self.config["singletons"]:
-                stages += [stagefuncs.group_albums(self)]
-
-            if self.config["autotag"]:
-                stages += [
-                    stagefuncs.lookup_candidates(self),
-                    stagefuncs.user_query(self),
-                ]
-            else:
-                stages += [stagefuncs.import_asis(self)]
-
-            for stage_func in plugins.early_import_stages():
-                stages.append(stagefuncs.plugin_stage(self, stage_func))
-            for stage_func in plugins.import_stages():
-                stages.append(stagefuncs.plugin_stage(self, stage_func))
-
-            stages += [stagefuncs.manipulate_files(self)]
-
-        pl = pipeline.Pipeline(stages)
-
-        plugins.send("import_begin", session=self)
-        try:
-            if config["threaded"]:
-                pl.run_parallel(QUEUE_SIZE)
-            else:
-                pl.run_sequential()
-        except importer.ImportAbortError:
-            pass
+        super().run()
 
     def choose_match(self, task):
         """Given an initial autotagging of items, go through an interactive
