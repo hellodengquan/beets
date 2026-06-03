@@ -426,7 +426,8 @@ class ImportTask(BaseImportTask):
 
         Returns a dictionary mapping item paths to lists of missing field names.
         """
-        from .preflight import REQUIRED_ITEM_FIELDS, REQUIRED_ALBUM_FIELDS
+        REQUIRED_ITEM_FIELDS = ("artist", "title")
+        REQUIRED_ALBUM_FIELDS = ("albumartist", "album")
 
         missing: dict[bytes, list[str]] = {}
         for item in self.items:
@@ -757,7 +758,7 @@ class SingletonImportTask(ImportTask):
 
         Returns a dictionary mapping the item path to a list of missing field names.
         """
-        from .preflight import REQUIRED_ITEM_FIELDS
+        REQUIRED_ITEM_FIELDS = ("artist", "title")
 
         missing: dict[bytes, list[str]] = {}
         item_missing = []

@@ -47,9 +47,11 @@ def parse_logfiles(logfiles):
             ) from err
 
 
-def import_files(lib, paths: list[bytes], query):
+def import_files(lib, paths: list[bytes], query, preflight_explicit=None):
     """Import the files in the given list of paths or matching the
     query.
+
+    preflight_explicit: whether preflight was explicitly set via CLI
     """
     # Check parameter consistency.
     if config["import"]["quiet"] and config["import"]["timid"]:
@@ -72,7 +74,9 @@ def import_files(lib, paths: list[bytes], query):
     if config["import"]["resume"].get() == "ask" and config["import"]["quiet"]:
         config["import"]["resume"] = False
 
-    session = TerminalImportSession(lib, loghandler, paths, query)
+    session = TerminalImportSession(
+        lib, loghandler, paths, query, preflight_explicit=preflight_explicit
+    )
     session.run()
 
     # Emit event.
@@ -81,6 +85,8 @@ def import_files(lib, paths: list[bytes], query):
 
 def import_func(lib, opts, args: list[str]):
     config["import"].set_args(opts)
+
+    preflight_explicit = opts.preflight
 
     # Special case: --copy flag suppresses import_move (which would
     # otherwise take precedence).
@@ -129,7 +135,7 @@ def import_func(lib, opts, args: list[str]):
         if not byte_paths:
             raise UserError("none of the paths are importable")
 
-    import_files(lib, byte_paths, query)
+    import_files(lib, byte_paths, query, preflight_explicit=preflight_explicit)
 
 
 def _store_dict(option, opt_str, value, parser):

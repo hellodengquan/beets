@@ -8,10 +8,7 @@ from beets import config, importer, logging, plugins, ui
 from beets.autotag.hooks import AlbumMatch, TrackMatch
 from beets.autotag.match import Proposal, Recommendation, tag_album, tag_item
 from beets.importer import stages as stagefuncs
-from beets.importer.preflight import (
-    format_preflight_summary,
-    run_preflight,
-)
+from beets.importer.preflight import PreflightSummary, run_preflight
 from beets.importer.session import QUEUE_SIZE
 from beets.util import PromptChoice, displayable_path, pipeline
 from beets.util.color import colorize
@@ -23,8 +20,145 @@ from .display import show_change, show_item_change
 log = logging.getLogger("beets")
 
 
+def format_preflight_summary_cli(summary: PreflightSummary) -> str:
+    """CLI-specific formatting of preflight summary with colors and text."""
+    lines = []
+
+    risk_colors = {
+        "low": "green",
+        "medium": "yellow",
+        "high": "red",
+    }
+    risk_color = risk_colors.get(summary.risk_level, "text_default")
+    risk_text = colorize(risk_color, summary.risk_level.upper())
+
+    lines.append("")
+    lines.append(colorize("text_highlight", "=" * 60))
+    lines.append(
+        colorize(
+            "text_highlight",
+            f"  Import Preflight Summary - Risk Level: {risk_text}",
+        )
+    )
+    lines.append(colorize("text_highlight", "=" * 60))
+    lines.append("")
+
+    lines.append(colorize("text_highlight_minor", "  Statistics:"))
+    lines.append(f"    Total tasks: {summary.total_tasks}")
+    lines.append(f"      Album imports: {summary.album_tasks}")
+    lines.append(f"      Singleton imports: {summary.singleton_tasks}")
+    lines.append(f"    Total tracks: {summary.total_items}")
+    lines.append("")
+
+    lines.append(colorize("text_highlight_minor", "  Planned Actions:"))
+    actions = []
+    if summary.will_copy:
+        actions.append(colorize("cyan", "Copy files"))
+    if summary.will_move:
+        actions.append(colorize("yellow", "Move files"))
+    if summary.will_write:
+        actions.append(colorize("cyan", "Write tags"))
+    if summary.will_delete:
+        actions.append(colorize("red", "Delete source files"))
+    if not actions:
+        actions.append(colorize("text_default", "Add to database only"))
+    lines.append(f"    {', '.join(actions)}")
+    lines.append("")
+
+    if summary.has_issues:
+        lines.append(colorize("text_highlight_minor", "  Detected Issues:"))
+
+        if summary.tasks_with_duplicates > 0:
+            dup_color = "yellow" if summary.tasks_with_duplicates > 0 else "text_default"
+            lines.append(
+                colorize(
+                    dup_color,
+                    f"    Duplicates: {summary.tasks_with_duplicates} tasks, "
+                    f"{summary.total_duplicates} total",
+                )
+            )
+
+        if summary.tasks_with_path_conflicts > 0:
+            pc_color = "red" if summary.tasks_with_path_conflicts > 0 else "text_default"
+            lines.append(
+                colorize(
+                    pc_color,
+                    f"    Path conflicts: {summary.tasks_with_path_conflicts} tasks, "
+                    f"{summary.total_path_conflicts} total",
+                )
+            )
+
+        if summary.tasks_with_missing_tags > 0:
+            mt_color = "yellow" if summary.tasks_with_missing_tags > 0 else "text_default"
+            lines.append(
+                colorize(
+                    mt_color,
+                    f"    Missing tags: {summary.tasks_with_missing_tags} tasks, "
+                    f"{summary.total_missing_tags} total",
+                )
+            )
+        lines.append("")
+
+        lines.append(colorize("text_highlight_minor", "  Details:"))
+        for i, result in enumerate(summary.task_results, 1):
+            if not (
+                result.has_duplicates
+                or result.has_path_conflicts
+                or result.has_missing_tags
+            ):
+                continue
+
+            task_type = "Album" if result.is_album else "Singleton"
+            path_str = displayable_path(result.task.paths[0])
+            if len(path_str) > 50:
+                path_str = "..." + path_str[-47:]
+
+            issues = []
+            if result.has_duplicates:
+                issues.append(f"dup({result.duplicate_count})")
+            if result.has_path_conflicts:
+                issues.append(f"conflict({result.path_conflict_count})")
+            if result.has_missing_tags:
+                issues.append(f"missing({result.missing_tag_count})")
+
+            issue_str = ", ".join(issues)
+            lines.append(
+                f"    {i:2d}. [{task_type}] {path_str}"
+            )
+            lines.append(
+                f"        {colorize('yellow', issue_str)}"
+            )
+
+            for item in result.items:
+                item_issues = []
+                if item.is_duplicate:
+                    item_issues.append("duplicate")
+                if item.path_conflict:
+                    item_issues.append("path conflict")
+                if item.missing_tags:
+                    item_issues.append(f"missing: {', '.join(item.missing_tags)}")
+                if item_issues:
+                    item_path = displayable_path(item.path)
+                    if len(item_path) > 45:
+                        item_path = "..." + item_path[-42:]
+                    lines.append(
+                        f"          - {item_path}: "
+                        f"{colorize('yellow', ', '.join(item_issues))}"
+                    )
+        lines.append("")
+
+    lines.append(colorize("text_highlight", "=" * 60))
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 class TerminalImportSession(importer.ImportSession):
     """An import session that runs in a terminal."""
+
+    def __init__(self, *args, preflight_explicit=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.preflight_explicit = preflight_explicit
 
     def run(self):
         """Run the import task with preflight check."""
@@ -37,8 +171,14 @@ class TerminalImportSession(importer.ImportSession):
             task_generator = stagefuncs.query_tasks(self)
 
         should_preflight = config["import"]["preflight"].get(bool)
-        should_preflight &= not config["import"]["quiet"].get(bool)
-        should_preflight &= not config["import"]["pretend"].get(bool)
+        is_quiet = config["import"]["quiet"].get(bool)
+        is_pretend = config["import"]["pretend"].get(bool)
+
+        if self.preflight_explicit is not None:
+            should_preflight = self.preflight_explicit
+        else:
+            if should_preflight and (is_quiet or is_pretend):
+                should_preflight = False
 
         if should_preflight:
             all_tasks = list(task_generator)
@@ -49,21 +189,14 @@ class TerminalImportSession(importer.ImportSession):
 
             if real_tasks:
                 summary = run_preflight(real_tasks, self.lib)
-                ui.print_(format_preflight_summary(summary))
+                ui.print_(format_preflight_summary_cli(summary))
 
                 if summary.has_issues:
                     confirm = ui.input_yn(
-                        "检测到潜在问题，是否继续导入？ (Y/n)"
+                        "Potential issues detected. Continue import? (Y/n)"
                     )
                     if not confirm:
-                        ui.print_(colorize("red", "导入已取消。"))
-                        return
-                else:
-                    confirm = ui.input_yn(
-                        "预检完成，未发现问题。是否继续导入？ (Y/n)"
-                    )
-                    if not confirm:
-                        ui.print_(colorize("yellow", "导入已取消。"))
+                        ui.print_(colorize("red", "Import cancelled."))
                         return
 
                 def task_replay():
