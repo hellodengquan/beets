@@ -324,6 +324,19 @@ import_cmd.parser.add_option(
     help="just print the files to import",
 )
 import_cmd.parser.add_option(
+    "--preflight",
+    dest="preflight",
+    action="store_true",
+    default=None,
+    help="enable preflight check before import (default)",
+)
+import_cmd.parser.add_option(
+    "--no-preflight",
+    dest="preflight",
+    action="store_false",
+    help="disable preflight check before import",
+)
+import_cmd.parser.add_option(
     "-S",
     "--search-id",
     dest="search_ids",

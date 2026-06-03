@@ -421,6 +421,27 @@ class ImportTask(BaseImportTask):
 
         return duplicates
 
+    def check_missing_tags(self) -> dict[bytes, list[str]]:
+        """Check for missing required tags in all items.
+
+        Returns a dictionary mapping item paths to lists of missing field names.
+        """
+        from .preflight import REQUIRED_ITEM_FIELDS, REQUIRED_ALBUM_FIELDS
+
+        missing: dict[bytes, list[str]] = {}
+        for item in self.items:
+            item_missing = []
+            for field in REQUIRED_ITEM_FIELDS:
+                if not getattr(item, field, None):
+                    item_missing.append(field)
+            if self.is_album:
+                for field in REQUIRED_ALBUM_FIELDS:
+                    if not getattr(item, field, None):
+                        item_missing.append(field)
+            if item_missing:
+                missing[item.path] = item_missing
+        return missing
+
     def align_album_level_fields(self):
         """Make some album fields equal across `self.items`. For the
         RETAG action, we assume that the responsible for returning it
@@ -730,6 +751,22 @@ class SingletonImportTask(ImportTask):
         return found_items
 
     duplicate_items = find_duplicates
+
+    def check_missing_tags(self) -> dict[bytes, list[str]]:
+        """Check for missing required tags in the singleton item.
+
+        Returns a dictionary mapping the item path to a list of missing field names.
+        """
+        from .preflight import REQUIRED_ITEM_FIELDS
+
+        missing: dict[bytes, list[str]] = {}
+        item_missing = []
+        for field in REQUIRED_ITEM_FIELDS:
+            if not getattr(self.item, field, None):
+                item_missing.append(field)
+        if item_missing:
+            missing[self.item.path] = item_missing
+        return missing
 
     def remove_duplicates(self, lib: library.Library):
         duplicate_items = self.find_duplicates(lib)
