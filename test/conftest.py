@@ -23,6 +23,31 @@ def skip_marked_items(items: list[pytest.Item], marker_name: str, reason: str):
         item.add_marker(pytest.mark.skip(f"{reason}: {test_name}"))
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "integration_test: mark a test as an integration test"
+    )
+    config.addinivalue_line(
+        "markers",
+        "on_lyrics_update: run test only when lyrics source code changes",
+    )
+    config.addinivalue_line(
+        "markers",
+        (
+            "requires_import(module, force_ci=True): run test only if module"
+            " is importable (use force_ci=False to allow CI to skip the test too)"
+        ),
+    )
+    config.addinivalue_line(
+        "markers",
+        "windows: mark a test to run only on Windows",
+    )
+    config.addinivalue_line(
+        "markers",
+        "posix: mark a test to run only on POSIX systems (Linux, macOS)",
+    )
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ):
@@ -57,22 +82,12 @@ def pytest_collection_modifyitems(
                     )
                 )
 
-
-def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line(
-        "markers", "integration_test: mark a test as an integration test"
-    )
-    config.addinivalue_line(
-        "markers",
-        "on_lyrics_update: run test only when lyrics source code changes",
-    )
-    config.addinivalue_line(
-        "markers",
-        (
-            "requires_import(module, force_ci=True): run test only if module"
-            " is importable (use force_ci=False to allow CI to skip the test too)"
-        ),
-    )
+    skip_marked_items(
+        items, "windows", "Windows required"
+    ) if os.name != "nt" else None
+    skip_marked_items(
+        items, "posix", "POSIX required"
+    ) if os.name == "nt" else None
 
 
 def pytest_make_parametrize_id(config, val, argname):
