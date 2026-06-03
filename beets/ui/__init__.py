@@ -837,7 +837,6 @@ def _print_plugin_notices(options: optparse.Values) -> None:
 
 def _configure(options):
     """Amend the global configuration object with command line options."""
-    config.add({"ui": {"plugin_notices": True}})
     # Add any additional config files specified with --config. This
     # special handling lets specified plugins get loaded before we
     # finish parsing the command line.

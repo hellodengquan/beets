@@ -122,6 +122,7 @@ ui:
     terminal_width: 80
     length_diff_thresh: 10.0
     color: yes
+    plugin_notices: yes
     colors:
         text_success: ['bold', 'green']
         text_warning: ['bold', 'yellow']
