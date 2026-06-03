@@ -854,10 +854,20 @@ class TestPrintPluginNotices(PytestPluginTestHelper):
         plugins._instances.clear()
         plugins._disabled_plugins.clear()
         plugins._command_conflicts.clear()
+        self.config["ui"]["plugin_notices"] = True
+        self.config["ui"]["color"] = False
         yield
         plugins._instances.clear()
         plugins._disabled_plugins.clear()
         plugins._command_conflicts.clear()
+
+    def _make_options(self, quiet=False):
+        """Create a mock options object."""
+        import optparse
+
+        options = optparse.Values()
+        options.quiet = quiet
+        return options
 
     def test_print_plugin_notices_disabled_plugins(self, capsys):
         """Test that _print_plugin_notices prints disabled plugins to stderr."""
@@ -869,7 +879,7 @@ class TestPrintPluginNotices(PytestPluginTestHelper):
             )
         )
 
-        _print_plugin_notices()
+        _print_plugin_notices(self._make_options())
 
         captured = capsys.readouterr()
         assert "Disabled plugins:" in captured.err
@@ -884,7 +894,7 @@ class TestPrintPluginNotices(PytestPluginTestHelper):
             plugins.CommandConflict("dupcmd", "plug_b", existing_plugin="plug_a")
         )
 
-        _print_plugin_notices()
+        _print_plugin_notices(self._make_options())
 
         captured = capsys.readouterr()
         assert "Command conflicts detected:" in captured.err
@@ -895,7 +905,7 @@ class TestPrintPluginNotices(PytestPluginTestHelper):
         """Test that _print_plugin_notices produces no output when there are no issues."""
         from beets.ui import _print_plugin_notices
 
-        _print_plugin_notices()
+        _print_plugin_notices(self._make_options())
 
         captured = capsys.readouterr()
         assert captured.err == ""
@@ -911,10 +921,56 @@ class TestPrintPluginNotices(PytestPluginTestHelper):
             plugins.CommandConflict("cmd1", "plug2", existing_plugin="plug3")
         )
 
-        _print_plugin_notices()
+        _print_plugin_notices(self._make_options())
 
         captured = capsys.readouterr()
         assert "Disabled plugins:" in captured.err
         assert "Command conflicts detected:" in captured.err
         assert "plug1" in captured.err
         assert "cmd1" in captured.err
+
+    def test_print_plugin_notices_respects_quiet_flag(self, capsys):
+        """Test that --quiet suppresses plugin notices."""
+        from beets.ui import _print_plugin_notices
+
+        plugins._disabled_plugins.append(
+            plugins.DisabledPluginNotification("plug1", "disabled")
+        )
+        plugins._command_conflicts.append(
+            plugins.CommandConflict("cmd1", "plug2", existing_plugin="plug3")
+        )
+
+        _print_plugin_notices(self._make_options(quiet=True))
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_print_plugin_notices_respects_config(self, capsys):
+        """Test that ui.plugin_notices config suppresses output when False."""
+        from beets.ui import _print_plugin_notices
+
+        plugins._disabled_plugins.append(
+            plugins.DisabledPluginNotification("plug1", "disabled")
+        )
+        self.config["ui"]["plugin_notices"] = False
+
+        _print_plugin_notices(self._make_options())
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_print_plugin_notices_uses_print_framework(self):
+        """Test that _print_plugin_notices uses ui.print_ instead of bare print."""
+        from beets import ui
+        from beets.ui import _print_plugin_notices
+        from unittest.mock import patch
+
+        plugins._disabled_plugins.append(
+            plugins.DisabledPluginNotification("plug1", "disabled")
+        )
+
+        with patch.object(ui, "print_") as mock_print:
+            _print_plugin_notices(self._make_options())
+            assert mock_print.call_count > 0
+            for call in mock_print.call_args_list:
+                assert "file" in call.kwargs or len(call.args) > 1

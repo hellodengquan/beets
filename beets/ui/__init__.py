@@ -106,29 +106,26 @@ def decargs(arglist):
     return arglist
 
 
-def print_(*strings: str, end: str = "\n") -> None:
+def print_(
+    *strings: str, end: str = "\n", file: Any = None
+) -> None:
     """Like print, but rather than raising an error when a character
     is not in the terminal's encoding's character set, just silently
     replaces it.
 
     The `end` keyword argument behaves similarly to the built-in `print`
-    (it defaults to a newline).
+    (it defaults to a newline). The `file` argument specifies which
+    file-like object to write to (defaults to sys.stdout).
     """
     txt = f"{' '.join(strings or ('',))}{end}"
+    out_file = file if file is not None else sys.stdout
 
-    # Encode the string and write it to stdout.
-    # On Python 3, sys.stdout expects text strings and uses the
-    # exception-throwing encoding error policy. To avoid throwing
-    # errors and use our configurable encoding override, we use the
-    # underlying bytes buffer instead.
-    if hasattr(sys.stdout, "buffer"):
+    if hasattr(out_file, "buffer"):
         out = txt.encode(_out_encoding(), "replace")
-        sys.stdout.buffer.write(out)
-        sys.stdout.buffer.flush()
+        out_file.buffer.write(out)
+        out_file.buffer.flush()
     else:
-        # In our test harnesses (e.g., DummyOut), sys.stdout.buffer
-        # does not exist. We instead just record the text string.
-        sys.stdout.write(txt)
+        out_file.write(txt)
 
 
 # Configuration wrappers.
@@ -792,32 +789,55 @@ def _setup(
     return subcommands, lib
 
 
-def _print_plugin_notices() -> None:
+def _print_plugin_notices(options: optparse.Values) -> None:
     """Print notices about disabled plugins and command conflicts to stderr.
 
-    This ensures users can see plugin status issues even without verbose
-    logging enabled.
+    Uses the ui.print_ framework and colorize for visual distinction.
+    Respects --quiet flag and ui.plugin_notices config to suppress output.
     """
+    quiet = getattr(options, "quiet", False)
+    show_notices = config["ui"]["plugin_notices"].get(bool)
+
+    if quiet or not show_notices:
+        return
+
     disabled = plugins.get_disabled_plugins()
-    if disabled:
-        print("", file=sys.stderr)
-        print("Disabled plugins:", file=sys.stderr)
-        for notice in disabled:
-            print(f"  {notice.name} ({notice.reason})", file=sys.stderr)
-
     conflicts = plugins.get_command_conflicts()
-    if conflicts:
-        print("", file=sys.stderr)
-        print("Command conflicts detected:", file=sys.stderr)
-        for conflict in conflicts:
-            print(f"  {conflict}", file=sys.stderr)
 
-    if disabled or conflicts:
-        print("", file=sys.stderr)
+    if not disabled and not conflicts:
+        return
+
+    if disabled:
+        print_("", file=sys.stderr)
+        print_(
+            colorize("text_warning", "Disabled plugins:"),
+            file=sys.stderr,
+        )
+        for notice in disabled:
+            print_(
+                f"  {colorize('text_warning', notice.name)} "
+                f"({notice.reason})",
+                file=sys.stderr,
+            )
+
+    if conflicts:
+        print_("", file=sys.stderr)
+        print_(
+            colorize("text_error", "Command conflicts detected:"),
+            file=sys.stderr,
+        )
+        for conflict in conflicts:
+            print_(
+                f"  {colorize('text_error', str(conflict))}",
+                file=sys.stderr,
+            )
+
+    print_("", file=sys.stderr)
 
 
 def _configure(options):
     """Amend the global configuration object with command line options."""
+    config.add({"ui": {"plugin_notices": True}})
     # Add any additional config files specified with --config. This
     # special handling lets specified plugins get loaded before we
     # finish parsing the command line.
@@ -910,6 +930,14 @@ def _raw_main(args: list[str] | None) -> None:
         help="log more details (use twice for even more)",
     )
     parser.add_option(
+        "-q",
+        "--quiet",
+        dest="quiet",
+        action="store_true",
+        default=False,
+        help="suppress non-essential output including plugin notices",
+    )
+    parser.add_option(
         "-c", "--config", dest="config", help="path to configuration file"
     )
 
@@ -968,7 +996,7 @@ def _raw_main(args: list[str] | None) -> None:
         return config_edit(options)
 
     subcommands, lib = _setup(options)
-    _print_plugin_notices()
+    _print_plugin_notices(options)
     parser.add_subcommand(*subcommands)
 
     subcommand, suboptions, subargs = parser.parse_subcommand(subargs)
