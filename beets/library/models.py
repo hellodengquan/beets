@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import string
 import sys
+import threading
 import time
 import unicodedata
 from contextlib import suppress
@@ -41,13 +42,66 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("beets")
 
+_cover_fields_lock: threading.Lock = threading.Lock()
+"""Module-level lock guarding mutation of LibModel._cover_fields."""
+
+
+def register_cover_field(model_cls: type["LibModel"], field_name: str) -> None:
+    """Register an additional cover-related field on a LibModel subclass.
+
+    Writes to the named field will thereafter trigger a flush of
+    :attr:`Library._memotable`, ensuring that cached cover lookups are
+    not served after the field value changes.
+
+    Parameters
+    ----------
+    model_cls:
+        The concrete :class:`LibModel` subclass to instrument, i.e.
+        :class:`Album` or :class:`Item` (or a custom subclass thereof).
+    field_name:
+        Name of the field (fixed or flexible) whose writes should
+        invalidate the cover caches. Duplicate names are ignored.
+
+    Raises
+    ------
+    TypeError:
+        If ``model_cls`` is not a :class:`LibModel` subclass.
+    ValueError:
+        If ``field_name`` is empty.
+
+    Notes
+    -----
+    This function is thread-safe.  All mutations of ``_cover_fields``
+    across plugin load paths are serialized through a module-level lock,
+    so it is safe to call from plugin ``__init__`` methods even when
+    plugins are being loaded concurrently.
+    """
+    if not isinstance(field_name, str) or not field_name:
+        raise ValueError(
+            f"register_cover_field: field_name must be a non-empty str, "
+            f"got {field_name!r}"
+        )
+    if not (isinstance(model_cls, type) and issubclass(model_cls, LibModel)):
+        raise TypeError(
+            f"register_cover_field: model_cls must be a LibModel subclass, "
+            f"got {model_cls!r}"
+        )
+
+    with _cover_fields_lock:
+        current = model_cls._cover_fields
+        if field_name in current:
+            return  # idempotent
+        # Rebuild as a fresh frozenset so that running instances see the
+        # update atomically via their class attribute lookup.
+        model_cls._cover_fields = frozenset(current | {field_name})
+
 
 class LibModel(dbcore.Model["Library"]):
     """Shared concrete functionality for Items and Albums."""
 
     _field_names: ClassVar[set[str]]
 
-    _cover_fields: ClassVar[set[str]] = set()
+    _cover_fields: ClassVar[frozenset[str]] = frozenset()
     """Set of cover-related fields whose changes should trigger _memotable
     invalidation. Subclasses override with the relevant fields for each type.
     """
@@ -270,7 +324,7 @@ class Album(LibModel):
     _table = "albums"
     _flex_table = "album_attributes"
     _always_dirty = True
-    _cover_fields: ClassVar[set[str]] = {"artpath", "cover_art_url"}
+    _cover_fields: ClassVar[frozenset[str]] = frozenset({"artpath", "cover_art_url"})
     _field_names: ClassVar[set[str]] = {
         "added",
         "album",
@@ -637,7 +691,7 @@ class Item(LibModel):
 
     _table = "items"
     _flex_table = "item_attributes"
-    _cover_fields: ClassVar[set[str]] = {"cover_art_url"}
+    _cover_fields: ClassVar[frozenset[str]] = frozenset({"cover_art_url"})
     _field_names: ClassVar[set[str]] = (Album._field_names - {"artpath"}) | {
         "acoustid_fingerprint",
         "acoustid_id",

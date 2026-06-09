@@ -2,7 +2,7 @@ from beets.util.deprecation import deprecate_imports
 
 from .exceptions import FileOperationError, ReadError, WriteError
 from .library import Library
-from .models import Album, Item, LibModel
+from .models import Album, Item, LibModel, register_cover_field
 from .queries import parse_query_parts, parse_query_string
 
 NEW_MODULE_BY_NAME = dict.fromkeys(
@@ -26,4 +26,5 @@ __all__ = [
     "WriteError",
     "parse_query_parts",
     "parse_query_string",
+    "register_cover_field",
 ]

@@ -19,13 +19,13 @@ The ``_cover_fields`` Class Variable
 
 Both :class:`~beets.library.Album` and :class:`~beets.library.Item` inherit
 from :class:`~beets.library.LibModel`.  ``LibModel`` defines a class variable
-named ``_cover_fields`` – a :class:`set` of field names whose mutation must
-trigger an immediate ``_memotable`` flush:
+named ``_cover_fields`` – an immutable :class:`frozenset` of field names whose
+mutation must trigger an immediate ``_memotable`` flush:
 
 .. code-block:: python
 
     class LibModel(dbcore.Model["Library"]):
-        _cover_fields: ClassVar[set[str]] = set()
+        _cover_fields: ClassVar[frozenset[str]] = frozenset()
 
         def _setitem(self, key, value):
             changed = super()._setitem(key, value)
@@ -40,12 +40,12 @@ The hook runs on *every* field mutation path: attribute assignment
 
 The built-in defaults are:
 
-====================  =============================================
+====================  =====================================================
 Class                 ``_cover_fields``
-====================  =============================================
-``Album``             ``{"artpath", "cover_art_url"}``
-``Item``              ``{"cover_art_url"}``
-====================  =============================================
+====================  =====================================================
+``Album``             ``frozenset({"artpath", "cover_art_url"})``
+``Item``              ``frozenset({"cover_art_url"})``
+====================  =====================================================
 
 
 Adding a Custom Cover Field
@@ -53,9 +53,11 @@ Adding a Custom Cover Field
 
 Suppose you are writing a plugin that stores the URL of a *back* cover on
 albums via a flexible field called ``back_cover_url``. To make sure that
-changes to ``back_cover_url`` also drop stale memotable entries, simply add
-the field name to the corresponding model's ``_cover_fields`` set from your
-plugin's setup code.
+changes to ``back_cover_url`` also drop stale memotable entries, call the
+thread-safe :func:`~beets.library.register_cover_field` helper from your
+plugin's setup code.  **Do not** mutate ``_cover_fields`` directly – it is
+declared as a :class:`frozenset` precisely to encourage you to use the
+registered helper so that the update happens atomically under a lock.
 
 Recommended template:
 
@@ -63,7 +65,7 @@ Recommended template:
 
     from beets.plugins import BeetsPlugin
     from beets.dbcore import types
-    from beets.library import Album, Item
+    from beets.library import Album, Item, register_cover_field
 
 
     class BackCoverPlugin(BeetsPlugin):
@@ -77,11 +79,12 @@ Recommended template:
             # Register our cover-related fields so that writes invalidate
             # Library._memotable and thus force the web plugin, templates,
             # etc. to see the new value.
-            Album._cover_fields.add("back_cover_url")
-            Item._cover_fields.add("per_item_cover_url")
+            register_cover_field(Album, "back_cover_url")
+            register_cover_field(Item, "per_item_cover_url")
 
 Alternatively, if you are subclassing ``Album`` or ``Item`` directly (advanced
-use case), override the class variable on your subclass:
+use case), override the class variable on your subclass by constructing a new
+frozen set from the parent's:
 
 .. code-block:: python
 
@@ -91,7 +94,11 @@ use case), override the class variable on your subclass:
     class MyAlbum(Album):
         """An album variant that tracks an extra front-cover thumbnail."""
 
-        _cover_fields = Album._cover_fields | {"thumbnail_cover_url"}
+        _cover_fields = Album._cover_fields | frozenset({"thumbnail_cover_url"})
+
+Calling :func:`~beets.library.register_cover_field` a second time with the
+same ``(model_cls, field_name)`` pair is a safe no-op, so plugins that share
+a cover field do not need to coordinate.
 
 After registering the field the way shown above, the following operations
 will *all* correctly invalidate ``lib._memotable`` for you:

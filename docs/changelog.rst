@@ -67,10 +67,29 @@ Bug fixes
 - :doc:`plugins/fetchart`: Catch ``OSError`` in ``_set_art`` so that permission
   errors (e.g. a file locked by another process) are logged as warnings instead
   of crashing beets. :bug:`6193`
+- **Album / Item cover cache invalidation**: ``Library._memotable`` is now
+  properly invalidated whenever cover-related fields are modified. Fixed the
+  ``web`` plugin returning stale album art after ``set_art``/``move_art``,
+  direct ``artpath`` assignment, import re-merge, ``fetchart`` CLI,
+  ``embedart clearart``, and ``extractart --associate`` operations. The
+  ``/album/<id>/art`` HTTP endpoint now sends ``Cache-Control: no-store`` and
+  an ETag combining ``album.id``, ``st_mtime_ns``, ``st_ino`` and ``st_size``,
+  which correctly detects atomic ``os.replace`` file substitutions that keep
+  the original mtime. :bug:`6642`
 
-..
-    For plugin developers
-    ~~~~~~~~~~~~~~~~~~~~~
+For plugin developers
+~~~~~~~~~~~~~~~~~~~~~
+
+- Introduced the ``_cover_fields`` public extension point on
+  :class:`~beets.library.LibModel` (the common base class of ``Album`` and
+  ``Item``) together with the :func:`~beets.library.register_cover_field`
+  helper. Third-party plugins that add new cover-related fields (e.g. a
+  flexible attribute holding a back-cover URL) should call
+  ``register_cover_field(Album, "back_cover_url")`` in their ``__init__`` so
+  writes to those fields automatically flush the ``Library._memotable`` cache.
+  ``_cover_fields`` defaults to an immutable ``frozenset`` and
+  ``register_cover_field`` is thread-safe, so plugin load order and parallel
+  plugin initialization are handled correctly.
 
 Other changes
 ~~~~~~~~~~~~~

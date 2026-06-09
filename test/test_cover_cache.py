@@ -264,10 +264,218 @@ class CoverFieldsBenchmarkTest(ItemInDBTestCase):
 
     def test_cover_fields_classvars_are_configured(self):
         """Sanity-check: subclasses must declare the right _cover_fields."""
-        assert Album._cover_fields == {"artpath", "cover_art_url"}
-        assert Item._cover_fields == {"cover_art_url"}
+        assert Album._cover_fields == frozenset({"artpath", "cover_art_url"})
+        assert isinstance(Album._cover_fields, frozenset)
+        assert Item._cover_fields == frozenset({"cover_art_url"})
+        assert isinstance(Item._cover_fields, frozenset)
         from beets.library.models import LibModel
-        assert LibModel._cover_fields == set()
+        assert LibModel._cover_fields == frozenset()
+        assert isinstance(LibModel._cover_fields, frozenset)
+
+
+class RegisterCoverFieldTest(ItemInDBTestCase):
+    """Exercise the public :func:`register_cover_field` helper: basic
+    semantics, argument validation, idempotence, thread-safety and
+    live end-to-end proof that a freshly-registered flexible field
+    actually triggers ``_memotable`` invalidation on write.
+    """
+
+    def setUp(self):
+        super().setUp()
+        item = self.add_item_fixture()
+        self.album = self.lib.add_album([item])
+        self.item = item
+        # Snapshot the built-in defaults so each test can undo its
+        # registrations without leaking side effects into other tests.
+        self._orig_album_fields = Album._cover_fields
+        self._orig_item_fields = Item._cover_fields
+
+    def tearDown(self):
+        # Restore the pristine built-in cover field sets.  Because the
+        # class attribute is replaced with a fresh frozenset during each
+        # registration, a plain assignment back to the captured reference
+        # is enough to reset state.
+        Album._cover_fields = self._orig_album_fields
+        Item._cover_fields = self._orig_item_fields
+        super().tearDown()
+
+    # ------------------------------------------------------------------
+    # Basic semantics
+    # ------------------------------------------------------------------
+    def test_registered_field_writes_clear_memotable(self):
+        """After register_cover_field(Album, 'back_cover_url'), writes
+        to that flexible field must flush _memotable."""
+        from beets.library import register_cover_field
+
+        register_cover_field(Album, "back_cover_url")
+        assert "back_cover_url" in Album._cover_fields
+
+        self.lib._memotable = {"stale": "entry"}
+        self.album.back_cover_url = "http://example.com/back.jpg"
+        assert self.lib._memotable == {}
+
+    def test_registered_item_field_writes_clear_memotable(self):
+        from beets.library import register_cover_field
+
+        register_cover_field(Item, "digipak_cover_url")
+        assert "digipak_cover_url" in Item._cover_fields
+
+        self.lib._memotable = {"stale": "entry"}
+        self.item.digipak_cover_url = "http://example.com/digipak.jpg"
+        assert self.lib._memotable == {}
+
+    def test_register_is_idempotent(self):
+        """Registering the same (cls, name) twice is a no-op."""
+        from beets.library import register_cover_field
+
+        before = Album._cover_fields
+        register_cover_field(Album, "artpath")  # already built in
+        register_cover_field(Album, "artpath")
+        register_cover_field(Album, "artpath")
+        assert Album._cover_fields == before
+
+    # ------------------------------------------------------------------
+    # Argument validation
+    # ------------------------------------------------------------------
+    def test_rejects_empty_field_name(self):
+        from beets.library import register_cover_field
+
+        with pytest.raises(ValueError):
+            register_cover_field(Album, "")
+
+    def test_rejects_non_string_field_name(self):
+        from beets.library import register_cover_field
+
+        with pytest.raises(ValueError):
+            register_cover_field(Album, None)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            register_cover_field(Album, 123)  # type: ignore[arg-type]
+
+    def test_rejects_non_libmodel_subclass(self):
+        from beets.library import register_cover_field
+
+        class NotALibModel:
+            pass
+
+        with pytest.raises(TypeError):
+            register_cover_field(NotALibModel, "foo")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            register_cover_field("not a class", "foo")  # type: ignore[arg-type]
+
+    def test_importable_from_beets_library_namespace(self):
+        """register_cover_field must be exposed as a public API under
+        ``beets.library`` (docs point users to this import)."""
+        from beets.library import register_cover_field as from_lib
+        from beets.library.models import register_cover_field as from_models
+
+        assert from_lib is from_models
+
+    # ------------------------------------------------------------------
+    # Concurrent registration
+    # ------------------------------------------------------------------
+    def test_concurrent_registers_all_fields_present(self):
+        """N worker threads each register a disjoint set of field names.
+        At the end, every proposed name must appear in Album._cover_fields.
+
+        This catches races where a ``frozenset | {name}`` rebuild is lost
+        because two threads read the old value concurrently and one of
+        the assignments overwrites the other.
+        """
+        import threading
+        from beets.library import register_cover_field
+
+        NUM_THREADS = 12
+        FIELDS_PER_THREAD = 50
+        errors: list[Exception] = []
+
+        def worker(tid: int):
+            try:
+                for i in range(FIELDS_PER_THREAD):
+                    name = f"thread_{tid}_cover_field_{i}"
+                    register_cover_field(Album, name)
+            except Exception as exc:  # pragma: no cover - best-effort
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(NUM_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"threads raised: {errors!r}"
+
+        expected = {
+            f"thread_{t}_cover_field_{i}"
+            for t in range(NUM_THREADS)
+            for i in range(FIELDS_PER_THREAD)
+        }
+        missing = expected - set(Album._cover_fields)
+        assert not missing, (
+            f"Concurrent register_cover_field missed {len(missing)} fields: "
+            f"{sorted(missing)[:10]}..."
+        )
+        assert len(Album._cover_fields) == len(self._orig_album_fields) + len(expected)
+
+    def test_concurrent_registers_interleaved_with_writes(self):
+        """Concurrent registrations must not break the interceptor.
+
+        Thread A keeps writing fields (some already registered, some
+        not); Threads B/C keep registering new fields.  Thread A must
+        observe that any write it performs to a field *after* that
+        field's registration has been observed by Thread A consistently
+        clears the memotable.  Weaker assertion: no exceptions occur
+        and the final class attribute is still a valid frozenset.
+        """
+        import threading
+        import random
+        from beets.library import register_cover_field
+
+        errors: list[Exception] = []
+        stop = threading.Event()
+
+        def writer():
+            try:
+                counter = 0
+                while not stop.is_set():
+                    # Alternate between a definitely-built-in field, a
+                    # definitely-not-registered-yet field, and an
+                    # unrelated field.
+                    pick = counter % 3
+                    if pick == 0:
+                        self.album.cover_art_url = f"http://ex.com/u{counter}"
+                    elif pick == 1:
+                        self.album[f"custom_field_{counter}"] = "x"
+                    else:
+                        self.album.title = f"t{counter}"
+                    counter += 1
+            except Exception as exc:  # pragma: no cover - best-effort
+                errors.append(exc)
+
+        def registrations(prefix: str):
+            try:
+                for i in range(80):
+                    register_cover_field(Album, f"{prefix}_{i}")
+            except Exception as exc:  # pragma: no cover - best-effort
+                errors.append(exc)
+
+        threads: list[threading.Thread] = [threading.Thread(target=writer)]
+        for p in ("a", "b", "c"):
+            threads.append(threading.Thread(target=registrations, args=(p,)))
+
+        for t in threads:
+            t.start()
+        # Let them overlap briefly.
+        for t in threads[1:]:
+            t.join()
+        stop.set()
+        threads[0].join()
+
+        assert errors == [], f"threads raised: {errors!r}"
+        assert isinstance(Album._cover_fields, frozenset)
+        # Every explicitly-registered name must be observed.
+        for p in ("a", "b", "c"):
+            for i in range(80):
+                assert f"{p}_{i}" in Album._cover_fields
 
 
 class AlbumArtEndpointCacheHeadersTest(ItemInDBTestCase):
