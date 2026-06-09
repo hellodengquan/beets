@@ -68,9 +68,24 @@ Bug fixes
   errors (e.g. a file locked by another process) are logged as warnings instead
   of crashing beets. :bug:`6193`
 
-..
-    For plugin developers
-    ~~~~~~~~~~~~~~~~~~~~~
+For plugin developers
+~~~~~~~~~~~~~~~~~~~~
+
+- :doc:`plugins/smartplaylist`: Fix an aliasing bug in the ``splupdate`` command
+  handler. In prior releases, running ``beet splupdate`` (without playlist
+  arguments) assigned ``self._matched_playlists = self._unmatched_playlists``
+  as a Python reference (alias), so the subsequent
+  ``self._matched_playlists.clear()`` call inside ``update_playlists`` emptied
+  **both** sets, leaving the plugin with zero tracked playlists after the command completed.
+  The sets are now independent copies. This fixes long-running daemons (e.g. the
+  ``beetd`` / ``beet web``) accumulate no longer lose their playlist registry
+  across multiple ``splupdate`` invocations.
+- :doc:`plugins/smartplaylist`: Formalize the public contract of the
+  ``smartplaylist_update`` event emitted after a successful (non-``--pretend``)
+  playlist write. The event is fired **without any keyword arguments**
+  (``plugins.send("smartplaylist_update")``. Downstream plugins that subscribe to
+  ``smartplaylist_update`` (e.g. ``subsonicupdate`` or custom hooks) must not
+  depend on any positional or keyword arguments.
 
 Other changes
 ~~~~~~~~~~~~~
