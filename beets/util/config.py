@@ -232,6 +232,11 @@ class PluginConfigManager:
         except (confuse.ConfigTypeError, confuse.ConfigValueError) as e:
             raise PluginConfigError(f"'{key}': {e}")
 
+        if schema.required and value is None:
+            raise PluginConfigError(
+                f"'{key}' is required but not configured"
+            )
+
         if schema.choices is not None and value not in schema.choices:
             raise PluginConfigError(
                 f"'{key}' must be one of {schema.choices}, got {value!r}"
@@ -285,9 +290,21 @@ class PluginConfigManager:
         resolved_type = type or schema.type
 
         try:
+            try:
+                raw_value = config_item.get()
+            except confuse.NotFoundError:
+                if schema.required:
+                    raise PluginConfigError(
+                        f"'{key}' is required but not configured"
+                    )
+                return schema.default
+
+            if raw_value is None and schema.default is None:
+                return None
+
             if resolved_type is not None:
                 return config_item.get(resolved_type)
-            return config_item.get()
+            return raw_value
         except confuse.NotFoundError:
             if schema.required:
                 raise PluginConfigError(
