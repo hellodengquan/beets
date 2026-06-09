@@ -106,4 +106,5 @@ resources:
     commands
     events
     autotagger
+    query
     other/index

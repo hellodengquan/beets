@@ -115,6 +115,17 @@ rst_epilog = r"""
 .. |Model| replace:: :class:`~beets.dbcore.db.Model`
 .. |TrackInfo| replace:: :class:`beets.autotag.hooks.TrackInfo`
 .. |semicolon_space| replace:: :literal:`; \ `
+.. |AndQuery| replace:: :class:`~beets.dbcore.query.AndQuery`
+.. |OrQuery| replace:: :class:`~beets.dbcore.query.OrQuery`
+.. |Query| replace:: :class:`~beets.dbcore.query.Query`
+.. |Sort| replace:: :class:`~beets.dbcore.sort.Sort`
+.. |InvalidQueryError| replace:: :class:`~beets.dbcore.InvalidQueryError`
+.. |QueryNormalizationContext| replace:: :class:`~beets.library.queries.QueryNormalizationContext`
+.. |build_query_context| replace:: :func:`~beets.library.queries.build_query_context`
+.. |get_query_prefixes| replace:: :func:`~beets.library.queries.get_query_prefixes`
+.. |normalize_query_parts| replace:: :func:`~beets.library.queries.normalize_query_parts`
+.. |parse_query_parts| replace:: :func:`~beets.library.queries.parse_query_parts`
+.. |parse_query_string| replace:: :func:`~beets.library.queries.parse_query_string`
 """
 
 # -- Options for HTML output -------------------------------------------------
