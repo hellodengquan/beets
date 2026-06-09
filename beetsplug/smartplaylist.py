@@ -215,7 +215,8 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
             self._matched_playlists = playlists
             self._unmatched_playlists -= playlists
         else:
-            self._matched_playlists = self._unmatched_playlists
+            self._matched_playlists = set(self._unmatched_playlists)
+            self._unmatched_playlists.clear()
 
         self.config.set(vars(opts))
         self.update_playlists(lib)

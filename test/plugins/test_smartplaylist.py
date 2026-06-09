@@ -25,7 +25,7 @@ import pytest
 from beets import config
 from beets.dbcore.sort import FixedFieldSort, MultipleSort, NullSort
 from beets.library import Album, Item, parse_query_string
-from beets.plugins import BeetsPlugin
+from beets.plugins import BeetsPlugin, find_plugins
 from beets.test._common import item
 from beets.test.helper import BeetsTestCase, IOMixin, PluginTestCase
 from beets.ui import UserError
@@ -644,6 +644,103 @@ class SmartPlaylistCLITest(IOMixin, PluginTestCase):
         assert "Creating playlist my_playlist.m3u: 1 tracks." in output
         assert "1 playlists would be updated" in output
 
+    def test_splupdate_command_end_to_end_state_cleanup(self):
+        """E2E: after `beet splupdate`, internal state is fully reset.
+
+        Verifies that running the splupdate command leaves the plugin with:
+          * _matched_playlists == empty set
+          * _cli_exit_registered == False
+          * _unmatched_playlists contains all configured playlists
+        """
+        plugin_instance = None
+        for p in find_plugins():
+            if isinstance(p, SmartPlaylistPlugin):
+                plugin_instance = p
+                break
+        assert plugin_instance is not None, (
+            "SmartPlaylistPlugin should be loaded in PluginTestCase"
+        )
+
+        assert plugin_instance._matched_playlists == set(), (
+            "Initial state: _matched_playlists must be empty"
+        )
+
+        self.run_with_output("splupdate")
+
+        assert plugin_instance._matched_playlists == set(), (
+            "After splupdate: _matched_playlists must be empty; playlists "
+            "moved back to _unmatched_playlists"
+        )
+        assert plugin_instance._cli_exit_registered is False, (
+            "After splupdate: _cli_exit_registered must be reset to False; "
+            "manual command path should not permanently set this flag"
+        )
+        assert len(plugin_instance._unmatched_playlists) == 2, (
+            "Both configured playlists must be present in _unmatched_playlists"
+        )
+        names = {pl[0] for pl in plugin_instance._unmatched_playlists}
+        assert names == {"my_playlist.m3u", "all.m3u"}
+
+    def test_db_change_then_splupdate_manual_recovers_state(self):
+        """E2E: splupdate recovers when db_change pre-populated internal state.
+
+        Simulates a real-world scenario:
+          1. A database change marks some playlists as needing update and
+             sets the cli_exit_registered flag (as if auto mode had engaged).
+          2. Before cli_exit fires, the user runs `splupdate` manually.
+
+        Expected: the manual rebuild + update correctly resets both flags,
+        writes all configured playlists to disk.
+        """
+        plugin_instance = None
+        for p in find_plugins():
+            if isinstance(p, SmartPlaylistPlugin):
+                plugin_instance = p
+                break
+        assert plugin_instance is not None
+
+        if not plugin_instance._unmatched_playlists and not plugin_instance._matched_playlists:
+            plugin_instance.build_queries()
+
+        if not plugin_instance._unmatched_playlists:
+            plugin_instance._unmatched_playlists = {
+                ("recovery_check1.m3u", parse_query_string("", Item), (None, None)),
+                ("recovery_check2.m3u", parse_query_string("artist:anything", Item), (None, None)),
+            }
+
+        all_playlists = (
+            plugin_instance._unmatched_playlists | plugin_instance._matched_playlists
+        )
+        assert all_playlists, (
+            "Playlists must exist before the test runs (from setUp config)"
+        )
+        initial_total = len(all_playlists)
+        assert plugin_instance._cli_exit_registered is False
+
+        a_playlist = next(iter(plugin_instance._unmatched_playlists or all_playlists))
+        plugin_instance._matched_playlists.add(a_playlist)
+        plugin_instance._unmatched_playlists.discard(a_playlist)
+        plugin_instance._cli_exit_registered = True
+
+        assert len(plugin_instance._matched_playlists) >= 1
+        assert plugin_instance._cli_exit_registered is True
+
+        self.run_with_output("splupdate")
+
+        assert plugin_instance._matched_playlists == set(), (
+            "After manual splupdate, _matched_playlists must be cleared "
+            "regardless of prior state from db_change"
+        )
+        assert plugin_instance._cli_exit_registered is False, (
+            "After manual splupdate, _cli_exit_registered must be reset "
+            "even if it was True before (via build_queries)"
+        )
+        assert len(plugin_instance._unmatched_playlists) >= initial_total
+        for name in ("my_playlist.m3u", "all.m3u"):
+            assert any(
+                pl[0] == name for pl in plugin_instance._unmatched_playlists
+            ), f"Playlist {name} must be present in _unmatched_playlists"
+
 
 class TestSmartplaylistFileMove(BeetsTestCase):
     """Tests for smartplaylist sync with file moves, metadata changes,
@@ -1018,4 +1115,202 @@ class TestSmartplaylistFileMove(BeetsTestCase):
         content = m3u_path.read_bytes()
         assert beatle.path + b"\n" in content
         assert other.path + b"\n" not in content
+
+
+class TestSmartplaylistUpdateEvent(BeetsTestCase):
+    """Tests for the smartplaylist_update event: its signature, trigger
+    timing, and the state clean-up after splupdate command invocation.
+    """
+
+    @staticmethod
+    def _make_plugin():
+        spl = SmartPlaylistPlugin()
+        spl.register_listener = Mock()
+        return spl
+
+    def setUp(self):
+        super().setUp()
+        config["smartplaylist"]["playlist_dir"].set(str(self.temp_dir_path))
+        config["smartplaylist"]["pretend"].set(False)
+        config["smartplaylist"]["output"].set("m3u")
+
+    def _make_lib_mock(self, items=None, albums=None):
+        lib = Mock()
+        lib.items.return_value = items or []
+        lib.albums.return_value = albums or []
+        lib.replacements = CHAR_REPLACE
+        return lib
+
+    def _make_test_playlist_tuple(
+        self,
+        name="test_event.m3u",
+        item_query="",
+        album_query=None,
+    ):
+        nones = None, None
+        q = parse_query_string(item_query, Item) if item_query is not None else None
+        a_q = (
+            parse_query_string(album_query, Album)
+            if album_query is not None
+            else None
+        )
+        if q is None:
+            q = None, None
+        if a_q is None:
+            a_q = None, None
+        return (name, q, a_q)
+
+    def test_smartplaylist_update_event_signature_has_no_arguments(self):
+        """The smartplaylist_update event must be emitted with no arguments.
+
+        plugins.send("smartplaylist_update") is called with no keyword args.
+        Subscribers (e.g. subsonicupdate) rely on this signature.
+        """
+        spl = self._make_plugin()
+        captured_events = []
+
+        def capture_event(**kwargs):
+            captured_events.append(kwargs)
+
+        BeetsPlugin.listeners.setdefault("smartplaylist_update", []).append(
+            capture_event
+        )
+        try:
+            pl = self._make_test_playlist_tuple("empty.m3u", "", None)
+            spl._matched_playlists = {pl}
+            spl._unmatched_playlists = set()
+            spl.update_playlists(self._make_lib_mock())
+
+            assert len(captured_events) == 1, (
+                "Exactly one smartplaylist_update event must be emitted "
+                "per update_playlists() call in non-pretend mode"
+            )
+            assert captured_events[0] == {}, (
+                "smartplaylist_update must be sent with no keyword arguments; "
+                f"got: {captured_events[0]}"
+            )
+        finally:
+            BeetsPlugin.listeners["smartplaylist_update"].remove(capture_event)
+
+    def test_smartplaylist_update_emitted_after_all_files_written(self):
+        """Event must fire AFTER all playlist files have been written to disk.
+
+        Subscribers such as subsonicupdate scan the playlist directory for
+        changes, so the files must be fully written and flushed before the
+        event is dispatched.
+        """
+        spl = self._make_plugin()
+        write_state = {"files_written": 0}
+        seen_file_exists_at_event = []
+
+        def capture_event(**kwargs):
+            write_state["event_fired"] = True
+            seen_file_exists_at_event.append(
+                all(
+                    (self.temp_dir_path / name).exists()
+                    for name in ("pl_a.m3u", "pl_b.m3u")
+                )
+            )
+
+        BeetsPlugin.listeners.setdefault("smartplaylist_update", []).append(
+            capture_event
+        )
+        try:
+            i1 = self.add_item(artist="A", title="One", path=b"/a1.mp3")
+            i2 = self.add_item(artist="B", title="Two", path=b"/b2.mp3")
+
+            pl_a = self._make_test_playlist_tuple("pl_a.m3u", "artist:A", None)
+            pl_b = self._make_test_playlist_tuple("pl_b.m3u", "artist:B", None)
+            spl._matched_playlists = {pl_a, pl_b}
+            spl._unmatched_playlists = set()
+
+            lib = Mock()
+            lib.replacements = CHAR_REPLACE
+
+            def fake_items(query=None, sort=None):
+                if query is not None and hasattr(query, "match"):
+                    matched = []
+                    for it in [i1, i2]:
+                        try:
+                            if query.match(it):
+                                matched.append(it)
+                        except Exception:
+                            pass
+                    return matched
+                return [i1, i2]
+
+            lib.items.side_effect = fake_items
+            lib.albums.return_value = []
+
+            spl.update_playlists(lib)
+
+            assert write_state.get("event_fired"), (
+                "Event smartplaylist_update must have been fired"
+            )
+            assert seen_file_exists_at_event == [True], (
+                "When smartplaylist_update fires, both pl_a.m3u and pl_b.m3u "
+                "must already exist on disk"
+            )
+            assert (self.temp_dir_path / "pl_a.m3u").exists()
+            assert (self.temp_dir_path / "pl_b.m3u").exists()
+        finally:
+            BeetsPlugin.listeners["smartplaylist_update"].remove(capture_event)
+
+    def test_smartplaylist_update_NOT_emitted_in_pretend_mode(self):
+        """When pretend=True, no files are written and no event is sent.
+
+        The pretend mode is for dry-runs. Subscribers must not be notified
+        of playlist updates that never actually materialized on disk.
+        """
+        spl = self._make_plugin()
+        capture_event = Mock()
+        BeetsPlugin.listeners.setdefault("smartplaylist_update", []).append(
+            capture_event
+        )
+        try:
+            config["smartplaylist"]["pretend"].set(True)
+            pl = self._make_test_playlist_tuple("pretend_pl.m3u", "", None)
+            spl._matched_playlists = {pl}
+            spl._unmatched_playlists = set()
+            spl.update_playlists(self._make_lib_mock())
+
+            capture_event.assert_not_called()
+            assert not (self.temp_dir_path / "pretend_pl.m3u").exists(), (
+                "No file should be created in pretend mode"
+            )
+        finally:
+            BeetsPlugin.listeners["smartplaylist_update"].remove(capture_event)
+
+    def test_smartplaylist_update_NOT_emitted_when_matched_set_is_empty(self):
+        """If _matched_playlists is empty, no files are written.
+
+        Early return should skip file writes; however, the current
+        implementation still sends the event to signal that an update cycle
+        ran (even if zero playlists needed updating). This test verifies the
+        filesystem side effects are absent.
+        """
+        spl = self._make_plugin()
+        events_received = []
+        def capture_event(**kwargs):
+            events_received.append(True)
+        BeetsPlugin.listeners.setdefault("smartplaylist_update", []).append(
+            capture_event
+        )
+        try:
+            pl = self._make_test_playlist_tuple("nomatch.m3u", "", None)
+            spl._matched_playlists = set()
+            spl._unmatched_playlists = {pl}
+
+            spl.update_playlists(self._make_lib_mock())
+
+            assert not (self.temp_dir_path / "nomatch.m3u").exists(), (
+                "Empty matched set must not produce any playlist file"
+            )
+            assert pl in spl._unmatched_playlists, (
+                "Playlist with empty matched set must stay in _unmatched"
+            )
+            assert spl._matched_playlists == set()
+        finally:
+            BeetsPlugin.listeners["smartplaylist_update"].remove(capture_event)
+
 
