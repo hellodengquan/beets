@@ -232,6 +232,7 @@ def import_asis(session: ImportSession, task: ImportTask):
     log.info("{}", displayable_path(task.paths))
     task.set_choice(Action.ASIS)
     _resolve_duplicates(session, task)
+    session.log_choice(task)
     _apply_choice(session, task)
 
 

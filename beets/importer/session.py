@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from beets import config, logging, plugins, util
@@ -39,6 +41,107 @@ QUEUE_SIZE = 128
 log = logging.getLogger("beets")
 
 
+@dataclass
+class ImportAuditSummary:
+    """汇总导入过程中各类操作的审计信息。
+
+    用于追踪导入期间哪些条目被修改、跳过或需人工审核，
+    便于导入结束后回顾结果和后续处理。
+    """
+
+    applied: int = 0
+    applied_details: list[tuple[str, str]] = field(default_factory=list)
+
+    asis: int = 0
+    asis_details: list[tuple[str, str]] = field(default_factory=list)
+
+    skipped: int = 0
+    skipped_details: list[tuple[str, str]] = field(default_factory=list)
+
+    duplicate_replace: int = 0
+    duplicate_replace_details: list[tuple[str, str]] = field(default_factory=list)
+
+    duplicate_keep: int = 0
+    duplicate_keep_details: list[tuple[str, str]] = field(default_factory=list)
+
+    duplicate_skip: int = 0
+    duplicate_skip_details: list[tuple[str, str]] = field(default_factory=list)
+
+    needs_review: int = 0
+    needs_review_details: list[tuple[str, str]] = field(default_factory=list)
+
+    total_tasks: int = 0
+
+    def record_choice(
+        self,
+        task: ImportTask,
+        duplicate: bool = False,
+        needs_review: bool = False,
+    ):
+        """记录任务的选择结果到审计摘要中。
+
+        Parameters
+        ----------
+        task : ImportTask
+            已做出选择的导入任务
+        duplicate : bool
+            是否为重复处理的二次选择
+        needs_review : bool
+            是否需要人工审核（如用户手动做出决策）
+        """
+        from .tasks import SentinelImportTask
+
+        if isinstance(task, SentinelImportTask):
+            return
+
+        path_display = displayable_path(task.paths)
+        desc = self._task_description(task)
+
+        if duplicate:
+            if task.should_remove_duplicates:
+                self.duplicate_replace += 1
+                self.duplicate_replace_details.append((path_display, desc))
+            elif task.choice_flag in (Action.ASIS, Action.APPLY):
+                self.duplicate_keep += 1
+                self.duplicate_keep_details.append((path_display, desc))
+            elif task.choice_flag is Action.SKIP:
+                self.duplicate_skip += 1
+                self.duplicate_skip_details.append((path_display, desc))
+        else:
+            if task.choice_flag is Action.APPLY:
+                self.applied += 1
+                self.applied_details.append((path_display, desc))
+            elif task.choice_flag is Action.ASIS:
+                self.asis += 1
+                self.asis_details.append((path_display, desc))
+            elif task.choice_flag is Action.SKIP:
+                self.skipped += 1
+                self.skipped_details.append((path_display, desc))
+
+        if needs_review:
+            self.needs_review += 1
+            self.needs_review_details.append((path_display, desc))
+
+        self.total_tasks += 1
+
+    @staticmethod
+    def _task_description(task: ImportTask) -> str:
+        """生成任务的简要描述（艺术家/专辑或标题）。"""
+        try:
+            if task.is_album:
+                info = task.chosen_info() if task.choice_flag else {}
+                artist = info.get("artist") or info.get("albumartist") or "Unknown"
+                album = info.get("album") or task.cur_album or "Unknown"
+                return f"{artist} - {album}"
+            else:
+                info = task.chosen_info() if task.choice_flag else {}
+                artist = info.get("artist") or getattr(task, "item", None) and task.item.artist or "Unknown"
+                title = info.get("title") or getattr(task, "item", None) and task.item.title or "Unknown"
+                return f"{artist} - {title}"
+        except Exception:
+            return "N/A"
+
+
 class ImportAbortError(Exception):
     """Raised when the user aborts the tagging operation."""
 
@@ -53,6 +156,7 @@ class ImportSession:
     logger: logging.Logger
     paths: list[PathBytes]
     lib: library.Library
+    audit_summary: ImportAuditSummary
 
     _is_resuming: dict[bytes, bool]
     _merged_items: set[PathBytes]
@@ -85,6 +189,7 @@ class ImportSession:
         self._is_resuming = {}
         self._merged_items = set()
         self._merged_dirs = set()
+        self.audit_summary = ImportAuditSummary()
 
         # Normalize the paths.
         self.paths = list(map(normpath, paths or []))
@@ -155,10 +260,13 @@ class ImportSession:
         """
         self.logger.info("{} {}", status, displayable_path(paths))
 
-    def log_choice(self, task: ImportTask, duplicate=False):
+    def log_choice(self, task: ImportTask, duplicate=False, needs_review=False):
         """Logs the task's current choice if it should be logged. If
         ``duplicate``, then this is a secondary choice after a duplicate was
         detected and a decision was made.
+
+        Also records the choice in the audit summary (including APPLY
+        actions, which are not written to the tag log file).
         """
         paths = task.paths
         if duplicate:
@@ -175,6 +283,10 @@ class ImportSession:
                 self.tag_log("asis", paths)
             elif task.choice_flag is Action.SKIP:
                 self.tag_log("skip", paths)
+            # Note: APPLY is intentionally not logged here (per existing
+            # behavior), but it IS recorded in the audit summary below.
+
+        self.audit_summary.record_choice(task, duplicate, needs_review)
 
     def should_resume(self, path: PathBytes):
         raise NotImplementedError
@@ -240,6 +352,57 @@ class ImportSession:
         except ImportAbortError:
             # User aborted operation. Silently stop.
             pass
+
+        self._emit_audit_summary()
+
+    def _emit_audit_summary(self):
+        """在导入结束时发送审计摘要事件并记录到日志。
+
+        子类可以覆盖 print_audit_summary 方法提供特定UI的输出。
+        """
+        summary = self.audit_summary
+        if summary.total_tasks > 0:
+            plugins.send("import_audit_summary", session=self, summary=summary)
+            self.print_audit_summary(summary)
+            self._log_audit_summary(summary)
+
+    def print_audit_summary(self, summary: ImportAuditSummary):
+        """打印审计摘要到控制台。
+
+        基类实现使用标准日志。子类（如 TerminalImportSession）可以
+        覆盖此方法以提供更友好的终端输出。
+        """
+        pass
+
+    def _log_audit_summary(self, summary: ImportAuditSummary):
+        """将审计摘要写入导入日志文件。"""
+        self.logger.info("")
+        self.logger.info("=== Import Audit Summary ===")
+        self.logger.info("Total tasks processed: {}", summary.total_tasks)
+        if summary.applied:
+            self.logger.info("  Applied metadata: {}", summary.applied)
+        if summary.asis:
+            self.logger.info("  Imported as-is: {}", summary.asis)
+        if summary.skipped:
+            self.logger.info("  Skipped: {}", summary.skipped)
+        if summary.duplicate_replace:
+            self.logger.info(
+                "  Duplicates (replaced old): {}", summary.duplicate_replace
+            )
+        if summary.duplicate_keep:
+            self.logger.info(
+                "  Duplicates (kept both): {}", summary.duplicate_keep
+            )
+        if summary.duplicate_skip:
+            self.logger.info(
+                "  Duplicates (skipped new): {}", summary.duplicate_skip
+            )
+        if summary.needs_review:
+            self.logger.info(
+                "  Required manual review: {}", summary.needs_review
+            )
+        self.logger.info("============================")
+        self.logger.info("import finished {}", time.asctime())
 
     # Incremental and resumed imports
 

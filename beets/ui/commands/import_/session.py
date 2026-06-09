@@ -6,6 +6,7 @@ from itertools import chain
 from beets import config, importer, logging, plugins, ui
 from beets.autotag.hooks import AlbumMatch, TrackMatch
 from beets.autotag.match import Proposal, Recommendation, tag_album, tag_item
+from beets.importer import ImportAuditSummary
 from beets.util import PromptChoice, displayable_path
 from beets.util.color import colorize
 from beets.util.units import human_bytes, human_seconds_short
@@ -56,6 +57,8 @@ class TerminalImportSession(importer.ImportSession):
             return match
         elif action is not None:
             return action
+
+        task._needs_review = True
 
         # Loop until we have a choice.
         while True:
@@ -114,6 +117,8 @@ class TerminalImportSession(importer.ImportSession):
         elif action is not None:
             return action
 
+        task._needs_review = True
+
         while True:
             # Ask for a choice.
             choices = self._get_choices(task)
@@ -151,6 +156,7 @@ class TerminalImportSession(importer.ImportSession):
             log.info("Skipping.")
             sel = "s"
         else:
+            task._needs_review = True
             # Print some detail about the existing and new items so the
             # user can make an informed decision.
             for duplicate in found_duplicates:
@@ -277,6 +283,120 @@ class TerminalImportSession(importer.ImportSession):
                     extra_choices.remove(c)
 
         return choices + extra_choices
+
+    def log_choice(self, task, duplicate=False, needs_review=False):
+        """Override to pass along the task's _needs_review flag."""
+        needs_review = needs_review or getattr(task, "_needs_review", False)
+        super().log_choice(task, duplicate, needs_review)
+
+    def print_audit_summary(self, summary: ImportAuditSummary):
+        """在终端上打印格式化的导入审计摘要。"""
+        ui.print_()
+        ui.print_(colorize("action", "=== Import Audit Summary ==="))
+        ui.print_(
+            f"Total: {summary.total_tasks} item(s)/album(s) processed"
+        )
+        ui.print_()
+
+        if summary.applied:
+            n = summary.applied
+            msg = colorize(
+                "text_success" if not config["ui"]["color"].get() else "green",
+                f"  ✓ Applied metadata: {n}",
+            )
+            ui.print_(msg)
+            self._print_sample_details(summary.applied_details)
+
+        if summary.asis:
+            n = summary.asis
+            msg = colorize(
+                "text_highlight_minor"
+                if not config["ui"]["color"].get()
+                else "cyan",
+                f"  → Imported as-is: {n}",
+            )
+            ui.print_(msg)
+            self._print_sample_details(summary.asis_details)
+
+        if summary.skipped:
+            n = summary.skipped
+            msg = colorize(
+                "text_warning" if not config["ui"]["color"].get() else "yellow",
+                f"  ⊘ Skipped: {n}",
+            )
+            ui.print_(msg)
+            self._print_sample_details(summary.skipped_details)
+
+        has_duplicates = (
+            summary.duplicate_replace
+            or summary.duplicate_keep
+            or summary.duplicate_skip
+        )
+        if has_duplicates:
+            ui.print_()
+            ui.print_("  Duplicate handling:")
+            if summary.duplicate_replace:
+                ui.print_(
+                    colorize(
+                        "text_highlight",
+                        f"    ✗ Replaced old: {summary.duplicate_replace}",
+                    )
+                )
+                self._print_sample_details(
+                    summary.duplicate_replace_details, indent=6
+                )
+            if summary.duplicate_keep:
+                ui.print_(
+                    colorize(
+                        "text_highlight_minor",
+                        f"    ⇄ Kept both: {summary.duplicate_keep}",
+                    )
+                )
+                self._print_sample_details(
+                    summary.duplicate_keep_details, indent=6
+                )
+            if summary.duplicate_skip:
+                ui.print_(
+                    colorize(
+                        "text_warning",
+                        f"    ⊘ Skipped new: {summary.duplicate_skip}",
+                    )
+                )
+                self._print_sample_details(
+                    summary.duplicate_skip_details, indent=6
+                )
+
+        if summary.needs_review:
+            ui.print_()
+            msg = colorize(
+                "text_warning" if not config["ui"]["color"].get() else "yellow",
+                f"  ⚠ Required manual review: {summary.needs_review}",
+            )
+            ui.print_(msg)
+            self._print_sample_details(summary.needs_review_details)
+
+        ui.print_(colorize("action", "============================"))
+        ui.print_()
+
+    @staticmethod
+    def _print_sample_details(
+        details: list[tuple[str, str]], indent: int = 4
+    ):
+        """打印详细列表的样本（最多5条），带缩进。"""
+        prefix = " " * indent
+        max_show = 5
+        for i, (path, desc) in enumerate(details[:max_show]):
+            path_display = (
+                path if len(path) < 60 else "..." + path[-57:]
+            )
+            ui.print_(
+                f"{prefix}{colorize('text_faint', desc)}"
+                f" — {colorize('text_faint', path_display)}"
+            )
+        if len(details) > max_show:
+            ui.print_(
+                f"{prefix}{colorize('text_faint', f'... and {len(details) - max_show} more')}"
+            )
 
 
 def summarize_items(items, singleton):
