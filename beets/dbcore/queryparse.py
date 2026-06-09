@@ -172,7 +172,21 @@ def query_from_strings(
     """Creates a collection query of type `query_cls` from a list of
     strings in the format used by parse_query_part. `model_cls`
     determines how queries are constructed from strings.
+
+    .. deprecated:: 2.12
+        Use :meth:`beets.library.QueryNormalizationContext.build_collection`
+        instead, which applies consistent prefixes, path query
+        normalization, and error wrapping throughout beets.
     """
+    import warnings
+
+    warnings.warn(
+        "dbcore.query_from_strings() is deprecated; use "
+        "beets.library.QueryNormalizationContext.build_collection() for "
+        "consistent query prefixes, path normalization, and error handling.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     subqueries = []
     for part in query_parts:
         subqueries.append(construct_query_part(model_cls, prefixes, part))
