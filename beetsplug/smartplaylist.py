@@ -298,9 +298,11 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
         newly_matched = set()
         for playlist in all_playlists:
             n, (q, _), (a_q, _) = playlist
+            has_item_q = q is not None
+            has_album_q = a_q is not None
             is_relevant = (
-                (isinstance(model, Item) and (q or a_q))
-                or (isinstance(model, Album) and a_q)
+                (isinstance(model, Item) and (has_item_q or has_album_q))
+                or (isinstance(model, Album) and has_album_q)
             )
             if is_relevant:
                 newly_matched.add(playlist)

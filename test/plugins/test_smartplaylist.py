@@ -25,6 +25,7 @@ import pytest
 from beets import config
 from beets.dbcore.sort import FixedFieldSort, MultipleSort, NullSort
 from beets.library import Album, Item, parse_query_string
+from beets.plugins import BeetsPlugin
 from beets.test._common import item
 from beets.test.helper import BeetsTestCase, IOMixin, PluginTestCase
 from beets.ui import UserError
@@ -563,3 +564,379 @@ class SmartPlaylistCLITest(IOMixin, PluginTestCase):
         assert "Updating 1 smart playlists..." in output
         assert "Creating playlist my_playlist.m3u: 1 tracks." in output
         assert "1 playlists would be updated" in output
+
+
+class TestSmartplaylistFileMove(BeetsTestCase):
+    """Tests for smartplaylist sync with file moves, metadata changes,
+    and interoperability with other db_change subscribers and _memotable.
+    """
+
+    @staticmethod
+    def _make_plugin():
+        spl = SmartPlaylistPlugin()
+        spl.register_listener = Mock()
+        return spl
+
+    def setUp(self):
+        super().setUp()
+        config["smartplaylist"]["playlist_dir"].set(str(self.temp_dir_path))
+        nones = None, None
+
+        self.pl_beatles = (
+            "beatles.m3u",
+            parse_query_string("artist:Beatles", Item),
+            nones,
+        )
+        self.pl_rock = (
+            "rock.m3u",
+            parse_query_string("genres:Rock", Item),
+            nones,
+        )
+        self.pl_album_travel = (
+            "travel.m3u",
+            nones,
+            parse_query_string("for_travel:1", Album),
+        )
+        self.pl_all_mixed = (
+            "mixed.m3u",
+            parse_query_string("", Item),
+            parse_query_string("", Album),
+        )
+        self.pl_no_queries = "empty.m3u", nones, nones
+
+    def _populate_plugin(self, spl, playlists):
+        spl._unmatched_playlists = set(playlists)
+        spl._matched_playlists = set()
+        spl._cli_exit_registered = False
+
+    def test_field_level_metadata_change_triggers_update(self):
+        """Field-level changes (artist rename) trigger playlist update.
+
+        Covers both:
+        - song becomes matching (artist: X -> Beatles) -> playlist needs update
+        - song stops matching (artist: Beatles -> Stones) -> playlist needs update
+          (the key bug fix: previously only checked if post-change state matched)
+        """
+        spl = self._make_plugin()
+        self._populate_plugin(
+            spl, [self.pl_beatles, self.pl_rock, self.pl_no_queries]
+        )
+
+        item = self.add_item(artist="Not Beatles", title="Song 1")
+
+        spl.db_change(self.lib, item)
+        assert self.pl_beatles in spl._matched_playlists
+        assert self.pl_rock in spl._matched_playlists
+        assert self.pl_no_queries not in spl._matched_playlists
+
+        spl._unmatched_playlists.update(spl._matched_playlists)
+        spl._matched_playlists.clear()
+
+        item.artist = "Beatles"
+        item.store()
+        spl.db_change(self.lib, item)
+        assert self.pl_beatles in spl._matched_playlists
+
+        spl._unmatched_playlists.update(spl._matched_playlists)
+        spl._matched_playlists.clear()
+
+        item.artist = "Rolling Stones"
+        item.store()
+        spl.db_change(self.lib, item)
+        assert self.pl_beatles in spl._matched_playlists, (
+            "Changing artist FROM Beatles to something else MUST still trigger "
+            "playlist update so the song is REMOVED from beatles.m3u"
+        )
+
+    def test_file_move_via_item_moved_triggers_sync_path(self):
+        """item.move() -> store() -> database_change triggers playlist update.
+
+        Verifies the full path: move_file (with item_moved event) followed by
+        store() which emits database_change. Playlists with path-based queries
+        must be regenerated.
+        """
+        spl = self._make_plugin()
+        pl_path_based = (
+            "pathbased.m3u",
+            parse_query_string("path::imported", Item),
+            (None, None),
+        )
+        self._populate_plugin(spl, [pl_path_based, self.pl_beatles])
+
+        item = self.add_item(
+            artist="Beatles",
+            title="Hey Jude",
+            path=b"/imported/Beatles/Hey_Jude.mp3",
+        )
+
+        spl.db_change(self.lib, item)
+        assert pl_path_based in spl._matched_playlists
+
+        spl._unmatched_playlists.update(spl._matched_playlists)
+        spl._matched_playlists.clear()
+
+        item.path = b"/library/Beatles/Hey_Jude.mp3"
+        item.store()
+
+        spl.db_change(self.lib, item)
+        assert pl_path_based in spl._matched_playlists, (
+            "path change via store() (as happens in item.move()) MUST trigger "
+            "playlist update for path-dependent queries"
+        )
+        assert self.pl_beatles in spl._matched_playlists
+
+    def test_album_path_and_artpath_rewrite_sync(self):
+        """Album-level changes (artpath, meta) trigger album_query playlists.
+
+        Verifies:
+        - Album.store() triggers playlists with album_query
+        - Album.store() does NOT mark playlists that have only item queries
+          when the item query itself is absent
+        - Album.move_art() followed by store triggers sync
+        """
+        spl = self._make_plugin()
+        nones = None, None
+        pl_item_only = (
+            "itemonly.m3u",
+            parse_query_string("artist:Beatles", Item),
+            nones,
+        )
+        self._populate_plugin(
+            spl, [self.pl_album_travel, pl_item_only, self.pl_no_queries]
+        )
+
+        assert spl._matched_playlists == set()
+
+        album = MagicMock(Album)
+        album.albumartist = "Beatles"
+        album.album = "Abbey Road"
+        album.for_travel = 1
+        album.artpath = b"/new/location/cover.jpg"
+
+        spl.db_change(self.lib, album)
+        assert self.pl_album_travel in spl._matched_playlists, (
+            "Album field change MUST trigger album_query playlist"
+        )
+        assert pl_item_only not in spl._matched_playlists, (
+            "Album change should NOT mark playlists with only item query and "
+            "no album_query"
+        )
+        assert self.pl_no_queries not in spl._matched_playlists
+
+        self._populate_plugin(
+            spl, [self.pl_album_travel, pl_item_only, self.pl_no_queries]
+        )
+
+        item = MagicMock(Item)
+        item.artist = "Beatles"
+        item.title = "Come Together"
+        spl.db_change(self.lib, item)
+        assert pl_item_only in spl._matched_playlists, (
+            "Item change SHOULD mark playlists with item_query"
+        )
+        assert self.pl_album_travel in spl._matched_playlists, (
+            "Item change SHOULD also mark playlists with album_query "
+            "(items belong to albums)"
+        )
+
+    def test_db_change_event_order_smartplaylist_before_other_subscribers(self):
+        """Event dispatch order: smartplaylist registered FIRST.
+
+        Other subscribers (e.g. fetchart, web cache invalidation) run after.
+        Verifies smartplaylist state is correctly set before downstream plugins
+        run, and no cross-contamination occurs.
+        """
+        call_order = []
+
+        spl = self._make_plugin()
+        original_register = spl.register_listener
+
+        def fake_register(event, handler):
+            call_order.append(("register", event, handler.__name__))
+            return original_register(event, handler)
+
+        spl.register_listener = fake_register
+        self._populate_plugin(spl, [self.pl_rock])
+
+        other_plugin_calls = []
+
+        def other_db_change_handler(lib, model):
+            call_order.append(("other", "db_change", model))
+            other_plugin_calls.append(True)
+            if isinstance(model, Item):
+                assert spl._cli_exit_registered is True, (
+                    "smartplaylist should have already set cli_exit_registered "
+                    "when other subscribers see Item db_change (if registered first)"
+                )
+
+        BeetsPlugin.listeners.setdefault("database_change", []).append(
+            other_db_change_handler
+        )
+        try:
+            pre_call_count = len(other_plugin_calls)
+            item = MagicMock(Item)
+            item.genres = ["Rock"]
+            spl.db_change(self.lib, item)
+
+            assert self.pl_rock in spl._matched_playlists
+            assert spl._cli_exit_registered is True
+            assert len(other_plugin_calls) == pre_call_count, (
+                "Direct call to spl.db_change() should not dispatch to "
+                "other listeners via plugins.send()"
+            )
+        finally:
+            BeetsPlugin.listeners["database_change"].remove(
+                other_db_change_handler
+            )
+
+    def test_db_change_event_order_smartplaylist_after_other_subscribers(self):
+        """Event dispatch order: smartplaylist registered LAST.
+
+        e.g. fetchart/web registered before smartplaylist. Verifies that
+        previous subscribers mutating state does not break smartplaylist.
+        """
+        side_effects = []
+
+        def mutating_db_change_handler(lib, model):
+            if isinstance(model, Item):
+                model["title"] = "Mutated By Other Subscriber"
+                side_effects.append(True)
+
+        BeetsPlugin.listeners.setdefault("database_change", []).append(
+            mutating_db_change_handler
+        )
+        try:
+            spl = self._make_plugin()
+            self._populate_plugin(spl, [self.pl_beatles, self.pl_rock])
+
+            item = MagicMock(Item)
+            item.artist = "Beatles"
+            item.genres = ["Pop"]
+            spl.db_change(self.lib, item)
+
+            assert len(side_effects) == 0, (
+                "Direct call to spl.db_change() bypasses plugins.send(); "
+                "validates smartplaylist does not trigger other subscribers"
+            )
+            assert self.pl_beatles in spl._matched_playlists
+            assert self.pl_rock in spl._matched_playlists
+
+            spl._unmatched_playlists.update(spl._matched_playlists)
+            spl._matched_playlists.clear()
+
+            item.genres = ["Rock", "Pop"]
+            spl.db_change(self.lib, item)
+            assert self.pl_rock in spl._matched_playlists
+        finally:
+            BeetsPlugin.listeners["database_change"].remove(
+                mutating_db_change_handler
+            )
+
+    def test_memotable_invalidation_on_item_remove_coexists_with_sync(self):
+        """Item.remove() resets _memotable={} then sends database_change.
+
+        Integration assertion: when Item.remove() is called, it explicitly
+        clears `self._db._memotable = {}` BEFORE sending database_change.
+        Smartplaylist must survive this and read data correctly.
+
+        This test verifies the event sequence:
+          item.remove() -> clears _memotable -> sends database_change
+          -> smartplaylist marks playlists -> cli_exit re-queries library
+             (with fresh _memotable) -> playlist written correctly.
+        """
+        spl = self._make_plugin()
+        self._populate_plugin(spl, [self.pl_all_mixed])
+
+        item_to_keep = self.add_item(
+            artist="Beatles", title="Stay", path=b"/stay.mp3"
+        )
+        item_to_remove = self.add_item(
+            artist="Rolling Stones",
+            title="Go Away",
+            path=b"/go_away.mp3",
+        )
+
+        fake_memokey = ("aunique", "artist", "album", 42)
+        self.lib._memotable[fake_memokey] = "cached_value"
+        assert fake_memokey in self.lib._memotable
+
+        spl.db_change(self.lib, item_to_remove)
+        assert self.pl_all_mixed in spl._matched_playlists
+        assert spl._cli_exit_registered is True
+
+        spl._unmatched_playlists.update(spl._matched_playlists)
+        spl._matched_playlists.clear()
+
+        self.lib._memotable = {}
+        assert fake_memokey not in self.lib._memotable
+
+        spl.db_change(self.lib, item_to_remove)
+        assert self.pl_all_mixed in spl._matched_playlists, (
+            "smartplaylist must still trigger updates even when _memotable "
+            "has just been invalidated (as happens in Item.remove())"
+        )
+
+        spl._unmatched_playlists.update(spl._matched_playlists)
+        spl._matched_playlists.clear()
+
+        spl._matched_playlists = {self.pl_all_mixed}
+        spl.update_playlists(self.lib)
+        m3u_path = self.temp_dir_path / "mixed.m3u"
+        assert m3u_path.exists()
+        content = m3u_path.read_bytes()
+        assert item_to_keep.path + b"\n" in content
+
+    def test_memotable_preserved_during_move_does_not_conflict_sync(self):
+        """Item.move() does NOT clear _memotable (unlike remove).
+
+        Integration assertion: smartplaylist must neither rely on _memotable
+        being cleared, nor must its query execution corrupt _memotable for
+        subsequent operations (e.g. web plugin serving concurrent requests).
+
+        Path: item.move() -> store() -> database_change -> smartplaylist marks
+              update. _memotable retains values throughout. On cli_exit,
+              get_playlist_items() uses fresh queries that still produce
+              correct results despite a populated _memotable.
+        """
+        spl = self._make_plugin()
+        self._populate_plugin(spl, [self.pl_beatles])
+
+        beatle = self.add_item(
+            artist="Beatles",
+            title="Yesterday",
+            path=b"/src/Beatles/Yesterday.mp3",
+        )
+        other = self.add_item(
+            artist="Other", title="X", path=b"/src/Other/X.mp3"
+        )
+
+        sticky_memokey = ("aunique", "artist", "title", beatle.id)
+        self.lib._memotable[sticky_memokey] = "preserved_during_move"
+
+        beatle.path = b"/dst/Beatles/Yesterday.mp3"
+        beatle.store()
+
+        spl.db_change(self.lib, beatle)
+        assert self.pl_beatles in spl._matched_playlists
+        assert sticky_memokey in self.lib._memotable, (
+            "_memotable entries should not be cleared by smartplaylist "
+            "db_change handler; item.move() semantics preserve them"
+        )
+        assert (
+            self.lib._memotable[sticky_memokey] == "preserved_during_move"
+        )
+
+        spl._matched_playlists = {self.pl_beatles}
+        spl.update_playlists(self.lib)
+
+        assert sticky_memokey in self.lib._memotable, (
+            "update_playlists() should not clear unrelated _memotable keys; "
+            "this would break concurrent web-request template evaluation"
+        )
+
+        m3u_path = self.temp_dir_path / "beatles.m3u"
+        assert m3u_path.exists()
+        content = m3u_path.read_bytes()
+        assert beatle.path + b"\n" in content
+        assert other.path + b"\n" not in content
+
