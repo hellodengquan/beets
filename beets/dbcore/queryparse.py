@@ -210,7 +210,7 @@ def query_from_strings(
         "beets.library.QueryNormalizationContext.build_collection() for "
         "consistent query prefixes, path normalization, and error handling.",
         DeprecationWarning,
-        stacklevel=2,
+        stacklevel=1,
     )
     return _query_from_strings_impl(query_cls, model_cls, prefixes, query_parts)
 

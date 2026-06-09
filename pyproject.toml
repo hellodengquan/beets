@@ -301,6 +301,27 @@ extend-exclude = [
     "README_kr.rst",
 ]
 
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["test"]
+filterwarnings = [
+    # Treat any DeprecationWarning that originates from the beets or
+    # beetsplug packages (i.e. module name starts with "beets" or
+    # "beetsplug") as a hard error. This acts as the project-level
+    # regression guard for legacy-API reintroductions, equivalent to
+    # passing ``-W error::DeprecationWarning::beets`` on the command
+    # line. Third-party plugin authors should add the same flag to
+    # their own CI to detect when they need to migrate.
+    "error::DeprecationWarning:beets\\..*",
+    "error::DeprecationWarning:beetsplug\\..*",
+    # Also catch warnings emitted from the top-level ``beets`` module
+    # itself (no dot after).
+    "error::DeprecationWarning:beets",
+    "error::DeprecationWarning:beetsplug",
+]
+junit_family = "xunit2"
+junit_logging = "out-err"
+
 [tool.ruff]
 target-version = "py310"
 line-length = 80

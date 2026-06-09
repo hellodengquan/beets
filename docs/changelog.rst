@@ -12,6 +12,14 @@ Unreleased
 New features
 ~~~~~~~~~~~~
 
+- Introduce the :class:`~beets.library.queries.QueryNormalizationContext`
+  public API (plus the :func:`~beets.library.queries.build_query_context`
+  factory) as the single, well-tested entry point for building queries from
+  user input. The context unifies query-prefix registration, implicit path
+  detection, sort case-sensitivity handling, and consistent error wrapping
+  so plugins no longer need to repeat these four steps. See the
+  :ref:`Query Normalization API <query-normalization-api>` developer guide
+  for method signatures, migration examples, and factory extension points.
 - :doc:`plugins/convert`: The ``--force`` and ``--keep-new`` CLI flags are now
   also available as config options via ``force`` and ``keep_new``.
 - :ref:`import-cmd`: The ``--nomove`` / ``-M`` CLI flag can now be used to
@@ -68,9 +76,35 @@ Bug fixes
   errors (e.g. a file locked by another process) are logged as warnings instead
   of crashing beets. :bug:`6193`
 
-..
-    For plugin developers
-    ~~~~~~~~~~~~~~~~~~~~~
+For plugin developers
+~~~~~~~~~~~~~~~~~~~~~
+
+- :func:`beets.dbcore.query_from_strings` is **deprecated** and emits a
+  :class:`DeprecationWarning` pointing at the new
+  :meth:`~beets.library.queries.QueryNormalizationContext.build_collection`
+  method. The legacy helper accepted a raw ``prefixes={}`` map in many
+  downstream call-sites, which silently disabled built-in prefix syntax
+  (``field::regex``, ``field:=exact``, ``field:=~string``) and plugin-provided
+  query prefixes. The new :class:`~beets.library.queries.QueryNormalizationContext`
+  guarantees consistent prefixes, implicit path-query normalization, and
+  wraps :class:`~beets.dbcore.query.InvalidQueryArgumentValueError` into the
+  public :class:`~beets.dbcore.InvalidQueryError` the UI knows how to render.
+  See the :ref:`Query Normalization API <query-normalization-api>` developer
+  guide for side-by-side migration examples:
+
+  * ``dbcore.query_from_strings(AndQuery, cls, prefixes, parts)`` →
+    ``ctx.build_collection(AndQuery, parts, cls)``
+  * ``dbcore.parse_sorted_query(cls, parts, prefixes, case_insensitive)`` →
+    ``ctx.parse_sorted(parts, cls)``
+  * ad-hoc ``isinstance(query, str/list/tuple/Query)`` dispatching →
+    ``ctx.parse(query, cls)``
+
+- To guard against accidental reintroductions, the pytest configuration in
+  ``pyproject.toml`` now promotes any
+  ``DeprecationWarning`` originating in the ``beets`` or ``beetsplug`` packages
+  to a hard test failure via the ``filterwarnings`` setting. Authors of
+  third-party plugins can rely on the same guarantee by running their test
+  suite with ``-W error::DeprecationWarning::beets`` on the command line.
 
 Other changes
 ~~~~~~~~~~~~~
