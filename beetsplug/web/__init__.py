@@ -390,16 +390,20 @@ def album_art(album_id):
     album = g.lib.get_album(album_id)
     if album and album.artpath:
         artpath = album.artpath.decode()
+        etag_parts = [str(album.id)]
         try:
-            mtime = os.path.getmtime(util.syspath(album.artpath))
+            stat_result = os.stat(util.syspath(album.artpath))
+            etag_parts.append(str(stat_result.st_mtime_ns))
+            etag_parts.append(str(stat_result.st_ino))
+            etag_parts.append(str(stat_result.st_size))
         except OSError:
-            mtime = None
+            pass
         response = flask.send_file(artpath)
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
-        if mtime:
-            response.set_etag(f"{album.id}-{int(mtime)}")
+        if len(etag_parts) > 1:
+            response.set_etag("-".join(etag_parts))
         return response
     else:
         return flask.abort(404)

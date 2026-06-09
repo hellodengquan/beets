@@ -341,6 +341,13 @@ class Album(LibModel):
         """The path to album's cover picture as pathlib.Path."""
         return Path(os.fsdecode(self.artpath)) if self.artpath else None
 
+    def _setitem(self, key, value):
+        """Override to clear _memotable when artpath changes."""
+        changed = super()._setitem(key, value)
+        if changed and key == "artpath" and self._db:
+            self._db._memotable = {}
+        return changed
+
     @classmethod
     def _getters(cls):
         # In addition to plugin-provided computed fields, also expose
