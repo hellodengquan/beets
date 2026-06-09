@@ -389,7 +389,18 @@ def album_query(queries):
 def album_art(album_id):
     album = g.lib.get_album(album_id)
     if album and album.artpath:
-        return flask.send_file(album.artpath.decode())
+        artpath = album.artpath.decode()
+        try:
+            mtime = os.path.getmtime(util.syspath(album.artpath))
+        except OSError:
+            mtime = None
+        response = flask.send_file(artpath)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        if mtime:
+            response.set_etag(f"{album.id}-{int(mtime)}")
+        return response
     else:
         return flask.abort(404)
 

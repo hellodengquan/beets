@@ -84,10 +84,14 @@ class LibModel(dbcore.Model["Library"]):
 
     def store(self, fields=None):
         super().store(fields)
+        if self._db:
+            self._db._memotable = {}
         plugins.send("database_change", lib=self._db, model=self)
 
     def remove(self):
         super().remove()
+        if self._db:
+            self._db._memotable = {}
         plugins.send("database_change", lib=self._db, model=self)
 
     def add(self, lib=None):
@@ -432,6 +436,8 @@ class Album(LibModel):
         else:
             assert False, "unknown MoveOperation"
         self.artpath = new_art
+        if self._db:
+            self._db._memotable = {}
 
     def move(self, operation=MoveOperation.MOVE, basedir=None, store=True):
         """Move, copy, link or hardlink (depending on `operation`)
@@ -551,6 +557,8 @@ class Album(LibModel):
         else:
             util.move(path, artdest)
         self.artpath = artdest
+        if self._db:
+            self._db._memotable = {}
 
         plugins.send("art_set", album=self)
 
