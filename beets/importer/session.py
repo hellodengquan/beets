@@ -126,17 +126,41 @@ class ImportAuditSummary:
 
     @staticmethod
     def _task_description(task: ImportTask) -> str:
-        """生成任务的简要描述（艺术家/专辑或标题）。"""
+        """生成任务的简要描述（艺术家/专辑或标题）。
+
+        优先使用已选择的匹配信息；若尚不可用则回退到现有元数据；
+        任何异常均被捕获并返回一个占位值，避免审计路径崩溃。
+        """
         try:
             if task.is_album:
                 info = task.chosen_info() if task.choice_flag else {}
-                artist = info.get("artist") or info.get("albumartist") or "Unknown"
-                album = info.get("album") or task.cur_album or "Unknown"
+                artist = (
+                    info.get("artist")
+                    or info.get("albumartist")
+                    or (task.items and task.items[0].albumartist)
+                    or (task.items and task.items[0].artist)
+                    or "Unknown"
+                )
+                album = (
+                    info.get("album")
+                    or task.cur_album
+                    or (task.items and task.items[0].album)
+                    or "Unknown"
+                )
                 return f"{artist} - {album}"
             else:
                 info = task.chosen_info() if task.choice_flag else {}
-                artist = info.get("artist") or getattr(task, "item", None) and task.item.artist or "Unknown"
-                title = info.get("title") or getattr(task, "item", None) and task.item.title or "Unknown"
+                item = getattr(task, "item", None)
+                artist = (
+                    info.get("artist")
+                    or (item and item.artist)
+                    or "Unknown"
+                )
+                title = (
+                    info.get("title")
+                    or (item and item.title)
+                    or "Unknown"
+                )
                 return f"{artist} - {title}"
         except Exception:
             return "N/A"

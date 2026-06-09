@@ -168,6 +168,44 @@ registration process in this case:
     :Parameters: ``session`` (|ImportSession|)
     :Description: Called just before a ``beet import`` session starts.
 
+``import_audit_summary``
+    :Parameters: ``session`` (|ImportSession|), ``summary``
+        (:class:`~beets.importer.ImportAuditSummary`)
+    :Description: Called at the end of a ``beet import`` session, *after* the
+        pipeline finishes (including on user abort) and *before* the CLI
+        returns control. Only fires when at least one import task has been
+        processed (``summary.total_tasks > 0``).
+
+        Listeners can introspect the ``summary`` object to learn how many
+        items/albums were modified, imported as-is, skipped, caught by the
+        duplicate-handling logic, or flagged for manual review. Details of
+        the first N entries per bucket are also exposed for logging,
+        reporting, or follow-up steps.
+
+        Example listener::
+
+            from beets.plugins import BeetsPlugin
+            from beets.importer import ImportAuditSummary
+
+            def _on_audit(session, summary: ImportAuditSummary):
+                if summary.needs_review:
+                    # E.g. write a ticket, push a notification, …
+                    report = [
+                        f"⚠ {path} — {desc}"
+                        for path, desc in summary.needs_review_details
+                    ]
+                    print("\n".join(report))
+
+            class AuditPlugin(BeetsPlugin):
+                def __init__(self):
+                    super().__init__()
+                    self.register_listener("import_audit_summary", _on_audit)
+
+        See :class:`~beets.importer.ImportAuditSummary` for the full field
+        contract. The summary is also written to the importer log file via
+        :attr:`ImportSession.logger` and is printed on the terminal in the
+        interactive UI.
+
 ``trackinfo_received``
     :Parameters: ``info`` (|TrackInfo|)
     :Description: Called after metadata for a track is fetched (e.g., from
