@@ -3,7 +3,15 @@ from beets.util.deprecation import deprecate_imports
 from .exceptions import FileOperationError, ReadError, WriteError
 from .library import Library
 from .models import Album, Item, LibModel
-from .queries import parse_query_parts, parse_query_string
+from .queries import (
+    QueryNormalizationContext,
+    build_query_context,
+    get_query_prefixes,
+    get_sort_case_insensitive,
+    normalize_query_parts,
+    parse_query_parts,
+    parse_query_string,
+)
 
 NEW_MODULE_BY_NAME = dict.fromkeys(
     ("DateType", "DurationType", "MusicalKey", "PathType"), "beets.dbcore.types"
@@ -22,8 +30,13 @@ __all__ = [
     "Item",
     "LibModel",
     "Library",
+    "QueryNormalizationContext",
     "ReadError",
     "WriteError",
+    "build_query_context",
+    "get_query_prefixes",
+    "get_sort_case_insensitive",
+    "normalize_query_parts",
     "parse_query_parts",
     "parse_query_string",
 ]

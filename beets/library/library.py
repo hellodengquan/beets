@@ -16,7 +16,7 @@ from beets.util.pathformats import get_path_formats
 
 from . import migrations
 from .models import Album, Item
-from .queries import parse_query_parts, parse_query_string
+from .queries import QueryNormalizationContext, parse_query_parts, parse_query_string
 
 if TYPE_CHECKING:
     from beets.dbcore import Results
@@ -127,18 +127,13 @@ class Library(dbcore.Database):
         If an order specification is present in the query string
         the `sort` argument is ignored.
         """
-        # Parse the query, if necessary.
-        try:
-            parsed_sort = None
+        parsed_sort = None
+        if isinstance(query, (str, list, tuple)):
             # Query parsing needs the library root, but keeping it scoped here
             # avoids leaking one Library's directory into another's work.
             with context.music_dir(self.directory):
-                if isinstance(query, str):
-                    query, parsed_sort = parse_query_string(query, model_cls)
-                elif isinstance(query, (list, tuple)):
-                    query, parsed_sort = parse_query_parts(query, model_cls)
-        except dbcore.query.InvalidQueryArgumentValueError as exc:
-            raise dbcore.InvalidQueryError(query, exc)
+                ctx = QueryNormalizationContext()
+                query, parsed_sort = ctx.parse(query, model_cls)
 
         # Any non-null sort specified by the parsed query overrides the
         # provided sort.
