@@ -162,6 +162,31 @@ def construct_query_part(
         return out_query
 
 
+def _query_from_strings_impl(
+    query_cls: type[query.CollectionQuery],
+    model_cls: type[LibModel],
+    prefixes: Prefixes,
+    query_parts: Collection[str],
+) -> query.Query:
+    """*Internal*: constructs a collection query without deprecation warnings.
+
+    Same behaviour as the public :func:`query_from_strings` but without the
+    :class:`DeprecationWarning` emission. Used by
+    :func:`parse_sorted_query` (which lives in the same module) to avoid
+    spurious warnings when constructing OR-branched sub-queries.
+
+    Third-party code should NOT call this helper directly – use
+    :class:`~beets.library.queries.QueryNormalizationContext.build_collection`
+    instead.
+    """
+    subqueries = []
+    for part in query_parts:
+        subqueries.append(construct_query_part(model_cls, prefixes, part))
+    if not subqueries:  # No terms in query.
+        subqueries = [query.TrueQuery()]
+    return query_cls(subqueries)
+
+
 # TYPING ERROR
 def query_from_strings(
     query_cls: type[query.CollectionQuery],
@@ -187,12 +212,7 @@ def query_from_strings(
         DeprecationWarning,
         stacklevel=2,
     )
-    subqueries = []
-    for part in query_parts:
-        subqueries.append(construct_query_part(model_cls, prefixes, part))
-    if not subqueries:  # No terms in query.
-        subqueries = [query.TrueQuery()]
-    return query_cls(subqueries)
+    return _query_from_strings_impl(query_cls, model_cls, prefixes, query_parts)
 
 
 def construct_sort_part(
@@ -266,7 +286,7 @@ def parse_sorted_query(
             # Parse the subquery in to a single AndQuery
             # TODO: Avoid needlessly wrapping AndQueries containing 1 subquery?
             query_parts.append(
-                query_from_strings(
+                _query_from_strings_impl(
                     query.AndQuery, model_cls, prefixes, subquery_parts
                 )
             )

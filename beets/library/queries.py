@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import beets
 from beets import dbcore, logging, plugins
+from beets.dbcore import queryparse as _queryparse
 
 if TYPE_CHECKING:
     from beets.dbcore import query as query_module
@@ -137,7 +138,7 @@ class QueryNormalizationContext:
         """
         normalized_parts = self.normalize(parts)
         try:
-            query = dbcore.query_from_strings(
+            query = _queryparse._query_from_strings_impl(
                 query_cls,
                 model_cls,
                 self.prefixes,

@@ -18,6 +18,7 @@ import os
 import shutil
 import sqlite3
 import unittest
+import warnings
 from tempfile import mkstemp
 from typing import ClassVar
 
@@ -619,9 +620,16 @@ class QueryParseTest(unittest.TestCase):
 
 class QueryFromStringsTest(unittest.TestCase):
     def qfs(self, strings):
-        return dbcore.queryparse.query_from_strings(
-            query.AndQuery, ModelFixture1, {":": query.RegexpQuery}, strings
-        )
+        # Suppress the DeprecationWarning for this legacy-API test class,
+        # which exercises the low-level helper directly on purpose.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return dbcore.queryparse.query_from_strings(
+                query.AndQuery,
+                ModelFixture1,
+                {":": query.RegexpQuery},
+                strings,
+            )
 
     def test_zero_parts(self):
         q = self.qfs([])

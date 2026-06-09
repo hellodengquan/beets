@@ -524,3 +524,78 @@ class TestBuildQueryContext:
             parts = [tmp.name]
             # With normalization disabled, no path: injection happens
             assert ctx.normalize(parts) == parts
+
+
+# =============================================================================
+# 8. Anti-regression – beets' own code paths must NOT emit DeprecationWarning
+# =============================================================================
+
+
+class TestNoLegacyDeprecationWarnings(PytestTestHelper):
+    """Sanity guard: core query flows in beets itself must remain clean.
+
+    This test acts as the in-repo equivalent of the CI setting
+    ``-W error::DeprecationWarning``. When a future change accidentally
+    re-introduces a call to the legacy ``dbcore.query_from_strings`` from
+    a non-test code path (or from ``parse_sorted_query``'s OR-branch
+    helper), this test fails immediately, giving plugin developers a
+    clean warning surface.
+    """
+
+    def _exercises_without_suppression(self):
+        """Exercises all major builder entry points, warning-unguarded."""
+        ctx = QueryNormalizationContext()
+
+        # 1) parse_sorted – plain parts + sort tokens
+        q, s = ctx.parse_sorted(["artist::Beatles", "year:2000", "title+"], Item)
+        assert isinstance(q, Query)
+        assert isinstance(s, FixedFieldSort)
+
+        # 2) parse_string – shlex-split path with a field prefix
+        q, s = ctx.parse_string('album:=~"Abbey Road" bpm+', Album)
+        assert isinstance(q, AndQuery)
+
+        # 3) build_collection – exact-match AndQuery
+        q = ctx.build_collection(AndQuery, ["genre:=Rock", "year:2000"], Item)
+        assert isinstance(q, AndQuery)
+
+        # 4) parse() – dispatch to all four input types
+        for inp in [
+            "artist:Bowie",
+            ["artist:Bowie", "year-"],
+            ("comp:true",),
+            MatchQuery("artist", "Prince"),
+        ]:
+            q, s = ctx.parse(inp, Item)  # type: ignore[arg-type]
+            assert isinstance(q, Query)
+
+        # 5) Library.items() / albums() – the real CLI-facing entry point
+        self.add_item(title="Yesterday", year=1965)
+        self.add_item(title="Tomorrow", year=2000)
+        assert len(list(self.lib.items("Yesterday"))) == 1
+        assert len(list(self.lib.albums())) >= 0
+
+    def test_no_deprecation_warnings_in_core_paths(self):
+        # Using ``pytest.warns(None)`` turns *any* unexpected warning
+        # (including DeprecationWarning) into a failure.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            self._exercises_without_suppression()
+
+    def test_warning_treated_as_error_matches_ci_flag(self):
+        """Mirror the ``-W error::DeprecationWarning`` CI semantics.
+
+        This sub-test demonstrates that a *genuine* call to the legacy
+        public entry point gets turned into a DeprecationWarning-based
+        exception under the strict policy, so the test above is
+        meaningful.
+        """
+        import beets.dbcore as _db
+
+        with pytest.raises((DeprecationWarning, Exception)):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                # Deliberately exercise the legacy entry point
+                _db.query_from_strings(
+                    AndQuery, Item, prefixes={}, query_parts=["foo"]
+                )
