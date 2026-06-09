@@ -326,6 +326,192 @@ When migrating a plugin, perform the following steps in order:
 7. Run the plugin’s existing tests plus the generic
    ``test/test_plugin_config_manager.py`` suite.
 
+Remaining Plugins (Backlog)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The following **33** high-impact plugins still use the legacy
+``self.config.add()`` path and are listed in the recommended migration order
+(most complex / most used first).  Plugins with ``≥ 6`` configuration keys
+are likely to benefit the most from centralized validation, while the second
+group has ``2–5`` keys and makes up the bulk of easy wins.  (A longer tail of
+**39** additional plugins with ``0–1`` visible configuration options exists
+in ``beetsplug/``; those are omitted here because they either carry no
+dynamic configuration at all or share their settings through a helper
+module.)
+
+Tier 1 — complex plugins (≥ 6 options)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These are the “convert/replaygain equivalents” that should be tackled first
+because each one exercises many different key types (booleans, ints, strings,
+enumerations, secrets, file paths).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 10 65
+
+   * - Plugin
+     - Options
+     - Notes / recommended metadata coverage
+
+   * - ``duplicates``
+     - ~15
+     - Mix of booleans, query strings and paths.  Add ``help`` for every
+       flag and consider ``choices`` for the canonical merge strategies.
+   * - ``lyrics``
+     - ~14
+     - Many backend toggles (google, musixmatch, genius, …); add
+       ``redact=True`` for API keys.
+   * - ``smartplaylist``
+     - ~13
+     - Mix of paths, relative-to-library booleans and playlist format
+       strings.  Add ``type=str`` / ``type=bool`` everywhere.
+   * - ``discogs``
+     - ~11
+     - Requires user tokens; use ``redact=True`` for ``token`` and
+       ``secret``, plus ``choices`` for the sort order.
+   * - ``titlecase``
+     - ~11
+     - Mostly boolean/string customization of the titlecase algorithm;
+       straightforward migration.
+   * - ``spotify``
+     - ~8
+     - OAuth credentials (``redact=True``) + several tuning knobs.
+   * - ``ftintitle``
+     - ~7
+     - Format strings and detection rules; good example of string/boolean
+       combinations.
+   * - ``web``
+     - ~7
+     - Host/port + CORS + authentication secret (``redact``).
+   * - ``embyupdate``
+     - ~6
+     - Hostname, port, credentials and a couple of boolean toggles.
+
+Tier 2 — medium plugins (2–5 options)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These make up the bulk of the migration work; each one is smaller than a
+Tier 1 plugin but still benefits from explicit ``type``, ``help`` and
+(where applicable) ``choices`` / ``redact``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 10 65
+
+   * - Plugin
+     - Options
+     - Notes / recommended metadata coverage
+
+   * - ``export``
+     - 5
+     - Preset definitions + JSON/YAML toggles.
+   * - ``importfeeds``
+     - 5
+     - Paths, playlist formats, and relative-path flags.
+   * - ``musicbrainz``
+     - 5
+     - ``user``/``pass`` credentials (``redact=True``) + search tuning.
+   * - ``subsonicplaylist``
+     - 5
+     - URL + credentials + sync flags.
+   * - ``the``
+     - 5
+     - Pattern list + strip/store toggles.
+   * - ``zero``
+     - 5
+     - Fields list + a few booleans; also consider a ``validator`` that
+       checks fields are actually zero-able.
+   * - ``bpd``
+     - 5
+     - Host/port + audio backend selection (``choices``).
+   * - ``absubmit``
+     - 4
+     - API endpoint + acousticbrainz tuning; ``redact`` for keys.
+   * - ``acousticbrainz``
+     - 4
+     - Tags/pitches toggles; small but frequently used.
+   * - ``autobpm``
+     - 4
+     - Binary selection + overwrite flags.
+   * - ``bucket``
+     - 4
+     - Album group expression, paths and boolean flags.
+   * - ``mbpseudo``
+     - 4
+     - Pseudo-release selection booleans.
+   * - ``missing``
+     - 4
+     - Count/album-only flags; string format overrides.
+   * - ``playlist``
+     - 4
+     - Playlist directory, relative paths, extension.
+   * - ``subsonicupdate``
+     - 4
+     - Same credential/path shape as ``subsonicplaylist``.
+   * - ``albumtypes``
+     - 3
+     - Type map plus two boolean knobs; ``choices`` for recognized types.
+   * - ``beatport``
+     - 3
+     - OAuth (``redact``) + overwrite flags.
+   * - ``edit``
+     - 3
+     - Editor command + two boolean flags.
+   * - ``keyfinder``
+     - 3
+     - Binary selection + key writing knobs.
+   * - ``mbcollection``
+     - 3
+     - MusicBrainz credentials + action toggles (``redact``).
+   * - ``mbsubmit``
+     - 3
+     - Disc-ID / submit related knobs.
+   * - ``thumbnails``
+     - 3
+     - Directory, force, force-localize flags.
+
+Tier 3 — small plugins (≤ 2 options)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each of these has very few (usually 1–2) configuration keys, making them
+ideal first issues for new contributors.  They are grouped as a single batch
+because the per-plumbing overhead dominates:
+
+* ``bpm``, ``fuzzy``, ``ihate``, ``importadded``, ``ipfs``, ``lastimport``,
+  ``parentwork``, ``permissions``, ``tidal``, ``unimported``.
+
+Each typically just needs a ``default`` + ``type`` + short ``help`` string,
+with one or two of them additionally using ``redact=True`` for credentials.
+
+Order of Execution
+~~~~~~~~~~~~~~~~~~
+
+To make best use of reviewer capacity and the
+``PendingDeprecationWarning`` signals from ``setup.cfg``, tackle the backlog
+in the following order:
+
+1. **Tier 1, high usage first** – ``lyrics``, ``duplicates``,
+   ``smartplaylist``, ``discogs``.  After each migration, re-run
+   ``pytest -W error::PendingDeprecationWarning::beets.plugins`` *against
+   that plugin’s test module* to confirm the warning is gone.
+2. **Tier 2, credential-bearing plugins first** – any plugin that ships
+   ``user``/``password``/``token`` fields (``musicbrainz``,
+   ``mbcollection``, ``subsonicplaylist``, ``subsonicupdate``,
+   ``beatport``, ``acousticbrainz``, ``absubmit``, …) should be migrated
+   immediately after Tier 1 so that ``redact=True`` can protect secrets
+   in bug reports and configuration dumps.
+3. **Tier 2, format-heavy plugins** – ``export``, ``importfeeds``,
+   ``the``, ``zero``, ``bucket``, ``playlist``, …
+4. **Tier 2, remaining** – everything else in the table above.
+5. **Tier 3** – use the list above as a “good first issue” pool.
+6. **Final clean-up** – once the 33-item backlog above is done, enable
+   a stricter pytest rule in ``setup.cfg`` by changing the
+   ``default::PendingDeprecationWarning`` filter to
+   ``error::PendingDeprecationWarning:beets.plugins`` so any future
+   regression to ``self.config.add()`` fails CI instead of being a
+   warning.
+
 More information
 ----------------
 

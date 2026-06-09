@@ -79,6 +79,34 @@ Other changes
   sync run, follows the standard beets write-before-store pattern, and logs
   audio-features API unavailability only once per run.
 
+For plugin developers
+~~~~~~~~~~~~~~~~~~~~~
+
+- Introduce the centralized ``PluginConfigManager`` together with two new
+  registration methods on ``BeetsPlugin``: ``register_config()`` for single
+  options and ``register_config_batch()`` for batch declarations. Each option
+  can now carry metadata (``default``, ``type``, ``choices``, ``help``,
+  ``required``, ``validator``, ``deprecated``, ``redact``) which drives
+  automatic validation, type coercion, redactions and deprecation warnings.
+  See :ref:`plugin-config-schema` in the developer guide for the full schema
+  and migration guide.
+- Direct use of ``self.config.add()`` on ``BeetsPlugin`` now emits a
+  ``PendingDeprecationWarning`` that nudges authors toward
+  ``register_config_batch()``. The internal ``LegacyConfigProxy`` transparent
+  wrapper keeps all existing confuse-based code working while surfacing the
+  migration signal.
+- ``setup.cfg`` now ships with ``filterwarnings`` / ``-W`` pytest rules that
+  surface ``PendingDeprecationWarning`` from ``beets.plugins`` and
+  ``beets.util.config`` in the test summary so reviewers and downstream
+  maintainers can see exactly which plugins still use the legacy path.
+- Migrated seven high-usage core plugins to ``register_config_batch()`` as
+  reference implementations: :doc:`plugins/embedart`,
+  :doc:`plugins/lastgenre`, :doc:`plugins/fetchart` (including the Last.fm
+  cover art source, i.e. **lastfm**), :doc:`plugins/mpdupdate`,
+  :doc:`plugins/replaygain`, :doc:`plugins/scrub` and
+  :doc:`plugins/convert`. See the :ref:`plugin-config-schema` chapter for
+  the remaining 33 plugins and the recommended migration order.
+
 2.11.0 (May 06, 2026)
 ---------------------
 
