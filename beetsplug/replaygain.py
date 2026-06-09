@@ -1178,27 +1178,71 @@ class ReplayGainPlugin(BeetsPlugin):
         super().__init__()
 
         # default backend is 'command' for backward-compatibility.
-        self.config.add(
+        self.register_config_batch(
             {
-                "overwrite": False,
-                "auto": True,
-                "backend": "command",
-                "threads": os.cpu_count(),
-                "parallel_on_import": False,
-                "per_disc": False,
-                "peak": "true",
-                "targetlevel": 89,
-                "r128": ["Opus"],
-                "r128_targetlevel": lufs_to_db(-23),
+                "overwrite": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Force re-calculation of existing tags on import",
+                },
+                "auto": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Automatically analyze audio on import",
+                },
+                "backend": {
+                    "default": "command",
+                    "type": str,
+                    "choices": list(BACKENDS.keys()),
+                    "help": f"Analysis backend ({', '.join(BACKENDS.keys())})",
+                },
+                "threads": {
+                    "default": os.cpu_count(),
+                    "type": int,
+                    "help": "Number of threads for parallel analysis",
+                },
+                "parallel_on_import": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Use parallel pool during import",
+                },
+                "per_disc": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Calculate album gain per disc",
+                },
+                "peak": {
+                    "default": "true",
+                    "type": str,
+                    "choices": list(PeakMethod.__members__.keys()),
+                    "help": (
+                        f"Peak detection method "
+                        f"({', '.join(PeakMethod.__members__.keys())})"
+                    ),
+                },
+                "targetlevel": {
+                    "default": 89,
+                    "type": float,
+                    "help": "Target reference loudness (dB)",
+                },
+                "r128": {
+                    "default": ["Opus"],
+                    "help": "Formats to treat as EBU R128",
+                },
+                "r128_targetlevel": {
+                    "default": lufs_to_db(-23),
+                    "type": float,
+                    "help": "Target LUFS for R128 analysis",
+                },
             }
         )
 
         # FIXME: Consider renaming the configuration option and deprecating the
         # old name 'overwrite'.
-        self.force_on_import: bool = self.config["overwrite"].get(bool)
+        self.force_on_import: bool = self.config_bool("overwrite")
 
         # Remember which backend is used for CLI feedback
-        self.backend_name = self.config["backend"].as_str()
+        self.backend_name = self.config_str("backend")
 
         if self.backend_name not in BACKENDS:
             raise UserError(
@@ -1208,7 +1252,7 @@ class ReplayGainPlugin(BeetsPlugin):
 
         # FIXME: Consider renaming the configuration option to 'peak_method'
         # and deprecating the old name 'peak'.
-        peak_method = self.config["peak"].as_str()
+        peak_method = self.config_str("peak")
         if peak_method not in PeakMethod.__members__:
             raise UserError(
                 f"Selected ReplayGain peak method {peak_method} is not"
@@ -1330,7 +1374,7 @@ class ReplayGainPlugin(BeetsPlugin):
         self._log.info("analyzing {}", album)
 
         discs: dict[int, list[Item]] = {}
-        if self.config["per_disc"].get(bool):
+        if self.config_bool("per_disc"):
             for item in album.items():
                 if discs.get(item.disc) is None:
                     discs[item.disc] = []
@@ -1464,10 +1508,10 @@ class ReplayGainPlugin(BeetsPlugin):
 
     def import_begin(self, session: ImportSession):
         """Handle `import_begin` event -> open pool"""
-        threads: int = self.config["threads"].get(int)
+        threads: int = self.config_int("threads")
 
         if (
-            self.config["parallel_on_import"]
+            self.config_bool("parallel_on_import")
             and self.config["auto"]
             and threads
         ):

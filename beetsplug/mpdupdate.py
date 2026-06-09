@@ -66,11 +66,33 @@ class BufferedSocket:
 class MPDUpdatePlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
+        self.register_config_batch(
+            {
+                "host": {
+                    "default": os.environ.get("MPD_HOST", "localhost"),
+                    "type": str,
+                    "help": "MPD server hostname or socket path",
+                },
+                "port": {
+                    "default": int(os.environ.get("MPD_PORT", 6600)),
+                    "type": int,
+                    "help": "MPD server TCP port",
+                },
+                "password": {
+                    "default": "",
+                    "type": str,
+                    "help": "MPD server password",
+                    "redact": True,
+                },
+            }
+        )
+        # Also populate legacy global `config["mpd"]` namespace used by
+        # the plugin. Forwards plugin-level overrides into global keys.
         config["mpd"].add(
             {
-                "host": os.environ.get("MPD_HOST", "localhost"),
-                "port": int(os.environ.get("MPD_PORT", 6600)),
-                "password": "",
+                "host": self.config_str("host"),
+                "port": self.config_int("port"),
+                "password": self.config_str("password"),
             }
         )
         config["mpd"]["password"].redact = True

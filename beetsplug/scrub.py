@@ -46,9 +46,17 @@ class ScrubPlugin(BeetsPlugin):
 
     def __init__(self):
         super().__init__()
-        self.config.add({"auto": True})
+        self.register_config_batch(
+            {
+                "auto": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Automatically scrub files on import",
+                },
+            }
+        )
 
-        if self.config["auto"]:
+        if self.config_bool("auto"):
             self.register_listener("import_task_files", self.import_task_files)
 
     def commands(self):

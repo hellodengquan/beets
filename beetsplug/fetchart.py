@@ -1330,38 +1330,93 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
         # fetching them and placing them in the filesystem.
         self.art_candidates: dict[ImportTask, Candidate] = {}
 
-        self.config.add(
+        self.register_config_batch(
             {
-                "auto": True,
-                "minwidth": 0,
-                "maxwidth": 0,
-                "quality": 0,
-                "max_filesize": 0,
-                "enforce_ratio": False,
-                "cautious": False,
-                "cover_names": ["cover", "front", "art", "album", "folder"],
-                "fallback": None,
-                "sources": [
-                    "filesystem",
-                    "coverart",
-                    "itunes",
-                    "amazon",
-                    "albumart",
-                    "cover_art_url",
-                ],
-                "store_source": False,
-                "high_resolution": False,
-                "deinterlace": False,
-                "cover_format": None,
+                "auto": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Automatically fetch art on import",
+                },
+                "minwidth": {
+                    "default": 0,
+                    "type": int,
+                    "help": "Minimum image width in pixels (0 = disabled)",
+                },
+                "maxwidth": {
+                    "default": 0,
+                    "type": int,
+                    "help": "Maximum image width in pixels (0 = disabled)",
+                },
+                "quality": {
+                    "default": 0,
+                    "type": int,
+                    "help": "JPEG quality for resizing (0-95, 0 = disabled)",
+                },
+                "max_filesize": {
+                    "default": 0,
+                    "type": int,
+                    "help": "Maximum filesize in bytes (0 = disabled)",
+                },
+                "enforce_ratio": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Enforce square aspect ratio (bool/Npx/N%)",
+                },
+                "cautious": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Require high-confidence match for cover",
+                },
+                "cover_names": {
+                    "default": ["cover", "front", "art", "album", "folder"],
+                    "help": "Filenames (no extension) to consider covers",
+                },
+                "fallback": {
+                    "default": None,
+                    "type": str,
+                    "help": "Path to fallback cover image if no match",
+                },
+                "sources": {
+                    "default": [
+                        "filesystem",
+                        "coverart",
+                        "itunes",
+                        "amazon",
+                        "albumart",
+                        "cover_art_url",
+                    ],
+                    "help": "Ordered list of cover art sources to query",
+                },
+                "store_source": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Store source URL in album.art_source field",
+                },
+                "high_resolution": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Prefer pixel-for-pixel match over smallest",
+                },
+                "deinterlace": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Deinterlace progressive cover art",
+                },
+                "cover_format": {
+                    "default": None,
+                    "type": str,
+                    "choices": [None, "jpg", "png"],
+                    "help": "Image format to store (None = keep original)",
+                },
             }
         )
         for source in ART_SOURCES:
             source.add_default_config(self.config)
 
-        self.minwidth = self.config["minwidth"].get(int)
-        self.maxwidth = self.config["maxwidth"].get(int)
-        self.max_filesize = self.config["max_filesize"].get(int)
-        self.quality = self.config["quality"].get(int)
+        self.minwidth = self.config_int("minwidth")
+        self.maxwidth = self.config_int("maxwidth")
+        self.max_filesize = self.config_int("max_filesize")
+        self.quality = self.config_int("quality")
 
         # allow both pixel and percentage-based margin specifications
         self.enforce_ratio = self.config["enforce_ratio"].get(
@@ -1375,7 +1430,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
         )
         self.margin_px = None
         self.margin_percent = None
-        self.deinterlace = self.config["deinterlace"].get(bool)
+        self.deinterlace = self.config_bool("deinterlace")
         if isinstance(self.enforce_ratio, str):
             if self.enforce_ratio[-1] == "%":
                 self.margin_percent = float(self.enforce_ratio[:-1]) / 100
@@ -1388,17 +1443,17 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
 
         cover_names = self.config["cover_names"].as_str_seq()
         self.cover_names = list(map(util.bytestring_path, cover_names))
-        self.cautious = self.config["cautious"].get(bool)
+        self.cautious = self.config_bool("cautious")
         self.fallback = self.config["fallback"].get(
             confuse.Optional(confuse.Filename())
         )
-        self.store_source = self.config["store_source"].get(bool)
+        self.store_source = self.config_bool("store_source")
 
         self.cover_format = self.config["cover_format"].get(
             confuse.Optional(str)
         )
 
-        if self.config["auto"]:
+        if self.config_bool("auto"):
             # Enable two import hooks when fetching is enabled.
             self.import_stages = [self.fetch_art]
             self.register_listener("import_task_files", self.assign_art)
@@ -1411,7 +1466,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
                 "been deprecated. Instead, place `filesystem` at the end of "
                 "your `sources` list."
             )
-            if self.config["remote_priority"].get(bool):
+            if self.config_bool("remote_priority"):
                 fs = []
                 others = []
                 for s, c in sources:

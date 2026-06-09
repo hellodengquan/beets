@@ -30,6 +30,7 @@ import mediafile
 from confuse import ConfigTypeError, Optional
 
 from beets import plugins, ui, util
+from beets.util import pipeline as _pipeline  # ensure submodule is imported
 from beets.exceptions import UserError
 from beets.library import Item, parse_query_string
 from beets.plugins import BeetsPlugin
@@ -73,54 +74,149 @@ def replace_ext(path: bytes, ext: bytes) -> bytes:
 class ConvertPlugin(BeetsPlugin):
     def __init__(self) -> None:
         super().__init__()
-        self.config.add(
+        self.register_config_batch(
             {
-                "dest": None,
-                "pretend": False,
-                "link": False,
-                "hardlink": False,
-                "threads": os.cpu_count(),
-                "format": "mp3",
-                "id3v23": "inherit",
-                "write_metadata": True,
-                "formats": {
-                    "aac": {
-                        "command": (
-                            "ffmpeg -i $source -y -vn -acodec aac -aq 1 $dest"
-                        ),
-                        "extension": "m4a",
-                    },
-                    "alac": {
-                        "command": (
-                            "ffmpeg -i $source -y -vn -acodec alac $dest"
-                        ),
-                        "extension": "m4a",
-                    },
-                    "flac": "ffmpeg -i $source -y -vn -acodec flac $dest",
-                    "mp3": "ffmpeg -i $source -y -vn -aq 2 $dest",
-                    "opus": (
-                        "ffmpeg -i $source -y -vn -acodec libopus -ab 96k $dest"
-                    ),
-                    "ogg": (
-                        "ffmpeg -i $source -y -vn -acodec libvorbis -aq 3 $dest"
-                    ),
-                    "wma": "ffmpeg -i $source -y -vn -acodec wmav2 -vn $dest",
+                "dest": {"default": None, "type": str, "help": "Output directory"},
+                "pretend": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Show actions without executing",
                 },
-                "max_bitrate": None,
-                "auto": False,
-                "auto_keep": False,
-                "tmpdir": None,
-                "quiet": False,
-                "embed": True,
-                "paths": {},
-                "no_convert": "",
-                "never_convert_lossy_files": False,
-                "copy_album_art": False,
-                "album_art_maxwidth": 0,
-                "delete_originals": False,
-                "playlist": None,
-                "force": False,
-                "keep_new": False,
+                "link": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Symlink when no transcoding needed",
+                },
+                "hardlink": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Hardlink when no transcoding needed",
+                },
+                "threads": {
+                    "default": os.cpu_count(),
+                    "type": int,
+                    "help": "Number of worker threads",
+                },
+                "format": {
+                    "default": "mp3",
+                    "type": str,
+                    "help": "Target format name (see formats)",
+                },
+                "id3v23": {
+                    "default": "inherit",
+                    "type": str,
+                    "choices": ["inherit", "True", "False"],
+                    "help": "Write ID3v2.3 tags (True/False/inherit)",
+                },
+                "write_metadata": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Write tags after conversion",
+                },
+                "formats": {
+                    "default": {
+                        "aac": {
+                            "command": (
+                                "ffmpeg -i $source -y -vn -acodec aac -aq 1 $dest"
+                            ),
+                            "extension": "m4a",
+                        },
+                        "alac": {
+                            "command": (
+                                "ffmpeg -i $source -y -vn -acodec alac $dest"
+                            ),
+                            "extension": "m4a",
+                        },
+                        "flac": (
+                            "ffmpeg -i $source -y -vn -acodec flac $dest"
+                        ),
+                        "mp3": "ffmpeg -i $source -y -vn -aq 2 $dest",
+                        "opus": (
+                            "ffmpeg -i $source -y -vn -acodec libopus -ab 96k $dest"
+                        ),
+                        "ogg": (
+                            "ffmpeg -i $source -y -vn -acodec libvorbis -aq 3 $dest"
+                        ),
+                        "wma": (
+                            "ffmpeg -i $source -y -vn -acodec wmav2 -vn $dest"
+                        ),
+                    },
+                    "help": "Map of format name to command/extension",
+                },
+                "max_bitrate": {
+                    "default": None,
+                    "type": int,
+                    "help": "Transcode above this kbps (None = disabled)",
+                },
+                "auto": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Auto-convert on import (transient)",
+                },
+                "auto_keep": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Auto-convert on import (keep converted)",
+                },
+                "tmpdir": {
+                    "default": None,
+                    "type": str,
+                    "help": "Directory for temporary transcode files",
+                },
+                "quiet": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Suppress encode status messages",
+                },
+                "embed": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Embed album art into converted files",
+                },
+                "paths": {
+                    "default": {},
+                    "help": "Query-to-template path mappings",
+                },
+                "no_convert": {
+                    "default": "",
+                    "type": str,
+                    "help": "Query to exclude items from conversion",
+                },
+                "never_convert_lossy_files": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Skip lossy source formats",
+                },
+                "copy_album_art": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Copy album art alongside converted files",
+                },
+                "album_art_maxwidth": {
+                    "default": 0,
+                    "type": int,
+                    "help": "Maximum width for copied/embedded art (0 = no limit)",
+                },
+                "delete_originals": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Delete original files after transcode on import",
+                },
+                "playlist": {
+                    "default": None,
+                    "type": str,
+                    "help": "M3U playlist name under destination directory",
+                },
+                "force": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Always transcode, bypass should_transcode checks",
+                },
+                "keep_new": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Keep converted file, move original to dest",
+                },
             }
         )
         self.early_import_stages = [self.auto_convert, self.auto_convert_keep]
@@ -228,7 +324,7 @@ class ConvertPlugin(BeetsPlugin):
 
     @cached_property
     def threads(self) -> int:
-        return self.config["threads"].get(int)
+        return self.config_int("threads")
 
     @cached_property
     def path_formats(self) -> list[PathFormat]:
@@ -247,19 +343,19 @@ class ConvertPlugin(BeetsPlugin):
 
     @cached_property
     def pretend(self) -> bool:
-        return self.config["pretend"].get(bool)
+        return self.config_bool("pretend")
 
     @cached_property
     def force(self) -> bool:
-        return self.config["force"].get(bool)
+        return self.config_bool("force")
 
     @cached_property
     def hardlink(self) -> bool:
-        return self.config["hardlink"].get(bool)
+        return self.config_bool("hardlink")
 
     @cached_property
     def link(self) -> bool:
-        return not self.hardlink and self.config["link"].get(bool)
+        return not self.hardlink and self.config_bool("link")
 
     @cached_property
     def command(self) -> FormatCommand:
@@ -318,7 +414,7 @@ class ConvertPlugin(BeetsPlugin):
         Raises `subprocess.CalledProcessError` if the command exited with a
         non-zero status code.
         """
-        pretend, quiet = self.pretend, self.config["quiet"].get(bool)
+        pretend, quiet = self.pretend, self.config_bool("quiet")
 
         if not quiet and not pretend:
             self._log.info("Encoding {}", util.displayable_path(source_bytes))
@@ -386,7 +482,7 @@ class ConvertPlugin(BeetsPlugin):
         if self.force:
             return True
         if self.in_no_convert(item) or (
-            self.config["never_convert_lossy_files"].get(bool)
+            self.config_bool("never_convert_lossy_files")
             and item.format.lower() not in LOSSLESS_FORMATS
         ):
             return False
@@ -493,7 +589,7 @@ class ConvertPlugin(BeetsPlugin):
             id3v23 = None
 
         # Write tags from the database to the file if requested
-        if self.config["write_metadata"].get(bool):
+        if self.config_bool("write_metadata"):
             item.try_write(path=converted, id3v23=id3v23)
 
         if keep_new:
@@ -649,7 +745,7 @@ class ConvertPlugin(BeetsPlugin):
                 items_paths.append(os.path.relpath(item_path, pl_dir))
 
         self._parallel_convert(
-            items, keep_new=self.config["keep_new"].get(bool)
+            items, keep_new=self.config_bool("keep_new")
         )
 
         if playlist:
@@ -704,7 +800,7 @@ class ConvertPlugin(BeetsPlugin):
         """
         newwidth = None
         if self.config["album_art_maxwidth"]:
-            maxwidth = self.config["album_art_maxwidth"].get(int)
+            maxwidth = self.config_int("album_art_maxwidth")
             size = ArtResizer.shared.get_size(artpath)
             self._log.debug("image size: {}", size)
             if size:
