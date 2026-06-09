@@ -77,14 +77,40 @@ albums that have a ``for_travel`` extensible field set to 1:
       query: 'for_travel:1'
 
 By default, each playlist is automatically regenerated at the end of the session
-if an item or album it matches changed in the library database. To force
-regeneration, you can invoke it manually from the command line:
+if an item or album it matches changed in the library database.
+
+Automatic Synchronization
+-------------------------
+
+The plugin ensures perfect synchronization between your music library and smart
+playlists by detecting **all types of changes** that can affect query results:
+
+- **New items added**: When you import or add new songs that match a playlist's
+  query, the playlist will be automatically updated to include them.
+- **Items removed**: When you delete songs from your library, they will be
+  automatically removed from all affected playlists.
+- **Items modified/renamed**: When you modify any metadata (artist, title,
+  genre, etc.), the plugin re-evaluates all relevant playlists. This means:
+
+  - Songs that now match a playlist's query will be added
+  - Songs that no longer match the query will be removed
+
+  For example, if you change a song's genre from "Rock" to "Jazz", it will
+  automatically be removed from the ``genre:Rock`` playlist and added to the
+  ``genre:Jazz`` playlist (if both exist).
+
+- **Album changes**: Changes to album metadata trigger updates for all
+  playlists that use ``album_query``.
+
+The updates happen automatically at the end of each beets command session when
+``auto`` is set to ``yes`` (the default). To force regeneration, you can invoke
+it manually from the command line:
 
 ::
 
     $ beet splupdate
 
-This will regenerate all smart playlists. You can also specify which ones you
+This regenerates all smart playlists. You can also specify which ones you
 want to regenerate:
 
 ::

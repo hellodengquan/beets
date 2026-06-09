@@ -35,8 +35,14 @@ _p = pytest.param
 
 
 class SmartPlaylistTest(BeetsTestCase):
-    def test_build_queries(self):
+    @staticmethod
+    def _make_plugin():
         spl = SmartPlaylistPlugin()
+        spl.register_listener = Mock()
+        return spl
+
+    def test_build_queries(self):
+        spl = self._make_plugin()
         assert spl._matched_playlists == set()
         assert spl._unmatched_playlists == set()
 
@@ -71,7 +77,7 @@ class SmartPlaylistTest(BeetsTestCase):
         }
 
     def test_build_queries_with_sorts(self):
-        spl = SmartPlaylistPlugin()
+        spl = self._make_plugin()
         config["smartplaylist"]["playlists"].set(
             [
                 {"name": "no_sort", "query": "foo"},
@@ -114,7 +120,7 @@ class SmartPlaylistTest(BeetsTestCase):
         ]
 
     def test_matches(self):
-        spl = SmartPlaylistPlugin()
+        spl = self._make_plugin()
 
         a = MagicMock(Album)
         i = MagicMock(Item)
@@ -144,34 +150,139 @@ class SmartPlaylistTest(BeetsTestCase):
         assert spl.matches(i, queries_list, None)
         assert not spl.matches(a, queries_list, None)
 
-    def test_db_changes(self):
-        spl = SmartPlaylistPlugin()
+    def test_db_changes_item_triggers_item_query_playlists(self):
+        """Any Item change should mark all playlists with item/album queries."""
+        spl = self._make_plugin()
 
         nones = None, None
         pl1 = "1", ("q1", None), nones
         pl2 = "2", ("q2", None), nones
-        pl3 = "3", ("q3", None), nones
+        pl3 = "3", nones, nones
+        pl4 = "4", nones, ("aq1", None)
+        pl5 = "5", ("q5", None), ("aq5", None)
 
-        spl._unmatched_playlists = {pl1, pl2, pl3}
+        spl._unmatched_playlists = {pl1, pl2, pl3, pl4, pl5}
         spl._matched_playlists = set()
 
-        spl.matches = Mock(return_value=False)
-        spl.db_change(None, "nothing")
-        assert spl._unmatched_playlists == {pl1, pl2, pl3}
+        i = MagicMock(Item)
+        spl.db_change(None, i)
+
+        assert spl._unmatched_playlists == {pl3}
+        assert spl._matched_playlists == {pl1, pl2, pl4, pl5}
+        assert spl._cli_exit_registered is True
+
+    def test_db_changes_album_triggers_album_query_playlists(self):
+        """Album change should mark playlists with album queries only."""
+        spl = self._make_plugin()
+
+        nones = None, None
+        pl1 = "1", ("q1", None), nones
+        pl2 = "2", nones, ("aq1", None)
+        pl3 = "3", ("q3", None), ("aq3", None)
+        pl4 = "4", nones, nones
+
+        spl._unmatched_playlists = {pl1, pl2, pl3, pl4}
+        spl._matched_playlists = set()
+
+        a = MagicMock(Album)
+        spl.db_change(None, a)
+
+        assert spl._unmatched_playlists == {pl1, pl4}
+        assert spl._matched_playlists == {pl2, pl3}
+
+    def test_db_changes_multiple_updates_accumulate(self):
+        """Multiple db changes should accumulate playlists to update."""
+        spl = self._make_plugin()
+
+        nones = None, None
+        pl1 = "1", ("q1", None), nones
+        pl2 = "2", ("q2", None), nones
+
+        spl._unmatched_playlists = {pl1, pl2}
+        spl._matched_playlists = set()
+
+        i = MagicMock(Item)
+        spl.db_change(None, i)
+
+        assert spl._unmatched_playlists == set()
+        assert spl._matched_playlists == {pl1, pl2}
+        assert spl._cli_exit_registered is True
+
+    def test_db_changes_after_update_playlists_reset(self):
+        """After update_playlists, playlists should be returned to unmatched."""
+        spl = self._make_plugin()
+
+        nones = None, None
+        pl1 = "1", ("q1", None), nones
+        pl2 = "2", ("q2", None), nones
+
+        spl._unmatched_playlists = {pl1, pl2}
+        spl._matched_playlists = set()
+
+        lib = Mock()
+        lib.items.return_value = []
+        lib.albums.return_value = []
+        lib.replacements = CHAR_REPLACE
+
+        i = MagicMock(Item)
+        spl.db_change(None, i)
+        assert spl._matched_playlists == {pl1, pl2}
+        assert spl._unmatched_playlists == set()
+
+        spl.update_playlists(lib)
+        assert spl._unmatched_playlists == {pl1, pl2}
         assert spl._matched_playlists == set()
 
-        spl.matches.side_effect = lambda _, q, __: q == "q3"
-        spl.db_change(None, "matches 3")
-        assert spl._unmatched_playlists == {pl1, pl2}
-        assert spl._matched_playlists == {pl3}
+    def test_db_changes_item_added_triggers_update(self):
+        """Newly added item should trigger playlist update."""
+        spl = self._make_plugin()
 
-        spl.matches.side_effect = lambda _, q, __: q == "q1"
-        spl.db_change(None, "matches 3")
-        assert spl._matched_playlists == {pl1, pl3}
-        assert spl._unmatched_playlists == {pl2}
+        nones = None, None
+        pl = "added.m3u", ("artist:NewArtist", None), nones
+        spl._unmatched_playlists = {pl}
+        spl._matched_playlists = set()
+
+        new_item = MagicMock(Item)
+        new_item.artist = "NewArtist"
+        spl.db_change(None, new_item)
+
+        assert pl in spl._matched_playlists
+        assert spl._cli_exit_registered is True
+
+    def test_db_changes_item_removed_triggers_update(self):
+        """Removed item should trigger playlist update even if not currently matching."""
+        spl = self._make_plugin()
+
+        nones = None, None
+        pl = "removed.m3u", ("genre:Rock", None), nones
+        spl._unmatched_playlists = {pl}
+        spl._matched_playlists = set()
+
+        removed_item = MagicMock(Item)
+        removed_item.genre = "Jazz"
+        spl.db_change(None, removed_item)
+
+        assert pl in spl._matched_playlists
+        assert spl._cli_exit_registered is True
+
+    def test_db_changes_item_renamed_triggers_update(self):
+        """Item field change (rename/modify) should trigger playlist update."""
+        spl = self._make_plugin()
+
+        nones = None, None
+        pl = "beatles.m3u", ("artist:Beatles", None), nones
+        spl._unmatched_playlists = {pl}
+        spl._matched_playlists = set()
+
+        modified_item = MagicMock(Item)
+        modified_item.artist = "The Beatles"
+        spl.db_change(None, modified_item)
+
+        assert pl in spl._matched_playlists
+        assert spl._cli_exit_registered is True
 
     def test_playlist_update(self):
-        spl = SmartPlaylistPlugin()
+        spl = self._make_plugin()
 
         i = Mock(path=b"/tagada.mp3")
         i.evaluate_template.side_effect = lambda pl, *_: os.fsdecode(
@@ -208,7 +319,7 @@ class SmartPlaylistTest(BeetsTestCase):
         assert content == b"/tagada.mp3\n"
 
     def test_playlist_update_output_extm3u(self):
-        spl = SmartPlaylistPlugin()
+        spl = self._make_plugin()
 
         i = MagicMock()
         type(i).artist = PropertyMock(return_value="fake artist")
@@ -255,7 +366,7 @@ class SmartPlaylistTest(BeetsTestCase):
         )
 
     def test_playlist_update_output_extm3u_fields(self):
-        spl = SmartPlaylistPlugin()
+        spl = self._make_plugin()
 
         i = MagicMock()
         type(i).artist = PropertyMock(return_value="Fake Artist")

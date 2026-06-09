@@ -77,6 +77,7 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
         self.config["prefix"].redact = True  # May contain username/password.
         self._matched_playlists: set[PlaylistMatch] = set()
         self._unmatched_playlists: set[PlaylistMatch] = set()
+        self._cli_exit_registered: bool = False
         # validate output format
         self.config["output"].get(confuse.Choice(["m3u", "extm3u"]))
 
@@ -252,6 +253,7 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
         """
         self._unmatched_playlists = set()
         self._matched_playlists = set()
+        self._cli_exit_registered = False
 
         for playlist in self.config["playlists"].get(list):
             if "name" not in playlist:
@@ -289,17 +291,29 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
         return False
 
     def db_change(self, lib: Library, model: Item | Album) -> None:
-        if self._unmatched_playlists is None:
+        if not self._unmatched_playlists and not self._matched_playlists:
             self.build_queries()
 
-        for playlist in self._unmatched_playlists:
+        all_playlists = self._unmatched_playlists | self._matched_playlists
+        newly_matched = set()
+        for playlist in all_playlists:
             n, (q, _), (a_q, _) = playlist
-            if self.matches(model, q, a_q):
-                self._log.debug("{} will be updated because of {}", n, model)
-                self._matched_playlists.add(playlist)
-                self.register_listener("cli_exit", self.update_playlists)
+            is_relevant = (
+                (isinstance(model, Item) and (q or a_q))
+                or (isinstance(model, Album) and a_q)
+            )
+            if is_relevant:
+                newly_matched.add(playlist)
+                self._log.debug(
+                    "{} will be updated due to library change: {}", n, model
+                )
 
-        self._unmatched_playlists -= self._matched_playlists
+        if newly_matched:
+            self._matched_playlists.update(newly_matched)
+            self._unmatched_playlists -= newly_matched
+            if not self._cli_exit_registered:
+                self.register_listener("cli_exit", self.update_playlists_on_exit)
+                self._cli_exit_registered = True
 
     @staticmethod
     def get_queries(
@@ -382,6 +396,13 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
             for entry in entries:
                 f.write(entry.get_comment(is_extm3u, keys))
 
+    def update_playlists_on_exit(self, lib: Library) -> None:
+        """Wrapper called on cli_exit to update playlists and reset state."""
+        try:
+            self.update_playlists(lib)
+        finally:
+            self._cli_exit_registered = False
+
     def update_playlists(self, lib: Library) -> None:
         playlist_count = len(self._matched_playlists)
         self._log.info("Updating {} smart playlists...", playlist_count)
@@ -434,6 +455,9 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
             # Send an event when playlists were updated.
             plugins.send("smartplaylist_update")
             self._log.info("{} playlists updated", playlist_count)
+
+        self._unmatched_playlists.update(self._matched_playlists)
+        self._matched_playlists.clear()
 
 
 class PlaylistItem:
