@@ -47,6 +47,11 @@ class LibModel(dbcore.Model["Library"]):
 
     _field_names: ClassVar[set[str]]
 
+    _cover_fields: ClassVar[set[str]] = set()
+    """Set of cover-related fields whose changes should trigger _memotable
+    invalidation. Subclasses override with the relevant fields for each type.
+    """
+
     # Config key that specifies how an instance should be formatted.
     _format_config_key: str
     path: bytes
@@ -93,6 +98,13 @@ class LibModel(dbcore.Model["Library"]):
         if self._db:
             self._db._memotable = {}
         plugins.send("database_change", lib=self._db, model=self)
+
+    def _setitem(self, key, value):
+        """Override to clear _memotable when cover-related fields change."""
+        changed = super()._setitem(key, value)
+        if changed and key in self._cover_fields and self._db:
+            self._db._memotable = {}
+        return changed
 
     def add(self, lib=None):
         # super().add() calls self.store(), which sends `database_change`,
@@ -258,6 +270,7 @@ class Album(LibModel):
     _table = "albums"
     _flex_table = "album_attributes"
     _always_dirty = True
+    _cover_fields: ClassVar[set[str]] = {"artpath", "cover_art_url"}
     _field_names: ClassVar[set[str]] = {
         "added",
         "album",
@@ -340,13 +353,6 @@ class Album(LibModel):
     def art_filepath(self) -> Path | None:
         """The path to album's cover picture as pathlib.Path."""
         return Path(os.fsdecode(self.artpath)) if self.artpath else None
-
-    def _setitem(self, key, value):
-        """Override to clear _memotable when artpath changes."""
-        changed = super()._setitem(key, value)
-        if changed and key == "artpath" and self._db:
-            self._db._memotable = {}
-        return changed
 
     @classmethod
     def _getters(cls):
@@ -631,6 +637,7 @@ class Item(LibModel):
 
     _table = "items"
     _flex_table = "item_attributes"
+    _cover_fields: ClassVar[set[str]] = {"cover_art_url"}
     _field_names: ClassVar[set[str]] = (Album._field_names - {"artpath"}) | {
         "acoustid_fingerprint",
         "acoustid_id",

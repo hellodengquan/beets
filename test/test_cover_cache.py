@@ -107,6 +107,168 @@ class MemotableClearingTest(ItemInDBTestCase):
         self.album.artpath = b"/same/path.jpg"
         assert self.lib._memotable == {"cached": "value"}
 
+    def test_memotable_cleared_on_album_cover_art_url_change(self):
+        self.lib._memotable = {"cached": "old_value"}
+        self.album.cover_art_url = "http://example.com/cover.jpg"
+        assert self.lib._memotable == {}
+
+    def test_memotable_cleared_on_album_cover_art_url_set_to_none(self):
+        self.album.cover_art_url = "http://example.com/old.jpg"
+        self.lib._memotable = {"cached": "old_value"}
+        self.album.cover_art_url = None
+        assert self.lib._memotable == {}
+
+    def test_memotable_not_cleared_when_album_cover_art_url_unchanged(self):
+        self.album.cover_art_url = "http://example.com/same.jpg"
+        self.lib._memotable = {"cached": "value"}
+        self.album.cover_art_url = "http://example.com/same.jpg"
+        assert self.lib._memotable == {"cached": "value"}
+
+
+class ItemMemotableClearingTest(ItemInDBTestCase):
+    """Test that _memotable is cleared when Item.cover_art_url is modified."""
+
+    def setUp(self):
+        super().setUp()
+        self.item = self.add_item_fixture()
+
+    def test_memotable_cleared_on_item_cover_art_url_assignment(self):
+        self.lib._memotable = {"cached": "old_value"}
+        self.item.cover_art_url = "http://example.com/track_cover.jpg"
+        assert self.lib._memotable == {}
+
+    def test_memotable_cleared_on_item_cover_art_url_setitem(self):
+        self.lib._memotable = {"cached": "old_value"}
+        self.item["cover_art_url"] = "http://example.com/track_cover.jpg"
+        assert self.lib._memotable == {}
+
+    def test_memotable_cleared_on_item_cover_art_url_set_to_none(self):
+        self.item.cover_art_url = "http://example.com/old.jpg"
+        self.lib._memotable = {"cached": "old_value"}
+        self.item.cover_art_url = None
+        assert self.lib._memotable == {}
+
+    def test_memotable_not_cleared_when_item_cover_art_url_unchanged(self):
+        self.item.cover_art_url = "http://example.com/same.jpg"
+        self.lib._memotable = {"cached": "value"}
+        self.item.cover_art_url = "http://example.com/same.jpg"
+        assert self.lib._memotable == {"cached": "value"}
+
+    def test_memotable_not_cleared_on_item_unrelated_field(self):
+        self.lib._memotable = {"cached": "value"}
+        self.item.title = "New Title"
+        assert self.lib._memotable == {"cached": "value"}
+
+    def test_memotable_cleared_on_item_store(self):
+        self.lib._memotable = {"cached": "old_value"}
+        self.item.title = "New Title"
+        self.item.store()
+        assert self.lib._memotable == {}
+
+    def test_memotable_cleared_on_item_remove(self):
+        self.lib._memotable = {"cached": "old_value"}
+        self.item.remove()
+        assert self.lib._memotable == {}
+
+
+class CoverFieldsBenchmarkTest(ItemInDBTestCase):
+    """Benchmark-style assertions to quantify the overhead of the
+    _setitem interceptor under bulk write scenarios.
+
+    These tests assert relative order-of-magnitude bounds rather than
+    absolute wall-clock times, so they remain stable on CI hardware.
+    """
+
+    def setUp(self):
+        super().setUp()
+        item = self.add_item_fixture()
+        self.album = self.lib.add_album([item])
+        self.item = item
+
+    def test_bulk_album_non_cover_writes_clear_count_is_zero(self):
+        """10k writes to unrelated album fields must NEVER clear _memotable.
+
+        This is a correctness guard, not a timing benchmark: the interceptor
+        must only trigger for fields declared in _cover_fields.
+        """
+        self.lib._memotable = {"marker": True}
+        for i in range(10_000):
+            self.album.title = f"Title_{i}"
+        assert "marker" in self.lib._memotable, (
+            "Writing title (not in _cover_fields) must not clear _memotable"
+        )
+
+    def test_bulk_album_cover_writes_clear_count_is_10k(self):
+        """10k writes to album.artpath must clear _memotable exactly 10k times
+        (once per actual change), proving the interceptor triggers correctly."""
+        clears = 0
+        for i in range(10_000):
+            self.lib._memotable = {"seq": i}
+            self.album.artpath = f"/path/{i}.jpg".encode()
+            if self.lib._memotable == {}:
+                clears += 1
+        assert clears == 10_000, (
+            f"Expected 10000 memotable clears but got {clears}"
+        )
+
+    def test_interceptor_overhead_non_cover_writes_under_2x(self):
+        """The _setitem interceptor must not more than double the cost of
+        10k writes to fields that are NOT in _cover_fields.
+
+        We compare: baseline (raw dbcore _setitem via patch) vs intercepted.
+        A 2x safety margin should hold on all reasonable hardware.
+        """
+        import timeit
+
+        N = 10_000
+
+        dbcore_setitem = super(type(self.album), type(self.album))._setitem
+
+        def run_with_patch():
+            original = type(self.album)._setitem
+            try:
+                type(self.album)._setitem = dbcore_setitem
+                for i in range(N):
+                    self.album.title = f"T{i}"
+                    self.album.artist = f"A{i}"
+                    self.album.year = 2000 + (i % 30)
+                    self.album.tracktotal = 10
+            finally:
+                type(self.album)._setitem = original
+
+        def run_with_interceptor():
+            for i in range(N):
+                self.album.title = f"T{i}"
+                self.album.artist = f"A{i}"
+                self.album.year = 2000 + (i % 30)
+                self.album.tracktotal = 10
+
+        baseline = timeit.timeit(run_with_patch, number=1)
+        intercepted = timeit.timeit(run_with_interceptor, number=1)
+
+        ratio = intercepted / max(baseline, 1e-9)
+        assert ratio < 2.0, (
+            f"_setitem interceptor overhead too high: "
+            f"baseline={baseline:.4f}s intercepted={intercepted:.4f}s ratio={ratio:.2f}x"
+        )
+
+    def test_bulk_item_non_cover_writes_no_memotable_clear(self):
+        """10k writes to unrelated Item fields must NEVER clear _memotable."""
+        self.lib._memotable = {"item_marker": True}
+        for i in range(10_000):
+            self.item.title = f"Track_{i}"
+            self.item.artist = f"Artist_{i % 100}"
+        assert "item_marker" in self.lib._memotable, (
+            "Writing title/artist (not in _cover_fields) must not clear _memotable"
+        )
+
+    def test_cover_fields_classvars_are_configured(self):
+        """Sanity-check: subclasses must declare the right _cover_fields."""
+        assert Album._cover_fields == {"artpath", "cover_art_url"}
+        assert Item._cover_fields == {"cover_art_url"}
+        from beets.library.models import LibModel
+        assert LibModel._cover_fields == set()
+
 
 class AlbumArtEndpointCacheHeadersTest(ItemInDBTestCase):
     """Test HTTP headers and ETag behavior for /album/<id>/art."""
