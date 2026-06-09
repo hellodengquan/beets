@@ -360,7 +360,22 @@ class PluginConfigManager:
         self.config_view.set(data)
 
     def add(self, defaults: dict[str, Any]) -> None:
-        """添加默认配置（向后兼容）。"""
+        """添加默认配置（向后兼容）。
+
+        .. deprecated:: 2.0
+            Use ``register_config_batch`` or ``register_config`` instead
+            so each option gets proper type metadata and validation.
+        """
+        import warnings
+
+        warnings.warn(
+            f"Plugin '{self.plugin_name}' is using the deprecated "
+            f"`self.config_manager.add()` API. Please migrate to "
+            f"`self.register_config_batch()` to register configuration "
+            f"options with explicit metadata (default, type, help, ...).",
+            PendingDeprecationWarning,
+            stacklevel=2,
+        )
         self.config_view.add(defaults)
         for key, value in defaults.items():
             if key not in self._registered_defaults:

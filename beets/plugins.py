@@ -20,12 +20,14 @@ import abc
 import inspect
 import re
 import sys
+import warnings
 from collections import defaultdict
 from functools import cached_property, wraps
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
+import confuse
 import mediafile
 from typing_extensions import ParamSpec
 
@@ -142,6 +144,84 @@ class PluginLogFilter(logging.Filter):
         return True
 
 
+class LegacyConfigProxy:
+    """Transparent proxy for a confuse ``Subview`` that emits a
+    ``PendingDeprecationWarning`` when the legacy ``add()`` method is
+    invoked directly on ``self.config``.
+
+    All other attribute access and item access is forwarded to the
+    wrapped confuse view so existing code keeps working without change
+    while we nudge developers towards :meth:`BeetsPlugin.register_config`
+    / :meth:`BeetsPlugin.register_config_batch`.
+    """
+
+    __slots__ = ("_plugin_name", "_wrapped_view")
+
+    def __init__(self, plugin_name: str, wrapped_view: confuse.Subview) -> None:
+        object.__setattr__(self, "_plugin_name", plugin_name)
+        object.__setattr__(self, "_wrapped_view", wrapped_view)
+
+    @property
+    def _confuse_subview(self) -> confuse.Subview:
+        """Return the underlying confuse ``Subview`` without the deprecation
+        wrapper.
+
+        Intended *only* for internal beets components (e.g. ``ArtSource``
+        helpers) that need to drive confuse directly and cannot yet use the
+        new registration API; regular plugins should go through
+        ``BeetsPlugin.register_config_batch`` which does not need this.
+        """
+        return self._wrapped_view
+
+    # -- Legacy deprecation hook ------------------------------------------
+
+    def add(self, defaults: dict[str, Any]) -> None:
+        warnings.warn(
+            f"Plugin '{self._plugin_name}' uses the deprecated "
+            f"`self.config.add()` path. Please migrate to "
+            f"`self.register_config_batch()` (or `self.register_config()` "
+            f"for single options) so every configuration key is registered "
+            f"with explicit metadata (default, type, help, choices, ...).",
+            PendingDeprecationWarning,
+            stacklevel=2,
+        )
+        return self._wrapped_view.add(defaults)
+
+    # -- Transparent attribute forwarding ---------------------------------
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped_view, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._wrapped_view, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._wrapped_view, name)
+
+    # -- confuse.Subview mapping API --------------------------------------
+
+    def __getitem__(self, key: str) -> confuse.Subview:
+        return self._wrapped_view[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._wrapped_view[key] = value
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._wrapped_view
+
+    def __iter__(self):
+        return iter(self._wrapped_view)
+
+    def __len__(self) -> int:
+        return len(self._wrapped_view)
+
+    def __repr__(self) -> str:
+        return (
+            f"LegacyConfigProxy(plugin_name={self._plugin_name!r}, "
+            f"view={self._wrapped_view!r})"
+        )
+
+
 # Managing the plugins themselves.
 
 
@@ -230,8 +310,9 @@ class BeetsPlugin(metaclass=BeetsPluginMeta):
         """Perform one-time plugin setup."""
 
         self.name = name or self.__module__.split(".")[-1]
-        self.config = beets.config[self.name]
-        self.config_manager = PluginConfigManager(self.name, self.config)
+        raw_config = beets.config[self.name]
+        self.config = LegacyConfigProxy(self.name, raw_config)
+        self.config_manager = PluginConfigManager(self.name, raw_config)
 
         # create per-instance storage for template fields and functions
         self.template_funcs = {}

@@ -1411,7 +1411,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
             }
         )
         for source in ART_SOURCES:
-            source.add_default_config(self.config)
+            source.add_default_config(self.config._confuse_subview)
 
         self.minwidth = self.config_int("minwidth")
         self.maxwidth = self.config_int("maxwidth")

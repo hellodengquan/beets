@@ -13,6 +13,7 @@ Tests cover 8 public methods with both success and failure paths:
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import confuse
@@ -907,3 +908,279 @@ class TestFixtureRegressionAssertions:
         init_source = inspect.getsource(BeetsPlugin.__init__)
         assert "fixture" not in init_source.lower()
         assert "request.getfixturevalue" not in init_source
+
+
+class TestLegacyConfigDeprecation:
+    """Emit PendingDeprecationWarning for the pre-migration `self.config.add`
+    path, and confirm the 5 migrated core plugins no longer trigger it.
+
+    Together with the filterwarnings rules in setup.cfg, this guarantees:
+    1. Reviewer plugin and other downstream non-migrated plugins WILL see a
+       migration signal during tests.
+    2. Migrated plugins (lastfm/fetchart, mpdupdate, replaygain, scrub,
+       convert) stay clean going forward.
+    """
+
+    # ------------------------------------------------------------------ utils
+
+    @staticmethod
+    def _reset_beets_config():
+        """Re-initialize a blank beets root config so plugin-level defaults
+        registered by earlier tests never leak between cases.
+        """
+        import beets
+
+        beets.config.clear()
+
+    # ----------------------------------------------------- legacy warnings
+
+    def test_legacy_config_add_emits_pending_deprecation_warning(self):
+        """Direct `self.config.add(...)` on a plugin subclass must fire the
+        warning so downstream maintainers see the migration signal.
+        """
+        from beets.plugins import BeetsPlugin
+
+        self._reset_beets_config()
+
+        class _OldStylePlugin(BeetsPlugin):
+            def __init__(self):
+                super().__init__()
+                self.config.add(
+                    {
+                        "foo": True,
+                        "bar": 42,
+                    }
+                )
+
+        with pytest.warns(PendingDeprecationWarning, match=r"self\.config\.add\(\)"):
+            _OldStylePlugin()
+
+    def test_legacy_config_manager_add_emits_pending_deprecation_warning(self):
+        """Direct `self.config_manager.add(...)` (extra back-compat shim) also
+        emits a deprecation warning.
+        """
+        from beets.plugins import BeetsPlugin
+
+        self._reset_beets_config()
+
+        class _OldShimPlugin(BeetsPlugin):
+            def __init__(self):
+                super().__init__()
+                self.config_manager.add({"baz": "hello"})
+
+        with pytest.warns(
+            PendingDeprecationWarning,
+            match=r"config_manager\.add\(\)",
+        ):
+            _OldShimPlugin()
+
+    def test_register_config_batch_does_not_trigger_legacy_warning(self):
+        """The new API MUST NOT fire the legacy-path warning (false negatives
+        would render the whole deprecation useless).
+        """
+        from beets.plugins import BeetsPlugin
+
+        self._reset_beets_config()
+
+        class _NewStylePlugin(BeetsPlugin):
+            def __init__(self):
+                super().__init__()
+                self.register_config_batch(
+                    {
+                        "threshold": {
+                            "default": 0.5,
+                            "type": float,
+                            "help": "test",
+                        },
+                    }
+                )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _NewStylePlugin()
+
+        legacy_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, PendingDeprecationWarning)
+            and (
+                "self.config.add()" in str(w.message)
+                or "config_manager.add()" in str(w.message)
+            )
+        ]
+        assert legacy_warnings == [], (
+            "register_config_batch must NOT trigger the legacy "
+            "PendingDeprecationWarning; got: "
+            + ", ".join(str(w.message) for w in legacy_warnings)
+        )
+
+    # -------------------------------------------------- migrated 5 plugins
+
+    def test_migrated_plugin_scrub_no_legacy_warning(self):
+        """`scrub` - 1-config minimal example. Must be clean."""
+        import warnings
+
+        from beetsplug.scrub import ScrubPlugin
+
+        self._reset_beets_config()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ScrubPlugin()
+
+        legacy_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, PendingDeprecationWarning)
+            and (
+                "self.config.add()" in str(w.message)
+                or "config_manager.add()" in str(w.message)
+            )
+        ]
+        assert legacy_warnings == [], (
+            "scrub plugin migrated -> MUST NOT trigger legacy-config warning"
+        )
+
+    def test_migrated_plugin_mpdupdate_no_legacy_warning(self):
+        """`mpdupdate` - env-var defaults + redact password."""
+        import warnings
+
+        from beetsplug.mpdupdate import MPDUpdatePlugin
+
+        self._reset_beets_config()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            MPDUpdatePlugin()
+
+        legacy_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, PendingDeprecationWarning)
+            and (
+                "self.config.add()" in str(w.message)
+                or "config_manager.add()" in str(w.message)
+            )
+        ]
+        assert legacy_warnings == [], (
+            "mpdupdate plugin migrated -> MUST NOT trigger legacy-config "
+            "warning"
+        )
+
+    def test_migrated_plugin_replaygain_no_legacy_warning(self, monkeypatch):
+        """`replaygain` - 10 configs with choices.
+
+        Uses a fake backend instance so plugin instantiation does NOT require
+        the `mp3gain`/`aacgain` binaries on PATH.
+        """
+        import warnings
+
+        from beetsplug import replaygain as rg_mod
+
+        self._reset_beets_config()
+
+        class _FakeBackend:
+            pass
+
+        def _fake_select(backend_name, log, config):
+            return _FakeBackend()
+
+        monkeypatch.setattr(rg_mod, "BACKENDS", {"command": lambda *a, **kw: _FakeBackend()})
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                rg_mod.ReplayGainPlugin()
+            except Exception:
+                # Any runtime exception after __init__ registration is fine,
+                # we only care about the legacy-path warning during init.
+                pass
+
+        legacy_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, PendingDeprecationWarning)
+            and (
+                "self.config.add()" in str(w.message)
+                or "config_manager.add()" in str(w.message)
+            )
+        ]
+        assert legacy_warnings == [], (
+            "replaygain plugin migrated -> MUST NOT trigger legacy-config "
+            "warning"
+        )
+
+    def test_migrated_plugin_convert_no_legacy_warning(self):
+        """`convert` - ~24 options incl. nested formats dict."""
+        import warnings
+
+        from beetsplug.convert import ConvertPlugin
+
+        self._reset_beets_config()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ConvertPlugin()
+
+        legacy_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, PendingDeprecationWarning)
+            and (
+                "self.config.add()" in str(w.message)
+                or "config_manager.add()" in str(w.message)
+            )
+        ]
+        assert legacy_warnings == [], (
+            "convert plugin migrated -> MUST NOT trigger legacy-config warning"
+        )
+
+    def test_migrated_plugin_fetchart_no_legacy_warning(self):
+        """`fetchart` (incl. LastFM source add_default_config shim) must be
+        clean after the migration.
+        """
+        import warnings
+
+        from beetsplug.fetchart import FetchArtPlugin
+
+        self._reset_beets_config()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            FetchArtPlugin()
+
+        legacy_warnings = [
+            w
+            for w in caught
+            if issubclass(w.category, PendingDeprecationWarning)
+            and (
+                "self.config.add()" in str(w.message)
+                or "config_manager.add()" in str(w.message)
+            )
+        ]
+        assert legacy_warnings == [], (
+            "fetchart plugin migrated -> MUST NOT trigger legacy-config "
+            "warning"
+        )
+
+    def test_legacy_warning_message_explicitly_names_migration_target(self):
+        """Warning text must mention the replacement APIs so authors can
+        immediately find the migration path without reading the docs first.
+        """
+        from beets.plugins import BeetsPlugin
+
+        self._reset_beets_config()
+
+        class _AnotherOldPlugin(BeetsPlugin):
+            def __init__(self):
+                super().__init__()
+                self.config.add({"mode": "safe"})
+
+        with pytest.warns(PendingDeprecationWarning) as record:
+            _AnotherOldPlugin()
+
+        msg = str(record[0].message).lower()
+        assert "register_config_batch" in msg or "register_config" in msg, (
+            "deprecation warning must tell authors which API to migrate TO; "
+            f"got: {record[0].message}"
+        )

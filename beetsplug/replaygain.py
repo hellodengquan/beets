@@ -550,7 +550,9 @@ class CommandBackend(Backend):
 
     def __init__(self, config: ConfigView, log: Logger):
         super().__init__(config, log)
-        config.add({"command": "", "noclip": True})
+        # Defaults for the two command-backend-specific options are registered
+        # by ReplayGainPlugin via register_config_batch, so no additional
+        # confuse-level add() is required here.
 
         cmd_path: Path = Path(config["command"].as_str())
         supported_tools = set(self.SUPPORTED_FORMATS_BY_TOOL)
@@ -1233,6 +1235,16 @@ class ReplayGainPlugin(BeetsPlugin):
                     "default": lufs_to_db(-23),
                     "type": float,
                     "help": "Target LUFS for R128 analysis",
+                },
+                "command": {
+                    "default": "",
+                    "type": str,
+                    "help": "Command backend tool path (mp3gain/aacgain/mp3rgain)",
+                },
+                "noclip": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Prevent clipping by lowering gain (command backend)",
                 },
             }
         )
