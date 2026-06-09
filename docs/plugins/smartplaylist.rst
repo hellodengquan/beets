@@ -99,8 +99,17 @@ playlists by detecting **all types of changes** that can affect query results:
   automatically be removed from the ``genre:Rock`` playlist and added to the
   ``genre:Jazz`` playlist (if both exist).
 
-- **Album changes**: Changes to album metadata trigger updates for all
-  playlists that use ``album_query``.
+- **Files moved or reorganized**: When you reorganize your library using the
+  ``move`` command (or any operation that triggers ``item_moved``, such as
+  renaming via ``modify`` that updates path templates), all playlists
+  containing the affected items — including those using ``path::`` regex
+  queries — are automatically regenerated with the updated file paths.
+
+- **Album changes**: Changes to album metadata (including ``artpath`` rewrites
+  triggered by :doc:`/plugins/fetchart` or :doc:`/plugins/embedart`) trigger
+  updates for all playlists that use ``album_query``. Album-level changes do
+  **not** incorrectly mark playlists that only define ``query`` (item-level)
+  without ``album_query``.
 
 The updates happen automatically at the end of each beets command session when
 ``auto`` is set to ``yes`` (the default). To force regeneration, you can invoke
@@ -116,6 +125,40 @@ want to regenerate:
 ::
 
     $ beet splupdate BeatlesUniverse.m3u MyTravelPlaylist
+
+Interoperability with Other Plugins
+-----------------------------------
+
+The ``smartplaylist`` plugin coexists correctly with other beets plugins that
+also subscribe to the ``database_change`` event (such as :doc:`/plugins/web`,
+:doc:`/plugins/fetchart`, :doc:`/plugins/mpdupdate`,
+:doc:`/plugins/subsonicupdate`, etc.).
+
+- **Event ordering independence**: The plugin's internal logic does not depend
+  on the relative order in which it is registered versus other subscribers.
+  Whether it is listed **before** or **after** ``fetchart`` / ``web`` in your
+  configuration, playlists will still be correctly scheduled for update.
+
+- **No cache conflicts**: The plugin neither relies on nor corrupts the
+  library's internal ``_memotable`` (used by the ``web`` plugin for template
+  memoization during rendering). Specifically:
+
+  - During ``item.remove()``, beets explicitly clears ``_memotable`` **before**
+    dispatching ``database_change``; smartplaylist tolerates this and still
+    produces correct playlist output.
+  - During ``item.move()`` / album reorganization, ``_memotable`` entries are
+    preserved; smartplaylist never touches them, so concurrent web UI requests
+    continue serving correct disambiguation values.
+
+- **cli_exit handler order**: Playlists are written during the ``cli_exit``
+  phase, after all ``database_change`` subscribers have had a chance to run.
+  This means changes performed by plugins like ``fetchart`` (which updates
+  ``artpath``) are guaranteed to be visible when ``smartplaylist`` runs its
+  final query.
+
+To chain plugins that react to playlist updates, ``smartplaylist`` emits its
+own ``smartplaylist_update`` event after writing files — subscribers such as
+``subsonicupdate`` use this hook to trigger further downstream sync.
 
 You can also use this plugin together with the :doc:`mpdupdate`, in order to
 automatically notify MPD of the playlist change, by adding ``mpdupdate`` to the

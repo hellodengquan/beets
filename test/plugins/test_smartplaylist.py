@@ -234,6 +234,85 @@ class SmartPlaylistTest(BeetsTestCase):
         assert spl._unmatched_playlists == {pl1, pl2}
         assert spl._matched_playlists == set()
 
+    def test_multiple_db_changes_do_not_grow_matched_set_beyond_playlist_count(
+        self,
+    ):
+        """Repeated db_change operations must not cause _matched_playlists
+        to grow unboundedly.
+
+        The set of matched playlists is bounded by the total number of
+        configured playlists — once all are moved from _unmatched to
+        _matched, further db_change calls must not change the sizes.
+        Additionally, update_playlists_on_exit must clear _matched_playlists
+        to prevent state leakage across cli_exit invocations.
+        """
+        spl = self._make_plugin()
+
+        nones = None, None
+        playlists = [
+            ("plA.m3u", parse_query_string("artist:A", Item), nones),
+            ("plB.m3u", parse_query_string("artist:B", Item), nones),
+            ("plC.m3u", nones, parse_query_string("for_travel:1", Album)),
+            ("plD.m3u", parse_query_string("title:D", Item),
+             parse_query_string("album:DA", Album)),
+            ("plNoQuery.m3u", nones, nones),
+        ]
+        n_playlists = len(playlists)
+        n_with_queries = 4  # plA, plB, plC, plD have at least one query
+
+        spl._unmatched_playlists = set(playlists)
+        spl._matched_playlists = set()
+
+        item = MagicMock(Item)
+
+        for round in range(1, 100):
+            spl.db_change(None, item)
+            assert len(spl._matched_playlists) <= n_playlists, (
+                f"After {round} db_change calls, _matched_playlists has "
+                f"{len(spl._matched_playlists)} entries, exceeding the "
+                f"configured playlist count of {n_playlists}"
+            )
+            assert (
+                len(spl._matched_playlists) + len(spl._unmatched_playlists)
+                == n_playlists
+            ), "Total playlists (matched + unmatched) must remain invariant"
+
+        assert len(spl._matched_playlists) == n_with_queries, (
+            "With Item changes, exactly playlists with item_query OR "
+            "album_query should be marked as matched"
+        )
+        assert len(spl._unmatched_playlists) == 1, (
+            "Only the playlist with no queries at all should remain unmatched"
+        )
+
+        first_matched_snapshot = frozenset(spl._matched_playlists)
+        for _ in range(50):
+            spl.db_change(None, item)
+        assert frozenset(spl._matched_playlists) == first_matched_snapshot, (
+            "After convergence, subsequent db_change calls must not alter "
+            "the composition of _matched_playlists (idempotent convergence)"
+        )
+
+        lib = Mock()
+        lib.items.return_value = []
+        lib.albums.return_value = []
+        lib.replacements = CHAR_REPLACE
+
+        spl.update_playlists_on_exit(lib)
+        assert len(spl._matched_playlists) == 0, (
+            "After update_playlists_on_exit, _matched_playlists must be "
+            "cleared to avoid state leakage across sessions"
+        )
+        assert spl._cli_exit_registered is False
+
+        spl._unmatched_playlists = set(playlists)
+        for _ in range(50):
+            spl.db_change(None, item)
+        assert len(spl._matched_playlists) == n_with_queries, (
+            "After a fresh cycle of db_change calls, the matched set must "
+            "still converge to exactly the count of playlists with queries"
+        )
+
     def test_db_changes_item_added_triggers_update(self):
         """Newly added item should trigger playlist update."""
         spl = self._make_plugin()

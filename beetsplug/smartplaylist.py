@@ -404,6 +404,7 @@ class SmartPlaylistPlugin(plugins.BeetsPlugin):
             self.update_playlists(lib)
         finally:
             self._cli_exit_registered = False
+            self._matched_playlists.clear()
 
     def update_playlists(self, lib: Library) -> None:
         playlist_count = len(self._matched_playlists)
