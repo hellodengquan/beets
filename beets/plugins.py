@@ -32,6 +32,7 @@ from typing_extensions import ParamSpec
 import beets
 from beets import logging
 from beets.util import unique_list
+from beets.util.config import PluginConfigError, PluginConfigManager
 from beets.util.deprecation import deprecate_for_maintainers, deprecate_for_user
 
 if TYPE_CHECKING:
@@ -167,6 +168,7 @@ class BeetsPlugin(metaclass=BeetsPluginMeta):
 
     name: str
     config: Subview
+    config_manager: PluginConfigManager
     early_import_stages: list[ImportStageFunc]
     import_stages: list[ImportStageFunc]
 
@@ -229,6 +231,7 @@ class BeetsPlugin(metaclass=BeetsPluginMeta):
 
         self.name = name or self.__module__.split(".")[-1]
         self.config = beets.config[self.name]
+        self.config_manager = PluginConfigManager(self.name, self.config)
 
         # create per-instance storage for template fields and functions
         self.template_funcs = {}
@@ -251,11 +254,19 @@ class BeetsPlugin(metaclass=BeetsPluginMeta):
     def _verify_config(self, *_, **__) -> None:
         """Verify plugin configuration.
 
+        1. Validates all configuration registered through config_manager.
+        2. Checks for deprecated 'source_weight' option (legacy metadata plugins).
+
         If deprecated 'source_weight' option is explicitly set by the user, they
         will see a warning in the logs. Otherwise, this must be configured by
         a third party plugin, thus we raise a deprecation warning which won't be
         shown to user but will be visible to plugin developers.
         """
+        try:
+            self.config_manager.validate()
+        except PluginConfigError as e:
+            raise UserWarning(f"Plugin '{self.name}' configuration error: {e}")
+
         # TODO: Remove in v3.0.0
         if (
             not hasattr(self, "data_source")
@@ -276,6 +287,86 @@ class BeetsPlugin(metaclass=BeetsPluginMeta):
                         "'source_weight' configuration option",
                         "'data_source_mismatch_penalty'",
                     )
+
+    def register_config(
+        self,
+        key: str,
+        default: Any = None,
+        type: type | Any = None,
+        choices: list[Any] | None = None,
+        help: str = "",
+        required: bool = False,
+        validator: Any = None,
+        deprecated: bool = False,
+        deprecation_message: str = "",
+        redact: bool = False,
+    ) -> None:
+        """Register a configuration option with metadata.
+
+        This is the preferred way to declare plugin configuration options.
+        Registered options will be automatically validated when plugins
+        are loaded.
+
+        Args:
+            key: Configuration key name.
+            default: Default value for the option.
+            type: Expected type or confuse template.
+            choices: List of valid values for the option.
+            help: Human-readable description of the option.
+            required: Whether this option must be explicitly configured.
+            validator: Custom callable that returns True if value is valid.
+            deprecated: Whether this option is deprecated.
+            deprecation_message: Message shown when deprecated option is used.
+            redact: Whether to hide the value in logs (for secrets/keys).
+        """
+        self.config_manager.register(
+            key=key,
+            default=default,
+            type=type,
+            choices=choices,
+            help=help,
+            required=required,
+            validator=validator,
+            deprecated=deprecated,
+            deprecation_message=deprecation_message,
+            redact=redact,
+        )
+        self.config_manager.apply_defaults()
+
+    def register_config_batch(
+        self, configs: dict[str, dict[str, Any]]
+    ) -> None:
+        """Batch register multiple configuration options.
+
+        Args:
+            configs: Dictionary where keys are config option names and
+                     values are dictionaries of parameters for register_config.
+        """
+        self.config_manager.register_batch(configs)
+        self.config_manager.apply_defaults()
+
+    def get_config(self, key: str, type: type | None = None) -> Any:
+        """Safely get a configuration value using the registered schema.
+
+        This method provides type-safe access with consistent error handling.
+        """
+        return self.config_manager.get(key, type=type)
+
+    def config_int(self, key: str) -> int:
+        """Get an integer configuration value."""
+        return self.config_manager.get_int(key)
+
+    def config_bool(self, key: str) -> bool:
+        """Get a boolean configuration value."""
+        return self.config_manager.get_bool(key)
+
+    def config_str(self, key: str) -> str:
+        """Get a string configuration value."""
+        return self.config_manager.get_str(key)
+
+    def config_float(self, key: str) -> float:
+        """Get a float configuration value."""
+        return self.config_manager.get_float(key)
 
     def commands(self) -> Sequence[Subcommand]:
         """Should return a list of beets.ui.Subcommand objects for

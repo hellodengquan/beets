@@ -55,27 +55,52 @@ class EmbedCoverArtPlugin(BeetsPlugin):
 
     def __init__(self):
         super().__init__()
-        self.config.add(
+        self.register_config_batch(
             {
-                "maxwidth": 0,
-                "auto": True,
-                "compare_threshold": 0,
-                "ifempty": False,
-                "remove_art_file": False,
-                "quality": 0,
-                "clearart_on_import": False,
+                "maxwidth": {
+                    "default": 0,
+                    "type": int,
+                    "help": "Maximum width for embedded album art (0 for no limit)",
+                },
+                "auto": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Automatically embed art after import",
+                },
+                "compare_threshold": {
+                    "default": 0,
+                    "type": int,
+                    "help": "Comparison threshold for image similarity (0 to disable)",
+                },
+                "ifempty": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Embed art only when no existing art is present",
+                },
+                "remove_art_file": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Remove the album art file after embedding",
+                },
+                "quality": {
+                    "default": 0,
+                    "type": int,
+                    "help": "JPEG quality for resized images (0-100, 0 for default)",
+                },
+                "clearart_on_import": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Clear embedded art on import",
+                },
             }
         )
 
-        if self.config["maxwidth"].get(int) and not ArtResizer.shared.local:
+        if self.config_int("maxwidth") and not ArtResizer.shared.local:
             self.config["maxwidth"] = 0
             self._log.warning(
                 "ImageMagick or PIL not found; 'maxwidth' option ignored"
             )
-        if (
-            self.config["compare_threshold"].get(int)
-            and not ArtResizer.shared.can_compare
-        ):
+        if self.config_int("compare_threshold") and not ArtResizer.shared.can_compare:
             self.config["compare_threshold"] = 0
             self._log.warning(
                 "ImageMagick 6.8.7 or higher not installed; "
@@ -84,7 +109,7 @@ class EmbedCoverArtPlugin(BeetsPlugin):
 
         self.register_listener("art_set", self.process_album)
 
-        if self.config["clearart_on_import"].get(bool):
+        if self.config_bool("clearart_on_import"):
             self.register_listener("import_task_files", self.import_task_files)
 
     def commands(self):
@@ -107,10 +132,10 @@ class EmbedCoverArtPlugin(BeetsPlugin):
             help="the URL of the image file to embed",
         )
 
-        maxwidth = self.config["maxwidth"].get(int)
-        quality = self.config["quality"].get(int)
-        compare_threshold = self.config["compare_threshold"].get(int)
-        ifempty = self.config["ifempty"].get(bool)
+        maxwidth = self.config_int("maxwidth")
+        quality = self.config_int("quality")
+        compare_threshold = self.config_int("compare_threshold")
+        ifempty = self.config_bool("ifempty")
 
         def embed_func(lib, opts, args):
             if opts.file:
@@ -257,15 +282,15 @@ class EmbedCoverArtPlugin(BeetsPlugin):
 
     def process_album(self, album):
         """Automatically embed art after art has been set"""
-        if self.config["auto"] and ui.should_write():
-            max_width = self.config["maxwidth"].get(int)
+        if self.config_bool("auto") and ui.should_write():
+            max_width = self.config_int("maxwidth")
             art.embed_album(
                 self._log,
                 album,
                 max_width,
                 True,
-                self.config["compare_threshold"].get(int),
-                self.config["ifempty"].get(bool),
+                self.config_int("compare_threshold"),
+                self.config_bool("ifempty"),
             )
             self.remove_artfile(album)
 
@@ -273,7 +298,7 @@ class EmbedCoverArtPlugin(BeetsPlugin):
         """Possibly delete the album art file for an album (if the
         appropriate configuration option is enabled).
         """
-        if self.config["remove_art_file"] and album.artpath:
+        if self.config_bool("remove_art_file") and album.artpath:
             if os.path.isfile(syspath(album.artpath)):
                 self._log.debug("Removing album art file for {}", album)
                 os.remove(syspath(album.artpath))

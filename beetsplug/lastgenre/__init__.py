@@ -119,29 +119,83 @@ class LastGenrePlugin(plugins.BeetsPlugin):
     def __init__(self) -> None:
         super().__init__()
 
-        self.config.add(
+        self.register_config_batch(
             {
-                "whitelist": True,
-                "min_weight": 10,
-                "count": 1,
-                "fallback": None,
-                "canonical": False,
-                "cleanup_existing": False,
-                "source": "album",
-                "force": False,
-                "keep_existing": False,
-                "auto": True,
-                "prefer_specific": False,
-                "title_case": True,
-                "pretend": False,
-                "ignorelist": {},
+                "whitelist": {
+                    "default": True,
+                    "help": "Use the built-in genre whitelist (True/False/path)",
+                },
+                "min_weight": {
+                    "default": 10,
+                    "type": int,
+                    "help": "Minimum tag weight to consider",
+                },
+                "count": {
+                    "default": 1,
+                    "type": int,
+                    "help": "Maximum number of genres to assign",
+                },
+                "fallback": {
+                    "default": None,
+                    "help": "Fallback genre when none found",
+                },
+                "canonical": {
+                    "default": False,
+                    "help": "Use genre canonicalization (True/False/path)",
+                },
+                "cleanup_existing": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Canonicalize existing genres even without force",
+                },
+                "source": {
+                    "default": "album",
+                    "type": str,
+                    "choices": ["track", "album", "artist"],
+                    "help": "Genre data source: track, album, or artist",
+                },
+                "force": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Overwrite existing genres",
+                },
+                "keep_existing": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Keep existing genres when forcing",
+                },
+                "auto": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Fetch genres automatically on import",
+                },
+                "prefer_specific": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Prefer more specific genres",
+                },
+                "title_case": {
+                    "default": True,
+                    "type": bool,
+                    "help": "Format genres in Title Case",
+                },
+                "pretend": {
+                    "default": False,
+                    "type": bool,
+                    "help": "Show actions but don't modify",
+                },
+                "ignorelist": {
+                    "default": {},
+                    "type": dict,
+                    "help": "Patterns of genres to ignore per artist",
+                },
             }
         )
         self.setup()
 
     def setup(self) -> None:
         """Setup plugin from config options"""
-        if self.config["auto"]:
+        if self.config_bool("auto"):
             self.import_stages = [self.imported]
 
         self.whitelist: Whitelist = self._load_whitelist()
@@ -149,7 +203,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
         self.c14n_branches, self.canonicalize = self._load_c14n_tree()
         self.ignore_patterns: GenreIgnorePatterns = self._load_ignorelist()
         self.client = LastFmClient(
-            self._log, self.config["min_weight"].get(int), self.ignore_patterns
+            self._log, self.config_int("min_weight"), self.ignore_patterns
         )
 
     def _load_whitelist(self) -> Whitelist:
@@ -284,7 +338,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
         if not tags:
             return []
 
-        count = self.config["count"].get(int)
+        count = self.config_int("count")
 
         # Canonicalization (if enabled)
         if self.canonicalize:
@@ -318,7 +372,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
                 # Stop if we have enough tags already, unless we need to find
                 # the most specific tag (instead of the most popular).
                 if (
-                    not self.config["prefer_specific"]
+                    not self.config_bool("prefer_specific")
                     and len(tags_all) >= count
                 ):
                     break
@@ -327,7 +381,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
         tags = unique_list(tags)
 
         # Sort the tags by specificity.
-        if self.config["prefer_specific"]:
+        if self.config_bool("prefer_specific"):
             tags = sort_by_depth(tags, self.c14n_branches)
 
         # Final filter: applies when c14n is disabled, or when c14n ran without
@@ -363,7 +417,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
 
     def _format_genres(self, tags: list[str]) -> list[str]:
         """Format to title case if configured."""
-        if self.config["title_case"]:
+        if self.config_bool("title_case"):
             return [tag.title() for tag in tags]
         else:
             return tags
@@ -416,7 +470,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
 
         def _fallback_stage() -> tuple[list[str], str]:
             """Return the fallback genre and label."""
-            if fallback := self.config["fallback"].get():
+            if fallback := self.get_config("fallback"):
                 return [fallback], "fallback"
             return [], "fallback unconfigured"
 
@@ -442,11 +496,11 @@ class LastGenrePlugin(plugins.BeetsPlugin):
         new_genres = []
         genres = self._get_existing_genres(obj)
 
-        if genres and not self.config["force"]:
+        if genres and not self.config_bool("force"):
             # Without force, but cleanup_existing enabled, we attempt
             # to canonicalize pre-populated tags before returning them.
             # If none are found, we use the fallback (if set).
-            if self.config["cleanup_existing"]:
+            if self.config_bool("cleanup_existing"):
                 keep_genres = [g.lower() for g in genres]
                 if result := _try_resolve_stage(
                     "cleanup",
@@ -462,10 +516,10 @@ class LastGenrePlugin(plugins.BeetsPlugin):
             # returned as-is.
             return genres, "keep any, no-force"
 
-        if self.config["force"]:
+        if self.config_bool("force"):
             # Force doesn't keep any unless keep_existing is set.
             # Whitelist validation is handled in _resolve_genres.
-            if self.config["keep_existing"]:
+            if self.config_bool("keep_existing"):
                 keep_genres = [g.lower() for g in genres]
 
         # Run through stages: track, album, artist,
@@ -542,7 +596,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
                     return result
 
         # Nothing found, leave original if configured and valid.
-        if genres and self.config["keep_existing"].get():
+        if genres and self.config_bool("keep_existing"):
             artist = self._artist_for_filter(obj)
             if valid_genres := self._filter_valid(genres, artist=artist):
                 return valid_genres, "original fallback"
@@ -574,7 +628,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
     def _process_track(self, obj: Item, write: bool) -> None:
         """Process a single track/item."""
         self._fetch_and_log_genre(obj)
-        if not self.config["pretend"]:
+        if not self.config_bool("pretend"):
             obj.try_sync(write=write, move=False)
 
     @_process.register
@@ -585,7 +639,7 @@ class LastGenrePlugin(plugins.BeetsPlugin):
             for item in obj.items():
                 self._process(item, write)
 
-        if not self.config["pretend"]:
+        if not self.config_bool("pretend"):
             obj.try_sync(
                 write=write, move=False, inherit="track" not in self.sources
             )
