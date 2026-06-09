@@ -12,5 +12,6 @@ resources:
     mediafile
     import
     fields
+    cover_cache
     logging
     prompts

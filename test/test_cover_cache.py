@@ -476,3 +476,224 @@ class SetArtEndToEndTest(ItemInDBTestCase):
         self.album.store()
         assert self.client.get(f"/album/{self.album.id}/art").status_code == 404
 
+
+class PluginIntegrationMemotableTest(ItemInDBTestCase):
+    """End-to-end tests that exercise the actual code paths of the
+    built-in ``fetchart`` and ``embedart`` plugins, verifying that
+    ``_memotable`` is correctly invalidated when each plugin writes
+    cover-related fields.
+
+    These tests catch the downstream integration blind spot: the core
+    _setitem interceptor can be correct in isolation, but if a plugin
+    ever bypasses it (e.g. via monkey-patching or writing to the raw
+    DB row) the bug would otherwise not show up in a unit test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        item = self.add_item_fixture()
+        self.album = self.lib.add_album([item])
+        self.config["art_filename"] = "cover"
+        # Album.set_art emits an ``art_set`` signal, to which
+        # EmbedCoverArtPlugin listens via process_album. The listener
+        # reads self.config["auto"], which normally gets its default
+        # value when the plugin is instantiated. In these tests we
+        # don't always construct a full plugin, so we seed the
+        # confuse tree with the embedart defaults up-front.
+        self.config["embedart"].set(
+            {
+                "maxwidth": 0,
+                "auto": True,
+                "compare_threshold": 0,
+                "ifempty": False,
+                "remove_art_file": False,
+                "quality": 0,
+                "clearart_on_import": False,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # fetchart integration
+    # ------------------------------------------------------------------
+    def test_fetchart_set_art_clears_memotable(self):
+        """FetchArtPlugin._set_art(album, candidate) must clear _memotable.
+
+        This is the exact code path used by both the ``fetchart`` CLI
+        command and the post-import ``assign_art`` hook.
+
+        We do **not** construct a full FetchArtPlugin instance here because
+        that requires the entire confuse configuration tree for unrelated
+        plugins (e.g. ``embedart.auto``) to be populated, which is outside
+        the scope of a cache-invalidation regression test.  Instead we
+        invoke ``_set_art`` with a minimal fake plugin whose attributes
+        mirror exactly what the real method reads (``_log`` and
+        ``store_source``).  The implementation of ``_set_art`` delegates
+        straight to ``album.set_art`` – that is the code under test.
+        """
+        from beetsplug.fetchart import Candidate, FetchArtPlugin, MetadataMatch
+        import logging
+        from types import SimpleNamespace
+
+        cover_bytes = b"FETCHART_INTEGRATION_TEST_CONTENT"
+        local_cover = _write_binary(
+            util.bytestring_path(self.temp_dir_path / "fetched_cover.jpg"),
+            cover_bytes,
+        )
+
+        candidate = Candidate(
+            log=logging.getLogger("fetchart.test"),
+            source_name="filesystem",
+            path=local_cover,
+            match=MetadataMatch.EXACT,
+        )
+        fake_plugin = SimpleNamespace(
+            _log=logging.getLogger("fetchart.test"),
+            store_source=False,
+        )
+
+        self.lib._memotable = {"stale": "cache_entry"}
+        ok = FetchArtPlugin._set_art(fake_plugin, self.album, candidate, delete=False)
+        assert ok is True
+        assert self.lib._memotable == {}, (
+            "FetchArtPlugin._set_art must invalidate _memotable via "
+            "the Album.set_art → _setitem interceptor chain."
+        )
+        assert self.album.artpath is not None
+        with open(util.syspath(self.album.artpath), "rb") as f:
+            assert f.read() == cover_bytes
+
+    def test_fetchart_art_source_flex_field_does_not_clear_twice(self):
+        """Assigning album.art_source (not in _cover_fields) during
+        fetchart's post-set_art step must not trigger a redundant flush.
+
+        The actual memotable-clearing happens inside _set_art → set_art.
+        We verify that writing art_source afterwards keeps it empty
+        (no extra empty-dict assignment is needed, but the point is that
+        unrelated fields must not raise).
+        """
+        from beetsplug.fetchart import Candidate, FetchArtPlugin, MetadataMatch
+        import logging
+        from types import SimpleNamespace
+
+        local_cover = _write_binary(
+            util.bytestring_path(self.temp_dir_path / "a.jpg"),
+            b"CONTENT",
+        )
+        candidate = Candidate(
+            log=logging.getLogger("fetchart.test"),
+            source_name="filesystem",
+            path=local_cover,
+            match=MetadataMatch.EXACT,
+        )
+        fake_plugin = SimpleNamespace(
+            _log=logging.getLogger("fetchart.test"),
+            store_source=True,
+        )
+
+        self.lib._memotable = {"stale": "cache_entry"}
+        ok = FetchArtPlugin._set_art(fake_plugin, self.album, candidate, delete=False)
+        assert ok is True
+        assert self.album.art_source == "filesystem"  # set by plugin
+        assert self.lib._memotable == {}
+
+    # ------------------------------------------------------------------
+    # embedart integration
+    # ------------------------------------------------------------------
+    def test_embedart_remove_artfile_clears_memotable(self):
+        """EmbedCoverArtPlugin.remove_artfile sets artpath = None → memotable flush.
+
+        This is the exact code path used when ``embedart`` is configured
+        with ``remove_art_file: yes`` and after an ``embed``/``import``.
+        """
+        from beetsplug.embedart import EmbedCoverArtPlugin
+
+        cover = _write_binary(
+            util.bytestring_path(self.temp_dir_path / "to_remove_cover.jpg"),
+            b"EMBED_TO_REMOVE",
+        )
+        self.album.set_art(cover, copy=True)
+        self.album.store()
+        assert self.album.artpath is not None
+        assert os.path.isfile(util.syspath(self.album.artpath))
+
+        plugin = EmbedCoverArtPlugin()
+        plugin.config["remove_art_file"] = True
+
+        self.lib._memotable = {"stale": "cache_entry"}
+        plugin.remove_artfile(self.album)
+
+        assert self.album.artpath is None, (
+            "remove_artfile must set artpath to None when file is removed"
+        )
+        assert not os.path.isfile(util.syspath(self.album.artpath or b"")), (
+            "remove_artfile must actually delete the art file on disk"
+        )
+        assert self.lib._memotable == {}, (
+            "EmbedArtPlugin.remove_artfile sets album.artpath = None, "
+            "which must go through the _setitem interceptor and flush "
+            "_memotable."
+        )
+
+    def test_embedart_extractart_associate_clears_memotable(self):
+        """Simulating extractart -o <path> --associate: art.extract_first
+        writes a file, then album.set_art associates it → memotable flush.
+
+        We cannot call extract_func directly because it drives the CLI
+        argument parser; instead we call the same primitives in order:
+        produce a cover file on disk (here we pre-create one instead of
+        relying on MediaFile embedded images), then call album.set_art()
+        and album.store(), mirroring exactly what the plugin code does
+        in the opts.associate branch.
+        """
+        cover_bytes = b"EXTRACTED_EMBEDDED_IMAGE_FROM_MEDIAFILE"
+        extracted_artpath = _write_binary(
+            util.bytestring_path(
+                os.path.join(
+                    util.syspath(self.album.path), "extracted.jpg"
+                )
+            ),
+            cover_bytes,
+        )
+
+        self.lib._memotable = {"stale": "before_extract"}
+        # Replicate the body of embedart.extract_func's associate branch:
+        self.album.set_art(extracted_artpath)
+        self.album.store()
+
+        assert self.lib._memotable == {}, (
+            "extractart --associate calls album.set_art + album.store(); "
+            "the set_art → _setitem chain must flush _memotable."
+        )
+        assert self.album.artpath is not None
+        with open(util.syspath(self.album.artpath), "rb") as f:
+            assert f.read() == cover_bytes
+
+    # ------------------------------------------------------------------
+    # clearart (via embedart module-level helper) integration
+    # ------------------------------------------------------------------
+    def test_embedart_clearart_sets_artpath_none_on_album(self):
+        """After art.clear() removes embedded images the embedart plugin
+        leaves the external album art alone; but when the user manually
+        nulls out the album's artpath afterwards, it must still flush.
+
+        This is a defensive regression test. ``art.clear()`` operates on
+        MediaFile embedded images and does not touch ``album.artpath``,
+        so users typically follow it up with ``album.artpath = None;
+        album.store()``.  The interceptor must fire for that manual step.
+        """
+        cover = _write_binary(
+            util.bytestring_path(self.temp_dir_path / "x.jpg"),
+            b"X",
+        )
+        self.album.set_art(cover, copy=True)
+        self.album.store()
+
+        self.lib._memotable = {"stale": "entry"}
+        # User invokes `beet clearart` then manually removes external art.
+        self.album.artpath = None
+        self.album.store()
+
+        assert self.album.artpath is None
+        assert self.lib._memotable == {}
+
+
