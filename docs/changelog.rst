@@ -68,9 +68,17 @@ Bug fixes
   errors (e.g. a file locked by another process) are logged as warnings instead
   of crashing beets. :bug:`6193`
 
-..
-    For plugin developers
-    ~~~~~~~~~~~~~~~~~~~~~
+For plugin developers
+~~~~~~~~~~~~~~~~~~~~~
+
+- Plugin command names and aliases are now checked for conflicts when
+  registering with the CLI. If a plugin command collides with a built-in
+  command or another plugin's command, the later one is ignored with a clear
+  warning log message that includes the command name, the conflicting plugin
+  name, and which command takes precedence.
+- Help output now labels plugin-provided commands with a ``[plugin: name]``
+  tag so users can tell which plugin provides each command, and duplicate
+  command names no longer produce duplicate help entries.
 
 Other changes
 ~~~~~~~~~~~~~
