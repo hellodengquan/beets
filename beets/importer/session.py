@@ -331,11 +331,12 @@ class ImportSession:
             context=summary,
         )
 
-        trace_path = (
+        raw_trace = (
             config["import"]["diagnose_trace"].get()
             if config["import"]["diagnose_trace"].exists()
             else None
         )
+        trace_path = raw_trace if raw_trace else None
         dry_run = bool(self.config.get("pretend", False))
         quiet = (
             config["import"]["quiet"].get(bool)
@@ -344,7 +345,10 @@ class ImportSession:
         )
 
         writer = create_writer_for_session(
-            trace_path, dry_run=dry_run, quiet=quiet
+            trace_path,
+            dry_run=dry_run,
+            quiet=quiet,
+            library_path=self.lib.path if hasattr(self.lib, "path") else None,
         )
         writer.write(
             self.diagnostics,

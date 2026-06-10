@@ -32,13 +32,16 @@ New features
   file operations, duplicate-resolution decisions, and structured exception
   tracebacks. The diagnostics are written out as a single JSON trace at the end
   of the import session; use ``--diagnose-trace PATH`` to write to a file
-  instead of stdout, or pair with ``--quiet`` for silent, scriptable
-  operation. Volume is bounded by ``import.diagnose_max_bytes`` and
-  ``import.diagnose_max_events``; write errors (permissions, disk-full, ...)
-  degrade gracefully and never interrupt the import. The new
-  ``beets.importer.diagnostics`` module exposes the
-  ``ImportDiagnosticCollector`` and ``DiagnosticTraceWriter`` classes for
-  programmatic use.
+  instead of stdout. In quiet mode (``-q``) without an explicit trace path,
+  the trace is automatically saved next to the library database file (e.g.
+  ``~/beetslibrary.diagnostics.json``) so diagnostics are never silently
+  discarded; if no default path can be determined (e.g. in-memory library), a
+  warning is logged instead. Volume is bounded by
+  ``import.diagnose_max_bytes`` and ``import.diagnose_max_events``; write
+  errors (permissions, disk-full, ...) degrade gracefully and never interrupt
+  the import. The new ``beets.importer.diagnostics`` module exposes the
+  ``ImportDiagnosticCollector``, ``DiagnosticTraceWriter``, and
+  ``default_diagnostic_trace_path`` helpers for programmatic use.
 
 Bug fixes
 ~~~~~~~~~

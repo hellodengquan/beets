@@ -46,6 +46,7 @@ from beets.importer import (
     ImportDiagnosticCollector,
     create_collector_for_session,
     create_writer_for_session,
+    default_diagnostic_trace_path,
     diagnostics_config,
     should_enable_diagnostics,
 )
@@ -539,28 +540,124 @@ class TestTraceWriterDryRunAndQuiet:
         assert "dry-run" in joined.lower()
         assert path in joined
 
-    def test_quiet_no_path_suppresses_output(self, capsys):
-        """``create_writer_for_session`` with ``quiet=True`` and no
-        explicit trace path produces a writer that returns True from
-        .write() without emitting anything to stdout.
+    def test_quiet_no_path_no_library_warns_data_discarded(self, caplog):
+        """Quiet mode + no trace path + no library path = writer has
+        nowhere to persist.  It must log a warning so the user knows
+        the diagnostics were collected but discarded.
         """
         c = self._collector()
-        w = create_writer_for_session(None, quiet=True, dry_run=False)
+        w = create_writer_for_session(
+            None, quiet=True, dry_run=False, library_path=None
+        )
+        # With no library path the default cannot be computed.
         assert w.output_path is None
         assert w._quiet is True
 
-        result = w.write(c)
+        with caplog.at_level(blog.WARNING, logger="beets"):
+            result = w.write(c)
         assert result is True
-        out, _ = capsys.readouterr()
-        assert out == ""
+        warnings = [r for r in caplog.records if r.levelno >= blog.WARNING]
+        assert any("discarded" in r.getMessage().lower() for r in warnings), (
+            "Expected a warning about discarded diagnostics"
+        )
+        assert any("--diagnose-trace" in r.getMessage() for r in warnings), (
+            "Warning should mention --diagnose-trace"
+        )
 
-        # Confirm the non-quiet version *does* write to stdout, so we
-        # know the suppression above is meaningful.
-        w2 = create_writer_for_session(None, quiet=False, dry_run=False)
-        w2.write(c)
-        out2, _ = capsys.readouterr()
-        assert len(out2) > 0
-        assert "metadata" in out2
+    def test_quiet_no_path_no_events_no_warning(self, caplog):
+        """If the collector has zero events the warning is suppressed
+        (nothing was actually discarded).
+        """
+        c = ImportDiagnosticCollector(enabled=True)
+        assert c.event_count == 0
+        w = DiagnosticTraceWriter(None, quiet=True)
+        with caplog.at_level(blog.WARNING, logger="beets"):
+            w.write(c)
+        warnings = [r for r in caplog.records if r.levelno >= blog.WARNING]
+        assert not any("discarded" in r.getMessage().lower() for r in warnings)
+
+    def test_non_quiet_no_path_writes_to_stdout(self, capsys):
+        """Non-quiet + no path → stdout, as before."""
+        c = self._collector()
+        w = create_writer_for_session(None, quiet=False, dry_run=False)
+        w.write(c)
+        out, _ = capsys.readouterr()
+        assert len(out) > 0
+        assert "metadata" in out
+
+
+class TestDefaultTracePath:
+    """Tests for the ``default_diagnostic_trace_path`` helper and its
+    integration with ``create_writer_for_session``.
+    """
+
+    def test_derives_from_library_path(self):
+        result = default_diagnostic_trace_path("/home/user/beetslibrary.db")
+        assert result == "/home/user/beetslibrary.diagnostics.json"
+
+    def test_derives_from_library_path_with_bytes(self):
+        result = default_diagnostic_trace_path(b"/home/user/beetslibrary.db")
+        assert result == "/home/user/beetslibrary.diagnostics.json"
+
+    def test_strips_extension(self):
+        result = default_diagnostic_trace_path("/tmp/my.lib.sqlite")
+        assert result == "/tmp/my.lib.diagnostics.json"
+
+    def test_memory_db_returns_none(self):
+        assert default_diagnostic_trace_path(":memory:") is None
+
+    def test_none_returns_none(self):
+        assert default_diagnostic_trace_path(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert default_diagnostic_trace_path("") is None
+        assert default_diagnostic_trace_path("  ") is None
+
+    def test_quiet_with_library_path_gets_default_trace_file(self):
+        """The key scenario: quiet mode + no explicit trace path, but a
+        library database is available.  The writer should automatically
+        target ``<library_base>.diagnostics.json``.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            lib_path = os.path.join(td, "library.db")
+            w = create_writer_for_session(
+                None, quiet=True, library_path=lib_path
+            )
+            assert w.output_path == os.path.join(
+                td, "library.diagnostics.json"
+            )
+
+    def test_quiet_with_library_path_actually_writes_file(self):
+        """End-to-end: quiet mode + library path → trace is written to
+        the default location next to the database.
+        """
+        c = ImportDiagnosticCollector(enabled=True)
+        c.record("general", "info", "batch import event")
+        with tempfile.TemporaryDirectory() as td:
+            lib_path = os.path.join(td, "library.db")
+            w = create_writer_for_session(
+                None, quiet=True, library_path=lib_path
+            )
+            assert w.output_path is not None
+            result = w.write(c)
+            assert result is True
+            expected_path = os.path.join(td, "library.diagnostics.json")
+            assert os.path.isfile(expected_path)
+            data = json.load(open(expected_path, "r", encoding="utf-8"))
+            assert data["metadata"]["summary"]["event_count"] == 1
+
+    def test_explicit_path_overrides_default(self):
+        """If the user explicitly sets --diagnose-trace, that takes
+        precedence over the default path.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            explicit = os.path.join(td, "custom_trace.json")
+            w = create_writer_for_session(
+                explicit,
+                quiet=True,
+                library_path=os.path.join(td, "library.db"),
+            )
+            assert w.output_path == explicit
 
 
 class TestTraceWriterTruncation:
@@ -765,3 +862,39 @@ class TestDiagnosticsIntegration(AsIsImporterMixin, ImportTestCase):
             stages = {e["stage"] for e in data["events"]}
             assert DIAG_STAGE_PATH_PARSE in stages
             assert DIAG_STAGE_FILE_IMPORT in stages
+
+    def test_quiet_import_without_trace_path_uses_default(self):
+        """Quiet mode + diagnostics enabled + no explicit trace path:
+        the trace should be written next to the library database file.
+        This is the exact scenario described in the bug report.
+        """
+        self.config["verbose"] = 3
+        self.config["import"]["quiet"] = True
+        self.config["import"]["autotag"] = False
+        self.config["import"]["copy"] = False
+        # Ensure no explicit diagnose_trace is set so the default kicks
+        # in.  The beets config object does not support __delitem__, so
+        # we set it to an empty string which the session treats as
+        # "not configured".
+        self.config["import"]["diagnose_trace"] = ""
+
+        importer = self._make_session(diagnose=None)
+        importer.set_config(self.config["import"])
+        importer.run()
+
+        lib_path_str = os.fsdecode(self.lib.path)
+        if lib_path_str == ":memory:":
+            # In-memory library: no default path, but a warning should
+            # have been logged. We cannot easily check the warning here
+            # but at least verify the import didn't crash.
+            return
+
+        expected = default_diagnostic_trace_path(self.lib.path)
+        assert expected is not None, (
+            f"Could not compute default trace path for library at {lib_path_str}"
+        )
+        assert os.path.isfile(expected), (
+            f"Quiet-mode import should have written trace to {expected}"
+        )
+        data = json.load(open(expected, "r", encoding="utf-8"))
+        assert data["metadata"]["summary"]["event_count"] > 0

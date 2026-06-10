@@ -160,16 +160,26 @@ Optional command flags:
   Diagnostics are also automatically turned on when the global
   ``verbose`` level is ``3`` or above (``beet -vvv import ...``), so
   you don't have to remember the extra flag for ad-hoc debugging.
-- By default the diagnostics trace is written to stdout unless
-  ``--quiet`` is active. Use the ``--diagnose-trace PATH`` option to
-  have the JSON written to a specific file instead. The trace honors
-  the ``--pretend`` (``dry_run``) flag: in pretend mode the file is
-  never created but the would-be size and path are logged at info
-  level. Size and count limits (``import.diagnose_max_bytes`` and
-  ``import.diagnose_max_events``) keep the trace from growing
-  unbounded; oldest events are dropped first when the limits kick
-  in. Writing the trace can never crash the import -- permissions or
-  disk errors gracefully fall back to a short summary on stderr.
+- The trace output destination depends on the mode and configuration:
+
+  - In non-quiet mode, the trace is written to stdout.
+  - In quiet mode (``-q`` / ``--quiet``) **without** ``--diagnose-trace``,
+    the trace is automatically written to a file next to your library
+    database — e.g. ``~/beetslibrary.diagnostics.json`` — so that
+    diagnostics are never silently discarded. If the library uses an
+    in-memory database (``:memory:``) and no explicit output path is
+    provided, a warning is logged to remind you to set
+    ``--diagnose-trace``.
+  - With ``--diagnose-trace PATH``, the trace is always written to that
+    file, regardless of quiet mode.
+
+  The trace honors the ``--pretend`` (``dry_run``) flag: in pretend mode
+  the file is never created but the would-be size and path are logged at
+  info level. Size and count limits (``import.diagnose_max_bytes`` and
+  ``import.diagnose_max_events``) keep the trace from growing unbounded;
+  oldest events are dropped first when the limits kick in. Writing the
+  trace can never crash the import -- permissions or disk errors
+  gracefully fall back to a short summary on stderr.
 
 .. _py7zr: https://pypi.org/project/py7zr/
 

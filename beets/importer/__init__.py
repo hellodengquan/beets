@@ -55,6 +55,7 @@ from .diagnostics import (  # noqa: E402
     ImportDiagnosticCollector,
     create_collector_for_session,
     create_writer_for_session,
+    default_diagnostic_trace_path,
     diagnostics_config,
     should_enable_diagnostics,
 )
@@ -76,6 +77,7 @@ __all__.extend(
         "ImportDiagnosticCollector",
         "create_collector_for_session",
         "create_writer_for_session",
+        "default_diagnostic_trace_path",
         "diagnostics_config",
         "should_enable_diagnostics",
     ]

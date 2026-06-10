@@ -562,11 +562,21 @@ class DiagnosticTraceWriter:
 
         if self._output_path is None:
             if self._quiet:
-                # Quiet mode with no explicit trace path: produce no
-                # output at all, but still return True as if everything
-                # succeeded. This lets non-interactive users keep logs
-                # clean while still being able to turn diagnostics on
-                # via config.
+                # Quiet mode with no trace path.  This should not
+                # normally happen because session-level code resolves
+                # a default path, but if we end up here it means
+                # diagnostics were collected with nowhere to persist
+                # them.  Warn loudly so the user knows data was lost.
+                if collector.event_count > 0:
+                    log.warning(
+                        "Diagnostics were enabled but no trace output "
+                        "path could be determined; {} events and {} "
+                        "errors were collected but discarded. Set "
+                        "import.diagnose_trace or use --diagnose-trace "
+                        "to specify an output file.",
+                        collector.event_count,
+                        collector.error_count,
+                    )
                 return True
             self._print_to_stdout(serialised)
             return True
@@ -733,6 +743,32 @@ def create_collector_for_session(
     return collector
 
 
+def default_diagnostic_trace_path(library_path: str | bytes | None) -> str | None:
+    """Compute a sensible default trace output path.
+
+    The default is placed next to the beets library database file with
+    a ``.diagnostics.json`` suffix.  For example, if the library is at
+    ``~/beetslibrary.db`` the default trace path is
+    ``~/beetslibrary.diagnostics.json``.
+
+    Returns None if the library path cannot be determined.
+    """
+    if library_path is None:
+        return None
+    lib_str = os.fsdecode(library_path) if isinstance(library_path, bytes) else library_path
+    lib_str = lib_str.strip()
+    if not lib_str:
+        return None
+    # For in-memory databases (e.g. ":memory:") there is no directory
+    # to write alongside.
+    if lib_str == ":memory:":
+        return None
+    base, _ = os.path.splitext(lib_str)
+    if not base:
+        return None
+    return f"{base}.diagnostics.json"
+
+
 def create_writer_for_session(
     trace_path: str | None,
     *,
@@ -740,23 +776,33 @@ def create_writer_for_session(
     quiet: bool = False,
     max_bytes: int | None = None,
     max_events: int | None = None,
+    library_path: str | bytes | None = None,
 ) -> DiagnosticTraceWriter:
     """Build a trace writer respecting quiet/dry-run modes.
 
-    In quiet mode with an explicit ``trace_path`` we still write the
-    file but suppress any info logs (the writer uses log.warning for
-    failures, which the quiet config won't suppress). If neither a
-    trace path is given nor quiet is off, we output to stdout *unless*
-    quiet is enabled, in which case we do nothing at all.
+    Resolution order for the output path:
+
+    1. Explicit ``trace_path`` from ``--diagnose-trace`` or config → use as-is.
+    2. No explicit path, quiet mode → fall back to the default path
+       derived from the library database location so the trace is
+       always persisted somewhere.
+    3. No explicit path, non-quiet → stdout (as before).
+
+    If the default path cannot be determined (e.g. in-memory library)
+    and no explicit path is given, the writer will emit a warning when
+    it has events to write but nowhere to put them.
     """
     resolved_path: str | None
     if trace_path:
         resolved_path = trace_path
     elif quiet:
-        # No output path and user asked for silence: do not produce a
-        # trace at all. The writer will still have its summary for
-        # introspection.
-        resolved_path = None
+        # Quiet mode with no explicit path: compute a default file
+        # path so diagnostics are not silently discarded.
+        resolved_path = default_diagnostic_trace_path(library_path)
+        if resolved_path is None:
+            # We truly have nowhere to write.  The writer will emit
+            # a warning at write time.
+            resolved_path = None
     else:
         resolved_path = None
 
