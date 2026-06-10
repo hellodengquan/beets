@@ -615,6 +615,7 @@ class Subcommand:
         self.help = help
         self.hide = hide
         self._root_parser = None
+        self.plugin: str | None = None
 
     def print_help(self):
         self.parser.print_help()
@@ -660,8 +661,46 @@ class SubcommandsOptionParser(CommonOptionsParser):
         self.subcommands = []
 
     def add_subcommand(self, *cmds):
-        """Adds a Subcommand object to the parser's list of commands."""
+        """Adds a Subcommand object to the parser's list of commands.
+
+        If a command name or alias collides with one already registered,
+        a warning is logged and the colliding command is *not* added
+        (the existing one remains effective).
+        """
         for cmd in cmds:
+            existing = self._subcommand_for_name(cmd.name)
+            if existing is None:
+                for alias in cmd.aliases:
+                    existing = self._subcommand_for_name(alias)
+                    if existing is not None:
+                        break
+
+            if existing is not None:
+                existing_source = (
+                    f"plugin '{existing.plugin}'"
+                    if existing.plugin
+                    else "built-in"
+                )
+                new_source = (
+                    f"plugin '{cmd.plugin}'" if cmd.plugin else "built-in"
+                )
+                colliding_name = (
+                    cmd.name
+                    if self._subcommand_for_name(cmd.name) is not None
+                    else next(
+                        a for a in cmd.aliases
+                        if self._subcommand_for_name(a) is not None
+                    )
+                )
+                log.warning(
+                    "command '{name}' from {new_source} conflicts with "
+                    "{existing_source} and has been ignored",
+                    name=colliding_name,
+                    new_source=new_source,
+                    existing_source=existing_source,
+                )
+                continue
+
             cmd.root_parser = self
             self.subcommands.append(cmd)
 
@@ -694,7 +733,7 @@ class SubcommandsOptionParser(CommonOptionsParser):
             if proposed_help_position <= formatter.max_help_position:
                 help_position = max(help_position, proposed_help_position)
 
-        # Add each subcommand to the output.
+        # Add the list of subcommands to the output.
         for subcommand, name in zip(subcommands, disp_names):
             # Lifted directly from optparse.py.
             name_width = help_position - formatter.current_indent - 2
@@ -706,7 +745,19 @@ class SubcommandsOptionParser(CommonOptionsParser):
                 indent_first = 0
             result.append(name)
             help_width = formatter.width - help_position
-            help_lines = textwrap.wrap(subcommand.help, help_width)
+
+            help_text = subcommand.help
+            if subcommand.plugin:
+                source_tag = f" [plugin: {subcommand.plugin}]"
+            else:
+                source_tag = ""
+
+            if help_text:
+                full_help = f"{help_text}{source_tag}"
+            else:
+                full_help = source_tag.strip()
+
+            help_lines = textwrap.wrap(full_help, help_width)
             help_line = help_lines[0] if help_lines else ""
             result.append(f"{' ' * indent_first}{help_line}\n")
             result.extend(

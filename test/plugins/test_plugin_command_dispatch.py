@@ -258,10 +258,11 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
     """Test the behavior when a plugin registers a command whose name
     collides with a built-in command or another plugin's command.
 
-    Ordering in beets is currently:
-        built-in commands first, then plugin commands
-    so built-in commands *shadow* plugin commands of the same name
-    (and the first plugin command shadows later ones with the same name).
+    Conflict resolution:
+        - built-in commands are registered first, so they shadow plugin commands
+        - first-registered plugin command shadows later ones with the same name
+        - a warning is logged explaining which command was ignored and why
+        - help output only shows the effective command, annotated with source
     """
 
     @pytest.fixture(autouse=True)
@@ -314,11 +315,9 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
         assert builtin_called[0] is True
         assert plugin_called[0] is False
 
-    def test_plugin_command_shadowed_no_warning_raised(self, caplog):
-        """Currently there is *no* warning when a plugin's command name
-        collides with a built-in.
-
-        This test documents existing behavior so we notice if it changes.
+    def test_plugin_conflict_with_builtin_logs_warning(self, caplog):
+        """When a plugin command collides with a built-in, a warning
+        is logged identifying the ignored command and its plugin.
         """
         import logging
 
@@ -327,7 +326,7 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
 
         class PluginDupe(plugins.BeetsPlugin):
             def __init__(self):
-                super().__init__("dupeplugin")
+                super().__init__("myplugin")
 
             def commands(self):
                 cmd = ui.Subcommand("list", help="plugin")
@@ -347,19 +346,101 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
             for rec in caplog.records
             if rec.levelno >= logging.WARNING
         ]
-        has_conflict_warning = any(
-            "shadow" in msg.lower()
-            or "conflict" in msg.lower()
-            or "duplicate" in msg.lower()
-            for msg in warning_msgs
-        )
-        assert not has_conflict_warning, (
-            f"unexpected warning about duplicate command: {warning_msgs}"
-        )
+        conflict_warnings = [
+            msg for msg in warning_msgs
+            if "conflicts" in msg and "ignored" in msg
+        ]
+        assert len(conflict_warnings) == 1
+        assert "list" in conflict_warnings[0]
+        assert "myplugin" in conflict_warnings[0]
+        assert "built-in" in conflict_warnings[0]
+
+    def test_plugin_conflict_with_another_plugin_logs_warning(self, caplog):
+        """When two plugins register the same command name, a warning
+        is logged with both plugin names.
+        """
+        import logging
+
+        class PluginA(plugins.BeetsPlugin):
+            def __init__(self):
+                super().__init__("plugalpha")
+
+            def commands(self):
+                cmd = ui.Subcommand("sharedcmd", help="from alpha")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        class PluginB(plugins.BeetsPlugin):
+            def __init__(self):
+                super().__init__("plugbeta")
+
+            def commands(self):
+                cmd = ui.Subcommand("sharedcmd", help="from beta")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(PluginA)
+        self.register_plugin(PluginB)
+
+        caplog.set_level(logging.WARNING)
+
+        parser = ui.SubcommandsOptionParser()
+        parser.add_subcommand(*plugins.commands())
+
+        warning_msgs = [
+            rec.message
+            for rec in caplog.records
+            if rec.levelno >= logging.WARNING
+        ]
+        conflict_warnings = [
+            msg for msg in warning_msgs
+            if "conflicts" in msg and "ignored" in msg
+        ]
+        assert len(conflict_warnings) == 1
+        assert "sharedcmd" in conflict_warnings[0]
+        assert "plugbeta" in conflict_warnings[0]
+        assert "plugalpha" in conflict_warnings[0]
+
+    def test_alias_conflict_logs_warning(self, caplog):
+        """When a plugin's command alias collides, a warning is also logged."""
+        import logging
+
+        class PluginPrimary(plugins.BeetsPlugin):
+            def __init__(self):
+                super().__init__("plug_primary")
+
+            def commands(self):
+                cmd = ui.Subcommand("real", aliases=("r",))
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        class PluginAlias(plugins.BeetsPlugin):
+            def __init__(self):
+                super().__init__("plug_alias")
+
+            def commands(self):
+                cmd = ui.Subcommand("other", aliases=("r",))
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(PluginPrimary)
+        self.register_plugin(PluginAlias)
+
+        caplog.set_level(logging.WARNING)
+
+        parser = ui.SubcommandsOptionParser()
+        parser.add_subcommand(*plugins.commands())
+
+        conflict_msgs = [
+            rec.message for rec in caplog.records
+            if rec.levelno >= logging.WARNING and "conflicts" in rec.message
+        ]
+        assert len(conflict_msgs) == 1
+        assert "'r'" in conflict_msgs[0]
 
     def test_first_plugin_command_shadows_later_plugin_commands(self):
         """When two plugins register commands with the same name,
-        the one registered first wins.
+        the one registered first wins and the second is not added.
         """
         results = {"first": False, "second": False}
 
@@ -401,9 +482,9 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
         assert results["first"] is True
         assert results["second"] is False
 
-    def test_shadowed_command_still_present_in_subcommands_list(self):
-        """Both commands are physically present in subcommands list,
-        even though only the first one is ever dispatched to.
+    def test_conflicting_command_not_added_to_subcommands(self):
+        """The conflicting (second) command is *not* added to the parser's
+        subcommands list -- only the first one remains.
         """
         class PluginA(plugins.BeetsPlugin):
             def __init__(self):
@@ -426,9 +507,14 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
         self.register_plugin(PluginA)
         self.register_plugin(PluginB)
 
-        all_cmds = plugins.commands()
-        same_name_cmds = [c for c in all_cmds if c.name == "doublename"]
-        assert len(same_name_cmds) == 2
+        parser = ui.SubcommandsOptionParser()
+        parser.add_subcommand(*plugins.commands())
+
+        same_name_cmds = [
+            c for c in parser.subcommands if c.name == "doublename"
+        ]
+        assert len(same_name_cmds) == 1
+        assert same_name_cmds[0].plugin == "plug_a"
 
     def test_alias_conflict_primary_name_wins(self):
         """If a plugin command's primary name collides with another
@@ -509,14 +595,10 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
 
         assert plugin_list_called[0] is False
 
-    def test_help_listing_shows_both_of_duplicate_names(self, capsys):
-        """Help output shows two entries when two commands share a name
-        (one per subcommand object in the list).
-
-        This is the current behavior: ``format_help`` iterates each
-        subcommand once, so duplicate names produce duplicate entries.
+    def test_help_shows_only_effective_command(self):
+        """Help output only shows one entry per command name (the one
+        that is actually effective) because duplicates are rejected.
         """
-
         class PluginOne(plugins.BeetsPlugin):
             def __init__(self):
                 super().__init__("one")
@@ -543,6 +625,42 @@ class TestPluginCommandNameConflict(PluginLifecycleTestHelper):
         parser.add_subcommand(*all_cmds)
 
         help_text = parser.format_help()
-        assert help_text.count("duphelp") == 2
+        assert help_text.count("duphelp") == 1
         assert "from plugin one" in help_text
-        assert "from plugin two" in help_text
+        assert "from plugin two" not in help_text
+
+    def test_help_annotates_plugin_command_with_source(self):
+        """Plugin commands in help output are tagged with the plugin name
+        so the user can tell which plugin provides each command.
+        """
+
+        class HelpPlugin(plugins.BeetsPlugin):
+            def __init__(self):
+                super().__init__("mygreatplugin")
+
+            def commands(self):
+                cmd = ui.Subcommand("greatcmd", help="does great things")
+                cmd.func = lambda lib, opts, args: None
+                return [cmd]
+
+        self.register_plugin(HelpPlugin)
+
+        parser = ui.SubcommandsOptionParser()
+        parser.add_subcommand(*plugins.commands())
+
+        help_text = parser.format_help()
+        assert "greatcmd" in help_text
+        assert "[plugin: mygreatplugin]" in help_text
+        assert "does great things" in help_text
+
+    def test_help_builtin_commands_have_no_plugin_tag(self):
+        """Built-in commands should not show a [plugin: ...] tag."""
+        parser = ui.SubcommandsOptionParser()
+        from beets.ui.commands import default_commands
+
+        parser.add_subcommand(*default_commands)
+
+        help_text = parser.format_help()
+        assert "[plugin:" not in help_text
+        assert "list" in help_text
+        assert "import" in help_text

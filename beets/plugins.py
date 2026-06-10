@@ -502,10 +502,15 @@ def find_plugins() -> Iterable[BeetsPlugin]:
 
 
 def commands() -> list[Subcommand]:
-    """Returns a list of Subcommand objects from all loaded plugins."""
+    """Returns a list of Subcommand objects from all loaded plugins.
+
+    Each command's ``plugin`` attribute is set to the originating plugin name.
+    """
     out: list[Subcommand] = []
     for plugin in find_plugins():
-        out += plugin.commands()
+        for cmd in plugin.commands():
+            cmd.plugin = plugin.name
+            out.append(cmd)
     return out
 
 
