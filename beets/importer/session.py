@@ -22,6 +22,12 @@ from beets.importer.tasks import Action
 from beets.util import displayable_path, normpath, pipeline, syspath
 
 from . import stages as stagefuncs
+from .diagnostics import (
+    ImportDiagnosticCollector,
+    DiagnosticTraceWriter,
+    create_collector_for_session,
+    create_writer_for_session,
+)
 from .state import ImportState
 
 if TYPE_CHECKING:
@@ -53,6 +59,8 @@ class ImportSession:
     logger: logging.Logger
     paths: list[PathBytes]
     lib: library.Library
+    diagnostics: ImportDiagnosticCollector
+    _diagnose_cli_flag: bool | None
 
     _is_resuming: dict[bytes, bool]
     _merged_items: set[PathBytes]
@@ -64,6 +72,8 @@ class ImportSession:
         loghandler: logging.Handler | None,
         paths: Sequence[PathBytes] | None,
         query: dbcore.Query | None,
+        *,
+        diagnose: bool | None = None,
     ):
         """Create a session.
 
@@ -78,6 +88,10 @@ class ImportSession:
             The paths to be imported.
         query : dbcore.Query or None
             A query to filter items for import.
+        diagnose : bool or None, optional
+            Explicit override for diagnostic collection. If None, the
+            decision is derived from the ``--diagnose`` flag / config
+            and the global ``verbose`` level.
         """
         self.lib = lib
         self.logger = self._setup_logging(loghandler)
@@ -85,6 +99,19 @@ class ImportSession:
         self._is_resuming = {}
         self._merged_items = set()
         self._merged_dirs = set()
+        self._diagnose_cli_flag = diagnose
+
+        # Set up the diagnostic collector as early as possible so we
+        # capture the entire pipeline. The collector is cheap when
+        # disabled.
+        verbose_level = (
+            config["verbose"].as_number()
+            if config["verbose"].exists()
+            else 0
+        )
+        self.diagnostics = create_collector_for_session(
+            diagnose, verbose_level
+        )
 
         # Normalize the paths.
         self.paths = list(map(normpath, paths or []))
@@ -193,6 +220,19 @@ class ImportSession:
         self.logger.info("import started {}", time.asctime())
         self.set_config(config["import"])
 
+        # Record session-level diagnostics header.
+        self.diagnostics.record(
+            "general",
+            "info",
+            "import session started",
+            paths=self.paths,
+            context={
+                "num_paths": len(self.paths),
+                "query": str(self.query) if self.query else None,
+                "config_snapshot": self._diagnostic_config_snapshot(),
+            },
+        )
+
         # Set up the pipeline.
         if self.query is None:
             stages = [stagefuncs.read_tasks(self)]
@@ -239,7 +279,81 @@ class ImportSession:
                 pl.run_sequential()
         except ImportAbortError:
             # User aborted operation. Silently stop.
-            pass
+            self.diagnostics.record(
+                "general",
+                "warning",
+                "import aborted by user",
+                context=self.diagnostics.summary(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Record any fatal, top-level exception in the trace so
+            # users don't have to cross-reference a stack trace with
+            # the diagnostic file. Re-raise afterwards -- we are not
+            # changing the control flow here.
+            self.diagnostics.record(
+                "general",
+                "error",
+                f"fatal import error: {exc}",
+                context=self.diagnostics.summary(),
+                exc_info=exc,
+            )
+            raise
+        finally:
+            self._write_diagnostic_trace()
+
+    def _diagnostic_config_snapshot(self) -> dict[str, object]:
+        """Return a small, safe subset of the import config for the trace."""
+        icfg = self.config
+        return {
+            "autotag": bool(icfg.get("autotag", True)),
+            "singletons": bool(icfg.get("singletons", False)),
+            "move": bool(icfg.get("move", False)),
+            "copy": bool(icfg.get("copy", False)),
+            "write": bool(icfg.get("write", False)),
+            "pretend": bool(icfg.get("pretend", False)),
+            "incremental": bool(icfg.get("incremental", False)),
+            "flat": bool(icfg.get("flat", False)),
+            "quiet": bool(config["import"]["quiet"].get(bool))
+            if config["import"]["quiet"].exists()
+            else False,
+        }
+
+    def _write_diagnostic_trace(self) -> None:
+        """Serialise the diagnostic trace if collection is enabled."""
+        if not self.diagnostics.enabled:
+            return
+
+        summary = self.diagnostics.summary()
+        self.diagnostics.record(
+            "general",
+            "info",
+            "import session finished",
+            context=summary,
+        )
+
+        trace_path = (
+            config["import"]["diagnose_trace"].get()
+            if config["import"]["diagnose_trace"].exists()
+            else None
+        )
+        dry_run = bool(self.config.get("pretend", False))
+        quiet = (
+            config["import"]["quiet"].get(bool)
+            if config["import"]["quiet"].exists()
+            else False
+        )
+
+        writer = create_writer_for_session(
+            trace_path, dry_run=dry_run, quiet=quiet
+        )
+        writer.write(
+            self.diagnostics,
+            extra_metadata={
+                "import_paths": [displayable_path(p) for p in self.paths],
+                "query": str(self.query) if self.query else None,
+                "session_summary": summary,
+            },
+        )
 
     # Incremental and resumed imports
 

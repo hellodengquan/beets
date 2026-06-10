@@ -484,28 +484,59 @@ class ImportTask(BaseImportTask):
         # Save the original paths of all items for deletion and pruning
         # in the next step (finalization).
         self.old_paths: list[util.PathBytes] = [item.path for item in items]
+        operation_name = operation.name if operation is not None else "none"
         for item in items:
             if operation is not None:
                 # In copy and link modes, treat re-imports specially:
                 # move in-library files. (Out-of-library files are
                 # copied/moved as usual).
                 old_path = item.path
-                if (
-                    operation != util.MoveOperation.MOVE
-                    and self.replaced_items[item]
-                    and session.lib.directory in util.ancestry(old_path)
-                ):
-                    item.move()
-                    # We moved the item, so remove the
-                    # now-nonexistent file from old_paths.
-                    self.old_paths.remove(old_path)
-                else:
-                    # A normal import. Just copy files and keep track of
-                    # old paths.
-                    item.move(operation)
+                new_path: util.PathBytes | None = None
+                try:
+                    if (
+                        operation != util.MoveOperation.MOVE
+                        and self.replaced_items[item]
+                        and session.lib.directory in util.ancestry(old_path)
+                    ):
+                        item.move()
+                        new_path = item.path
+                        # We moved the item, so remove the
+                        # now-nonexistent file from old_paths.
+                        self.old_paths.remove(old_path)
+                    else:
+                        # A normal import. Just copy files and keep track of
+                        # old paths.
+                        item.move(operation)
+                        new_path = item.path
+                    session.diagnostics.record_file_operation(
+                        self,
+                        operation_name,
+                        old_path,
+                        new_path,
+                        success=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    session.diagnostics.record_file_operation(
+                        self,
+                        operation_name,
+                        old_path,
+                        None,
+                        success=False,
+                        exc_info=exc,
+                    )
+                    raise
 
             if write and (self.apply or self.choice_flag == Action.RETAG):
-                item.try_write()
+                try:
+                    item.try_write()
+                    session.diagnostics.record_metadata_write(
+                        item, success=True, task=self
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    session.diagnostics.record_metadata_write(
+                        item, success=False, task=self, exc_info=exc
+                    )
+                    raise
 
         with session.lib.transaction():
             for item in self.imported_items():
@@ -1047,11 +1078,15 @@ class ImportTaskFactory:
             yield [self.toppath], [self.toppath]
         elif self.session.config["flat"]:
             paths = []
-            for dirs, paths_in_dir in albums_in_dir(self.toppath):
+            for dirs, paths_in_dir in albums_in_dir(
+                self.toppath, session=self.session
+            ):
                 paths += paths_in_dir
             yield [self.toppath], paths
         else:
-            for dirs, paths in albums_in_dir(self.toppath):
+            for dirs, paths in albums_in_dir(
+                self.toppath, session=self.session
+            ):
                 yield dirs, paths
 
     def singleton(self, path: util.PathBytes):
@@ -1125,7 +1160,17 @@ class ImportTaskFactory:
             archive_task.extract()
         except Exception as exc:
             log.error("extraction failed: {}", exc)
+            self.session.diagnostics.record_archive_extract(
+                self.toppath,
+                archive_task.toppath or b"<unknown>",
+                success=False,
+                exc_info=exc,
+            )
             return
+
+        self.session.diagnostics.record_archive_extract(
+            self.toppath, archive_task.toppath or b"<unknown>", success=True
+        )
 
         # Now read albums from the extracted directory.
         self.toppath = archive_task.toppath
@@ -1154,11 +1199,40 @@ class ImportTaskFactory:
                 path = mp3_path
 
         try:
-            return library.Item.from_path(path)
+            item = library.Item.from_path(path)
+            self.session.diagnostics.record_item_read(path, success=True)
+            return item
         except library.ReadError as exc:
             if isinstance(exc.reason, mediafile.FileTypeError):
                 # Silently ignore other non-music files.
+                self.session.diagnostics.record_item_read(
+                    path,
+                    success=False,
+                    reason="non-music file type",
+                    exc_info=exc,
+                )
                 pass
+            else:
+                self.session.diagnostics.record_item_read(
+                    path,
+                    success=False,
+                    reason=str(exc.reason) if exc.reason else str(exc),
+                    exc_info=exc,
+                )
+                log.error("error reading {}: {}", util.displayable_path(path), exc)
+        except Exception as exc:  # noqa: BLE001
+            self.session.diagnostics.record_item_read(
+                path,
+                success=False,
+                reason=f"{type(exc).__name__}: {exc}",
+                exc_info=exc,
+            )
+            log.error(
+                "unexpected error reading {}: {}",
+                util.displayable_path(path),
+                exc,
+            )
+        return None
 
 
 _MULTIDISC_MARKERS = (
@@ -1183,7 +1257,7 @@ def is_subdir_of_any_in_list(path, dirs):
     return any(d in ancestors for d in dirs)
 
 
-def albums_in_dir(path: util.PathBytes):
+def albums_in_dir(path: util.PathBytes, session: ImportSession | None = None):
     """Recursively searches the given directory and returns an iterable
     of (paths, items) where paths is a list of directories and items is
     a list of Items that is probably an album. Specifically, any folder
@@ -1200,6 +1274,15 @@ def albums_in_dir(path: util.PathBytes):
         path, ignore=ignore, ignore_hidden=ignore_hidden, logger=log
     ):
         items = [os.path.join(root, f) for f in files]
+        # Record a path-walk diagnostic at debug level.
+        if session is not None:
+            try:
+                session.diagnostics.record_path_walk(
+                    path, root, len(items), ignored_files=[]
+                )
+            except Exception:  # noqa: BLE001
+                # Never let diagnostics interfere with the walk.
+                pass
         # If we're currently collapsing the constituent directories in a
         # multi-disc album, check whether we should continue collapsing
         # and add the current directory. If so, just add the directory

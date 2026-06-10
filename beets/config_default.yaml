@@ -58,6 +58,15 @@ import:
     singleton_album_disambig: yes
     fix_ext_inplace: no
     remux_mp3_in_wav: yes
+    # Diagnostics / failure debugging.
+    # enable collection (also on with --diagnose or -vvv):
+    diagnose: no
+    # structured trace output path (stdout if unset and not quiet):
+    diagnose_trace:
+    # per-session event count cap in the in-memory collector:
+    diagnose_max_events: 50000
+    # per-file byte limit for the written trace (oldest events dropped):
+    diagnose_max_bytes: 10485760
 
 # --------------- Paths ---------------
 

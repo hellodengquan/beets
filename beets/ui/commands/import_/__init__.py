@@ -55,6 +55,30 @@ def import_files(lib, paths: list[bytes], query):
     if config["import"]["quiet"] and config["import"]["timid"]:
         raise UserError("can't be both quiet and timid")
 
+    # Pull diagnostic overrides out of the parsed config (set_args already
+    # applied them to the config view) so we can pass them explicitly to
+    # the session constructor. The triple-value (True/False/None) is
+    # significant: None means "derive from verbosity/config".
+    diagnose_flag: bool | None
+    if hasattr(config["import"], "diagnose"):
+        try:
+            diagnose_flag = config["import"]["diagnose"].get()
+            if not isinstance(diagnose_flag, bool):
+                diagnose_flag = None
+        except Exception:
+            diagnose_flag = None
+    else:
+        diagnose_flag = None
+
+    # Explicit trace path overrides, if any.
+    if (
+        config["import"]["diagnose_trace"].exists()
+        and config["import"]["diagnose_trace"].get() is not None
+    ):
+        # A value is already set either via CLI --diagnose-trace or via
+        # configuration file; no further action here.
+        pass
+
     # Open the log.
     if config["import"]["log"].get() is not None:
         logpath = syspath(config["import"]["log"].as_filename())
@@ -72,7 +96,9 @@ def import_files(lib, paths: list[bytes], query):
     if config["import"]["resume"].get() == "ask" and config["import"]["quiet"]:
         config["import"]["resume"] = False
 
-    session = TerminalImportSession(lib, loghandler, paths, query)
+    session = TerminalImportSession(
+        lib, loghandler, paths, query, diagnose=diagnose_flag
+    )
     session.run()
 
     # Emit event.
@@ -345,5 +371,33 @@ import_cmd.parser.add_option(
     callback=_store_dict,
     metavar="FIELD=VALUE",
     help="set the given fields to the supplied values",
+)
+import_cmd.parser.add_option(
+    "-D",
+    "--diagnose",
+    action="store_true",
+    default=None,
+    dest="diagnose",
+    help=(
+        "enable verbose failure diagnostics (metadata match details, "
+        "path parse info, structured trace) for import troubleshooting"
+    ),
+)
+import_cmd.parser.add_option(
+    "--no-diagnose",
+    action="store_false",
+    dest="diagnose",
+    help="explicitly disable import failure diagnostics",
+)
+import_cmd.parser.add_option(
+    "--diagnose-trace",
+    type="string",
+    dest="diagnose_trace",
+    metavar="PATH",
+    help=(
+        "write a structured JSON diagnostic trace to the given file "
+        "(requires --diagnose or -vvv). Output to stdout if PATH is "
+        "omitted and --quiet is not set."
+    ),
 )
 import_cmd.func = import_func

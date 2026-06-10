@@ -144,7 +144,58 @@ def lookup_candidates(session: ImportSession, task: ImportTask):
 
     # Restrict the initial lookup to IDs specified by the user via the -m
     # option. Currently all the IDs are passed onto the tasks directly.
-    task.lookup_candidates(session.config["search_ids"].as_str_seq())
+    search_ids = session.config["search_ids"].as_str_seq()
+    try:
+        task.lookup_candidates(search_ids)
+    except Exception as exc:  # noqa: BLE001
+        session.diagnostics.record(
+            "metadata_match",
+            "error",
+            f"metadata lookup failed: {exc}",
+            task=task,
+            context={"search_ids": search_ids},
+            exc_info=exc,
+        )
+        raise
+
+    rec_name = task.rec.name if task.rec is not None else "NONE"
+    num_candidates = len(task.candidates) if task.candidates else 0
+
+    session.diagnostics.record_metadata_lookup(
+        task,
+        task.cur_artist,
+        task.cur_album,
+        num_candidates,
+        rec_name,
+        search_ids=search_ids,
+    )
+
+    # Record per-candidate detail at high verbosity.
+    if task.candidates:
+        for idx, cand in enumerate(task.candidates):
+            try:
+                dist = cand.distance
+                penalty_keys = list(dist.generic_penalty_keys or [])
+                disambig = getattr(cand, "disambig_string", "") or ""
+                session.diagnostics.record_metadata_candidate(
+                    task,
+                    idx,
+                    getattr(cand.info, "artist", None),
+                    getattr(cand.info, "name", None),
+                    float(dist.distance) if dist is not None else 0.0,
+                    getattr(dist, "string", "") or "",
+                    penalty_keys,
+                    disambig,
+                )
+            except Exception as inner:  # noqa: BLE001
+                # One bad candidate must not poison the whole trace.
+                session.diagnostics.record(
+                    "metadata_match",
+                    "debug",
+                    f"failed to serialise candidate #{idx}: {inner}",
+                    task=task,
+                    exc_info=inner,
+                )
 
 
 @pipeline.stage
@@ -170,6 +221,33 @@ def user_query(session: ImportSession, task: ImportTask):
     # Ask the user for a choice.
     task.choose_match(session)
     plugins.send("import_task_choice", session=session, task=task)
+
+    # Record the chosen match/action in diagnostics.
+    try:
+        if task.choice_flag is not None:
+            match_artist = None
+            match_album = None
+            if task.choice_flag == Action.APPLY and task.match:
+                minfo = getattr(task.match, "info", None)
+                if minfo is not None:
+                    match_artist = getattr(minfo, "artist", None)
+                    match_album = getattr(minfo, "name", None)
+            session.diagnostics.record_metadata_choice(
+                task,
+                str(task.choice_flag.value)
+                if hasattr(task.choice_flag, "value")
+                else str(task.choice_flag),
+                match_artist=match_artist,
+                match_album=match_album,
+            )
+    except Exception as exc:  # noqa: BLE001
+        session.diagnostics.record(
+            "user_choice",
+            "debug",
+            f"failed to record choice: {exc}",
+            task=task,
+            exc_info=exc,
+        )
 
     # As-tracks: transition to singleton workflow.
     if task.choice_flag is Action.TRACKS:
@@ -319,10 +397,28 @@ def _apply_choice(session: ImportSession, task: ImportTask):
 
     # Change metadata.
     if task.apply:
-        task.apply_metadata()
+        try:
+            task.apply_metadata()
+        except Exception as exc:  # noqa: BLE001
+            session.diagnostics.record(
+                "file_import",
+                "error",
+                f"metadata apply failed: {exc}",
+                task=task,
+                exc_info=exc,
+            )
+            raise
         plugins.send("import_task_apply", session=session, task=task)
 
-    task.add(session.lib)
+    num_items = len(task.imported_items())
+    try:
+        task.add(session.lib)
+    except Exception as exc:  # noqa: BLE001
+        session.diagnostics.record_library_add(
+            task, num_items, success=False, exc_info=exc
+        )
+        raise
+    session.diagnostics.record_library_add(task, num_items, success=True)
 
     # If ``set_fields`` is set, set those fields to the
     # configured values.
@@ -340,6 +436,7 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
     if task.choice_flag in (Action.ASIS, Action.APPLY, Action.RETAG):
         found_duplicates = task.find_duplicates(session.lib)
         if found_duplicates:
+            dup_ids = [o.id for o in found_duplicates if hasattr(o, "id")]
             log.debug("found duplicates: {}", [o.id for o in found_duplicates])
 
             # Get the default action to follow from config.
@@ -353,6 +450,14 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
                 }
             )
             log.debug("default action for duplicates: {}", duplicate_action)
+
+            action_label = {
+                "s": "skip",
+                "k": "keep",
+                "r": "remove",
+                "m": "merge",
+                "a": "ask",
+            }.get(duplicate_action, duplicate_action)
 
             if duplicate_action == "s":
                 # Skip new.
@@ -368,7 +473,25 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
                 task.should_merge_duplicates = True
             else:
                 # No default action set; ask the session.
-                session.resolve_duplicate(task, found_duplicates)
+                try:
+                    session.resolve_duplicate(task, found_duplicates)
+                except Exception as exc:  # noqa: BLE001
+                    session.diagnostics.record(
+                        "duplicate_resolve",
+                        "error",
+                        f"duplicate resolution failed: {exc}",
+                        task=task,
+                        context={
+                            "num_duplicates": len(found_duplicates),
+                            "action": action_label,
+                        },
+                        exc_info=exc,
+                    )
+                    raise
+
+            session.diagnostics.record_duplicate_found(
+                task, len(found_duplicates), dup_ids, action_label
+            )
 
             session.log_choice(task, True)
 

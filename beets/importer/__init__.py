@@ -36,3 +36,47 @@ __all__ = [
     "SentinelImportTask",
     "SingletonImportTask",
 ]
+
+# Re-export diagnostics helpers so importer API users can access them
+# without importing the submodule explicitly.
+from .diagnostics import (  # noqa: E402
+    DIAG_LEVEL_DEBUG,
+    DIAG_LEVEL_ERROR,
+    DIAG_LEVEL_INFO,
+    DIAG_LEVEL_WARNING,
+    DIAG_STAGE_DUPLICATE,
+    DIAG_STAGE_FILE_IMPORT,
+    DIAG_STAGE_GENERAL,
+    DIAG_STAGE_METADATA_MATCH,
+    DIAG_STAGE_PATH_PARSE,
+    DIAG_STAGE_USER_CHOICE,
+    DiagnosticEvent,
+    DiagnosticTraceWriter,
+    ImportDiagnosticCollector,
+    create_collector_for_session,
+    create_writer_for_session,
+    diagnostics_config,
+    should_enable_diagnostics,
+)
+
+__all__.extend(
+    [
+        "DIAG_LEVEL_DEBUG",
+        "DIAG_LEVEL_ERROR",
+        "DIAG_LEVEL_INFO",
+        "DIAG_LEVEL_WARNING",
+        "DIAG_STAGE_DUPLICATE",
+        "DIAG_STAGE_FILE_IMPORT",
+        "DIAG_STAGE_GENERAL",
+        "DIAG_STAGE_METADATA_MATCH",
+        "DIAG_STAGE_PATH_PARSE",
+        "DIAG_STAGE_USER_CHOICE",
+        "DiagnosticEvent",
+        "DiagnosticTraceWriter",
+        "ImportDiagnosticCollector",
+        "create_collector_for_session",
+        "create_writer_for_session",
+        "diagnostics_config",
+        "should_enable_diagnostics",
+    ]
+)
