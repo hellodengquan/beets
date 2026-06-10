@@ -464,8 +464,11 @@ class DiagnosticTraceWriter:
     - event count limit
     - graceful fallback on write errors (stdout summary + warning log)
     - ``dry_run`` mode that serialises but never touches the filesystem
-    - history retention: timestamps each trace file and prunes old ones
-      beyond ``keep`` count
+    - history retention: the latest trace is always written to the
+      configured fixed path; when ``keep > 0``, a timestamped copy is
+      also saved alongside and old copies beyond ``keep`` are pruned.
+      This means downstream scripts can always read the latest data
+      from the same path, while history is available for comparison.
     """
 
     DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
@@ -507,10 +510,12 @@ class DiagnosticTraceWriter:
 
     @property
     def last_written_path(self) -> str | None:
-        """The actual path the trace was most recently written to.
+        """The path the trace was most recently written to.
 
-        This may differ from ``output_path`` when history retention is
-        enabled, since a timestamp is appended to each filename.
+        This is always ``output_path`` — the latest trace is always
+        written to the configured fixed path so that downstream scripts
+        can rely on it.  Timestamped history copies are stored alongside
+        but are not reflected here.
         """
         return self._last_written_path
 
@@ -664,26 +669,30 @@ class DiagnosticTraceWriter:
             if output_dir and not os.path.isdir(syspath(output_dir)):
                 os.makedirs(syspath(output_dir), exist_ok=True)
 
-            target_path: str
-            if self._keep <= 0:
-                # History disabled: overwrite the configured path directly.
-                target_path = self._output_path
-            else:
-                target_path = self._generate_timestamped_path()
-
-            with open(syspath(target_path), "w", encoding="utf-8") as fp:
+            with open(syspath(self._output_path), "w", encoding="utf-8") as fp:
                 fp.write(content)
 
-            self._last_written_path = target_path
+            self._last_written_path = self._output_path
             log.info(
                 "Diagnostic trace written to {} ({} bytes, {} events)",
-                target_path,
+                self._output_path,
                 len(content.encode("utf-8")),
-                content.count('"stage":'),  # approximate count
+                content.count('"stage":'),
             )
 
             if self._keep > 0:
-                self._prune_old_traces(target_path)
+                hist_path = self._generate_timestamped_path()
+                try:
+                    with open(syspath(hist_path), "w", encoding="utf-8") as fp:
+                        fp.write(content)
+                    log.debug(
+                        "Diagnostic trace history copy: {}", hist_path
+                    )
+                except OSError as exc:
+                    log.debug(
+                        "Could not write history copy {}: {}", hist_path, exc
+                    )
+                self._prune_old_traces()
 
             return True
         except OSError as exc:
@@ -723,14 +732,13 @@ class DiagnosticTraceWriter:
             counter += 1
         return candidate
 
-    def _prune_old_traces(self, current_path: str) -> None:
-        """Remove trace files older than the keep limit.
+    def _prune_old_traces(self) -> None:
+        """Remove timestamped history files beyond the keep limit.
 
-        Scans the directory of ``current_path`` for files matching the
-        base name pattern of the configured output path, sorts them by
-        modification time (newest first), and deletes those beyond the
-        ``keep`` threshold. The most recent file (``current_path``) is
-        always kept.
+        Only files matching ``<stem>_*<ext>`` (the timestamped copies)
+        are considered for pruning.  The primary output file
+        (``self._output_path``) is never pruned — it always holds the
+        latest trace so that downstream scripts can rely on a fixed path.
         """
         if self._keep <= 0 or self._output_path is None:
             return
@@ -740,10 +748,6 @@ class DiagnosticTraceWriter:
             base_name = os.path.basename(self._output_path)
             stem, ext = os.path.splitext(base_name)
 
-            # Pattern: files starting with the stem and ending with the
-            # extension (e.g. trace_*.json for trace.json).  The
-            # original base name itself (trace.json) is also matched so
-            # that existing non-timestamped files get cleaned up too.
             pattern_prefix = stem + "_"
 
             candidates: list[tuple[float, str]] = []
@@ -751,32 +755,21 @@ class DiagnosticTraceWriter:
                 entry_path = os.path.join(base_dir, entry)
                 if not os.path.isfile(syspath(entry_path)):
                     continue
-                # Match files named either exactly <stem><ext> or
-                # <stem>_*<ext>.
                 if entry == base_name:
-                    pass  # match
-                elif entry.startswith(pattern_prefix) and entry.endswith(ext):
-                    pass  # match
-                else:
                     continue
-                try:
-                    mtime = os.path.getmtime(syspath(entry_path))
-                    candidates.append((mtime, entry_path))
-                except OSError:
-                    continue
+                if entry.startswith(pattern_prefix) and entry.endswith(ext):
+                    try:
+                        mtime = os.path.getmtime(syspath(entry_path))
+                        candidates.append((mtime, entry_path))
+                    except OSError:
+                        continue
 
-            # Sort newest first.
             candidates.sort(key=lambda x: x[0], reverse=True)
 
-            # The current path might not be in the candidates (e.g.
-            # symlink race) but we know it exists and should be kept.
-            current_kept = False
             kept = 0
             for mtime, path in candidates:
                 if kept < self._keep:
                     kept += 1
-                    if path == current_path:
-                        current_kept = True
                 else:
                     try:
                         os.remove(syspath(path))
@@ -791,18 +784,6 @@ class DiagnosticTraceWriter:
                             path,
                             exc,
                         )
-
-            # If the current path wasn't in the list (unexpected),
-            # adjust the kept count and prune one fewer file.
-            if not current_kept and self._keep > 0 and len(candidates) >= self._keep:
-                # One slot is taken by current_path; remove the oldest
-                # candidate that would have been kept.
-                if candidates and len(candidates) >= self._keep:
-                    oldest_kept = candidates[self._keep - 1]
-                    try:
-                        os.remove(syspath(oldest_kept[1]))
-                    except OSError:
-                        pass
         except OSError as exc:
             log.debug(
                 "Error while pruning old diagnostic traces: {}", exc

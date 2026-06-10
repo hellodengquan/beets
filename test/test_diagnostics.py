@@ -428,18 +428,20 @@ class TestTraceWriterBasicOutput:
             path = os.path.join(td, "trace.json")
             w = DiagnosticTraceWriter(path, keep=3)
             assert w.write(c) is True
-            # With keep>0 the actual filename has a timestamp suffix.
-            assert w.last_written_path is not None
-            assert os.path.isfile(w.last_written_path)
-            assert w.last_written_path != path
-            # The original path (no timestamp) should NOT be created.
-            assert not os.path.exists(path)
-            data = json.load(open(w.last_written_path, "r", encoding="utf-8"))
+            # With keep>0 the latest trace is always written to the
+            # fixed path AND a timestamped history copy is created.
+            assert w.last_written_path == path
+            assert os.path.isfile(path)
+            data = json.load(open(path, "r", encoding="utf-8"))
             assert "metadata" in data
             assert "events" in data
             assert len(data["events"]) == 3
             assert data["metadata"]["trace_version"] == 1
             assert data["metadata"]["summary"]["event_count"] == 3
+            # A timestamped history copy should also exist.
+            all_files = os.listdir(td)
+            hist_files = [f for f in all_files if f.startswith("trace_") and f.endswith(".json")]
+            assert len(hist_files) == 1
 
     def test_keep_zero_overwrites_without_timestamp(self):
         """keep=0 restores the old behaviour: write directly to the
@@ -659,14 +661,13 @@ class TestDefaultTracePath:
 
     def test_quiet_with_library_path_actually_writes_file(self):
         """End-to-end: quiet mode + library path → trace is written to
-        the default location next to the database, with a timestamp
-        suffix when keep > 0.
+        the default location next to the database. With keep>0, a
+        timestamped history copy is also created alongside.
         """
         c = ImportDiagnosticCollector(enabled=True)
         c.record("general", "info", "batch import event")
         with tempfile.TemporaryDirectory() as td:
             lib_path = os.path.join(td, "library.db")
-            # Use keep=0 to disable timestamp for deterministic path.
             w = create_writer_for_session(
                 None, quiet=True, library_path=lib_path, keep=0
             )
@@ -679,19 +680,26 @@ class TestDefaultTracePath:
             data = json.load(open(expected_path, "r", encoding="utf-8"))
             assert data["metadata"]["summary"]["event_count"] == 1
 
-            # Now with keep>0: should get a timestamped filename.
+            # Now with keep>0: the latest trace is still at the fixed
+            # path, and a timestamped history copy is created alongside.
             c2 = ImportDiagnosticCollector(enabled=True)
             c2.record("general", "info", "event2")
             w2 = create_writer_for_session(
                 None, quiet=True, library_path=lib_path, keep=5
             )
             assert w2.write(c2) is True
-            assert w2.last_written_path is not None
-            assert w2.last_written_path != w.output_path
-            assert os.path.isfile(w2.last_written_path)
-            # base name should have _timestamp suffix
-            basename = os.path.basename(w2.last_written_path)
-            assert basename.startswith("library.diagnostics_")
+            assert w2.last_written_path == expected_path
+            assert os.path.isfile(expected_path)
+            data2 = json.load(open(expected_path, "r", encoding="utf-8"))
+            assert data2["metadata"]["summary"]["event_count"] == 1
+            # A timestamped history copy should exist.
+            all_files = os.listdir(td)
+            hist_files = [
+                f
+                for f in all_files
+                if f.startswith("library.diagnostics_") and f.endswith(".json")
+            ]
+            assert len(hist_files) == 1
 
     def test_explicit_path_overrides_default(self):
         """If the user explicitly sets --diagnose-trace, that takes
@@ -824,74 +832,80 @@ class TestTraceWriterRotation:
         return c
 
     def test_timestamped_filename_basic(self):
-        """Filenames get a timestamp suffix with keep>0."""
+        """With keep>0, the fixed path always holds the latest trace,
+        and a timestamped history copy is created alongside.
+        """
         c = self._collector(1)
         with tempfile.TemporaryDirectory() as td:
             base_path = os.path.join(td, "trace.json")
             w = DiagnosticTraceWriter(base_path, keep=5)
             assert w.write(c) is True
-            assert w.last_written_path is not None
-            assert os.path.basename(w.last_written_path).startswith("trace_")
-            assert os.path.basename(w.last_written_path).endswith(".json")
-            # The timestamp part has no underscores (only in the counter).
-            basename = os.path.basename(w.last_written_path)
-            # trace_YYYYmmddTHHMMSS.json
-            assert basename.count("_") == 1
+            assert w.last_written_path == base_path
+            assert os.path.isfile(base_path)
+            # A timestamped history copy should also exist.
+            all_files = os.listdir(td)
+            hist_files = [
+                f
+                for f in all_files
+                if f.startswith("trace_") and f.endswith(".json")
+            ]
+            assert len(hist_files) == 1
 
     def test_timestamped_filename_collision_appends_counter(self):
-        """Writing twice in the same second appends a counter suffix to
-        avoid overwriting.
+        """Writing twice with the same timestamp appends a counter suffix
+        to the history copy. The fixed path always has the latest data.
         """
-        import time as _time
-
         c = self._collector(1)
         with tempfile.TemporaryDirectory() as td:
             base_path = os.path.join(td, "trace.json")
-            # Force a fixed timestamp format for reproducibility.
             fixed_fmt = "FIXEDTS"
             w = DiagnosticTraceWriter(base_path, keep=5, timestamp_format=fixed_fmt)
             assert w.write(c) is True
-            first = w.last_written_path
-            assert os.path.basename(first) == "trace_FIXEDTS.json"
+            assert w.last_written_path == base_path
+            first_hist = os.path.join(td, "trace_FIXEDTS.json")
+            assert os.path.isfile(first_hist)
             # Write again with the same fixed timestamp: collision.
             assert w.write(c) is True
-            second = w.last_written_path
-            assert os.path.basename(second) == "trace_FIXEDTS_1.json"
+            second_hist = os.path.join(td, "trace_FIXEDTS_1.json")
+            assert os.path.isfile(second_hist)
             # And again...
             assert w.write(c) is True
-            third = w.last_written_path
-            assert os.path.basename(third) == "trace_FIXEDTS_2.json"
-            # All three files exist.
-            assert os.path.isfile(first)
-            assert os.path.isfile(second)
-            assert os.path.isfile(third)
+            third_hist = os.path.join(td, "trace_FIXEDTS_2.json")
+            assert os.path.isfile(third_hist)
+            # The fixed path always has the latest data.
+            assert os.path.isfile(base_path)
 
     def test_keep_limit_prunes_old_files(self):
-        """Writing more than `keep` files deletes the oldest."""
+        """Writing more than `keep` history copies deletes the oldest.
+        The fixed-path file always remains and is not counted.
+        """
         c = self._collector(1)
         with tempfile.TemporaryDirectory() as td:
             base_path = os.path.join(td, "trace.json")
             keep = 3
-            # Use sequential timestamps via a custom format.
             for i in range(5):
                 ts = f"TS{i:02d}"
                 w = DiagnosticTraceWriter(
                     base_path, keep=keep, timestamp_format=ts
                 )
                 assert w.write(c) is True
-            # Only the most recent `keep`=3 files (TS02, TS03, TS04)
-            # should remain.
+            # 1 fixed file + keep=3 history copies = 4 total.
             files = sorted(os.listdir(td))
-            assert len(files) == 3
-            assert f"trace_TS02.json" in files
-            assert f"trace_TS03.json" in files
-            assert f"trace_TS04.json" in files
-            # Older ones must be gone.
-            assert f"trace_TS00.json" not in files
-            assert f"trace_TS01.json" not in files
+            assert len(files) == 4
+            assert "trace.json" in files
+            # The most recent `keep`=3 history copies (TS02, TS03, TS04)
+            # should remain.
+            assert "trace_TS02.json" in files
+            assert "trace_TS03.json" in files
+            assert "trace_TS04.json" in files
+            # Older history copies must be gone.
+            assert "trace_TS00.json" not in files
+            assert "trace_TS01.json" not in files
 
     def test_keep_1_retains_only_current(self):
-        """keep=1 means only the most recent trace is kept."""
+        """keep=1 means only the most recent history copy is kept,
+        plus the fixed-path file.
+        """
         c = self._collector(1)
         with tempfile.TemporaryDirectory() as td:
             base_path = os.path.join(td, "trace.json")
@@ -900,7 +914,8 @@ class TestTraceWriterRotation:
                     base_path, keep=1, timestamp_format=f"TS{i}"
                 )
                 assert w.write(c) is True
-            assert len(os.listdir(td)) == 1
+            # 1 fixed file + 1 history copy = 2 total.
+            assert len(os.listdir(td)) == 2
 
     def test_pruning_ignores_unrelated_files(self):
         """Files not matching the trace pattern are left alone."""
@@ -925,38 +940,32 @@ class TestTraceWriterRotation:
                     base_path, keep=2, timestamp_format=f"TS{i}"
                 )
                 assert w.write(c) is True
-            # 2 kept traces + unrelated + wrong_ext + bad_ext = 5 files.
+            # 1 fixed file + 2 kept history + unrelated + wrong_ext + bad_ext = 6.
             all_files = set(os.listdir(td))
-            assert len(all_files) == 5
+            assert len(all_files) == 6
+            assert "trace.json" in all_files
             assert "other_file.json" in all_files
             assert "trace.txt" in all_files
             assert "trace_123.txt" in all_files
 
-    def test_old_non_timestamped_trace_is_pruned(self):
-        """A non-timestamped trace file matching the base name should
-        be counted and pruned along with the timestamped ones.
+    def test_fixed_path_never_pruned(self):
+        """The fixed-path file is always overwritten with the latest
+        trace and is never subject to pruning — only the timestamped
+        history copies are pruned.
         """
         c = self._collector(1)
         with tempfile.TemporaryDirectory() as td:
             base_path = os.path.join(td, "trace.json")
-            # Pre-create the base (non-timestamped) trace file.
-            with open(base_path, "w") as f:
-                json.dump({"old": True}, f)
-            # Give it an old mtime so it's considered the oldest.
-            old_time = 1000000000.0
-            os.utime(base_path, (old_time, old_time))
-
             # Write 3 new traces with keep=3.
             for i in range(3):
                 w = DiagnosticTraceWriter(
                     base_path, keep=3, timestamp_format=f"TS{i}"
                 )
                 assert w.write(c) is True
-            # The old base file should be pruned because we now have 4
-            # files total and keep=3, and it's the oldest.
-            all_files = set(os.listdir(td))
-            assert base_path not in [os.path.join(td, f) for f in all_files]
-            assert len(all_files) == 3
+            # The fixed-path file always exists and holds the latest data.
+            assert os.path.isfile(base_path)
+            data = json.load(open(base_path, "r", encoding="utf-8"))
+            assert data["metadata"]["summary"]["event_count"] == 1
 
     def test_dry_run_does_not_rotate_or_prune(self):
         """In dry-run mode, no files are written and no pruning occurs
@@ -982,7 +991,7 @@ class TestTraceWriterRotation:
             assert w.last_written_path is None
 
     def test_custom_timestamp_format(self):
-        """Users can customise the strftime format."""
+        """Users can customise the strftime format for history copies."""
         c = self._collector(1)
         with tempfile.TemporaryDirectory() as td:
             base_path = os.path.join(td, "trace.json")
@@ -991,15 +1000,60 @@ class TestTraceWriterRotation:
                 base_path, keep=5, timestamp_format=custom_fmt
             )
             assert w.write(c) is True
-            assert w.last_written_path is not None
-            basename = os.path.basename(w.last_written_path)
+            assert w.last_written_path == base_path
+            # The timestamped history copy should use the custom format.
+            all_files = os.listdir(td)
+            hist_files = [
+                f for f in all_files if f.startswith("trace_") and f.endswith(".json")
+            ]
+            assert len(hist_files) == 1
             # Should look like "trace_2026_06_11.json"
+            basename = hist_files[0]
             parts = basename.split(".")[0].split("_")
             assert len(parts) == 4  # trace + yyyy + mm + dd
             assert parts[0] == "trace"
             assert len(parts[1]) == 4  # year
             assert len(parts[2]) == 2  # month
             assert len(parts[3]) == 2  # day
+
+    def test_fixed_path_always_has_latest_data(self):
+        """Compatibility guarantee: the fixed output path always holds
+        the latest trace, so scripts reading from it always get fresh
+        data even when history retention (keep>0) is enabled.
+        """
+        c1 = self._collector(1)
+        c2 = self._collector(5)
+        c3 = self._collector(10)
+        with tempfile.TemporaryDirectory() as td:
+            base_path = os.path.join(td, "trace.json")
+            w = DiagnosticTraceWriter(base_path, keep=5, timestamp_format="A")
+            # First write: 1 event.
+            assert w.write(c1) is True
+            data = json.load(open(base_path, "r", encoding="utf-8"))
+            assert data["metadata"]["summary"]["event_count"] == 1
+            # Second write: 5 events.
+            w2 = DiagnosticTraceWriter(base_path, keep=5, timestamp_format="B")
+            assert w2.write(c2) is True
+            data = json.load(open(base_path, "r", encoding="utf-8"))
+            assert data["metadata"]["summary"]["event_count"] == 5
+            # Third write: 10 events.
+            w3 = DiagnosticTraceWriter(base_path, keep=5, timestamp_format="C")
+            assert w3.write(c3) is True
+            data = json.load(open(base_path, "r", encoding="utf-8"))
+            assert data["metadata"]["summary"]["event_count"] == 10
+            # History copies should have the respective event counts.
+            data_a = json.load(
+                open(os.path.join(td, "trace_A.json"), "r", encoding="utf-8")
+            )
+            assert data_a["metadata"]["summary"]["event_count"] == 1
+            data_b = json.load(
+                open(os.path.join(td, "trace_B.json"), "r", encoding="utf-8")
+            )
+            assert data_b["metadata"]["summary"]["event_count"] == 5
+            data_c = json.load(
+                open(os.path.join(td, "trace_C.json"), "r", encoding="utf-8")
+            )
+            assert data_c["metadata"]["summary"]["event_count"] == 10
 
 
 # ---------------------------------------------------------------------------
@@ -1116,9 +1170,9 @@ class TestDiagnosticsIntegration(AsIsImporterMixin, ImportTestCase):
             assert DIAG_STAGE_PATH_PARSE in stages
             assert DIAG_STAGE_FILE_IMPORT in stages
 
-    def test_asis_import_produces_timestamped_trace_by_default(self):
-        """With keep>0 (default) the trace file name includes a
-        timestamp suffix instead of the base name directly.
+    def test_asis_import_produces_history_copies_by_default(self):
+        """With keep>0 (default) the trace is written to the fixed path
+        and a timestamped history copy is created alongside.
         """
         self.config["verbose"] = 3
         with tempfile.TemporaryDirectory() as td:
@@ -1131,25 +1185,24 @@ class TestDiagnosticsIntegration(AsIsImporterMixin, ImportTestCase):
             importer.set_config(self.config["import"])
             importer.run()
 
-            # The base path should NOT exist, but a timestamped variant should.
-            assert not os.path.exists(trace_base), (
-                "Expected timestamped filename, not the base path directly"
+            # The base path should always exist with the latest trace.
+            assert os.path.isfile(trace_base), (
+                "Expected the fixed-path trace file to exist"
             )
+            data = json.load(open(trace_base, "r", encoding="utf-8"))
+            assert data["metadata"]["summary"]["event_count"] > 0
+            # A timestamped history copy should also exist.
             files = os.listdir(td)
             matching = [f for f in files if f.startswith("trace_") and f.endswith(".json")]
             assert len(matching) == 1, (
-                f"Expected one timestamped trace file, found: {matching}"
+                f"Expected one timestamped history copy, found: {matching}"
             )
-            data = json.load(open(os.path.join(td, matching[0]), "r", encoding="utf-8"))
-            assert data["metadata"]["summary"]["event_count"] > 0
 
     def test_quiet_import_without_trace_path_uses_default(self):
         """Quiet mode + diagnostics enabled + no explicit trace path:
         the trace should be written next to the library database file.
         This is the exact scenario described in the bug report.
-
-        With keep>0 the file gets a timestamp suffix; with keep=0 it
-        uses the base name directly.
+        With keep=0 the file is written directly to the base name.
         """
         self.config["verbose"] = 3
         self.config["import"]["quiet"] = True

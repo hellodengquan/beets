@@ -181,15 +181,17 @@ Optional command flags:
   trace can never crash the import -- permissions or disk errors
   gracefully fall back to a short summary on stderr.
 
-- **History retention**: By default, each import produces a separate
-  timestamped trace file (e.g. ``trace_20260611T223045.json``) and the
-  most recent **5** traces are retained while older ones are
-  automatically deleted. Configure the number of traces to keep with
-  ``import.diagnose_keep`` (set to ``0`` to disable history and overwrite
-  a single fixed path every time). Customise the filename timestamp with
-  ``import.diagnose_timestamp_format`` (a strftime format string; default
-  ``%Y%m%dT%H%M%S``). Retention applies to both explicit trace paths and
-  the default library-adjacent path.
+- **History retention**: The latest trace is always written to the
+  configured path (e.g. ``trace.json``), so scripts that read from a
+  fixed location always get fresh data. When ``import.diagnose_keep`` is
+  greater than zero (the default is **5**), a timestamped copy (e.g.
+  ``trace_20260611T223045.json``) is also saved alongside the primary
+  file, and older copies beyond the keep limit are automatically deleted.
+  Set ``import.diagnose_keep`` to ``0`` to disable history entirely (no
+  timestamped copies, only the fixed file). Customise the filename
+  timestamp with ``import.diagnose_timestamp_format`` (a strftime format
+  string; default ``%Y%m%dT%H%M%S``). Retention applies to both explicit
+  trace paths and the default library-adjacent path.
 
 .. _py7zr: https://pypi.org/project/py7zr/
 
