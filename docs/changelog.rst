@@ -36,10 +36,13 @@ New features
   the trace is automatically saved next to the library database file (e.g.
   ``~/beetslibrary.diagnostics.json``) so diagnostics are never silently
   discarded; if no default path can be determined (e.g. in-memory library), a
-  warning is logged instead. Volume is bounded by
-  ``import.diagnose_max_bytes`` and ``import.diagnose_max_events``; write
-  errors (permissions, disk-full, ...) degrade gracefully and never interrupt
-  the import. The new ``beets.importer.diagnostics`` module exposes the
+  warning is logged instead. **History retention**: by default, each run
+  produces a timestamped trace file and the most recent 5 are retained
+  (configure with ``import.diagnose_keep``; set to ``0`` to overwrite a
+  single fixed path). Volume is bounded by ``import.diagnose_max_bytes``
+  and ``import.diagnose_max_events``; write errors (permissions, disk-full,
+  ...) degrade gracefully and never interrupt the import. The new
+  ``beets.importer.diagnostics`` module exposes the
   ``ImportDiagnosticCollector``, ``DiagnosticTraceWriter``, and
   ``default_diagnostic_trace_path`` helpers for programmatic use.
 

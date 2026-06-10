@@ -343,11 +343,24 @@ class ImportSession:
             if config["import"]["quiet"].exists()
             else False
         )
+        # History retention configuration.
+        keep = (
+            config["import"]["diagnose_keep"].get(int)
+            if config["import"]["diagnose_keep"].exists()
+            else None
+        )
+        timestamp_format = (
+            config["import"]["diagnose_timestamp_format"].get(str)
+            if config["import"]["diagnose_timestamp_format"].exists()
+            else None
+        )
 
         writer = create_writer_for_session(
             trace_path,
             dry_run=dry_run,
             quiet=quiet,
+            keep=keep,
+            timestamp_format=timestamp_format,
             library_path=self.lib.path if hasattr(self.lib, "path") else None,
         )
         writer.write(

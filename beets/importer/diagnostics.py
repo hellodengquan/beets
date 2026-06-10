@@ -464,10 +464,14 @@ class DiagnosticTraceWriter:
     - event count limit
     - graceful fallback on write errors (stdout summary + warning log)
     - ``dry_run`` mode that serialises but never touches the filesystem
+    - history retention: timestamps each trace file and prunes old ones
+      beyond ``keep`` count
     """
 
     DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
     DEFAULT_MAX_EVENTS = 20000
+    DEFAULT_KEEP = 5
+    DEFAULT_TIMESTAMP_FMT = "%Y%m%dT%H%M%S"
     TRACE_VERSION = 1
 
     def __init__(
@@ -479,6 +483,8 @@ class DiagnosticTraceWriter:
         pretty: bool = True,
         dry_run: bool = False,
         quiet: bool = False,
+        keep: int = DEFAULT_KEEP,
+        timestamp_format: str = DEFAULT_TIMESTAMP_FMT,
     ) -> None:
         self._output_path = (
             os.fsdecode(output_path) if output_path is not None else None
@@ -488,13 +494,25 @@ class DiagnosticTraceWriter:
         self._pretty = pretty
         self._dry_run = dry_run
         self._quiet = quiet
+        self._keep = keep
+        self._timestamp_format = timestamp_format
         self._write_error: str | None = None
+        self._last_written_path: str | None = None
 
     # -- public API --------------------------------------------------------
 
     @property
     def output_path(self) -> str | None:
         return self._output_path
+
+    @property
+    def last_written_path(self) -> str | None:
+        """The actual path the trace was most recently written to.
+
+        This may differ from ``output_path`` when history retention is
+        enabled, since a timestamp is appended to each filename.
+        """
+        return self._last_written_path
 
     @property
     def write_error(self) -> str | None:
@@ -645,14 +663,28 @@ class DiagnosticTraceWriter:
             output_dir = os.path.dirname(self._output_path)
             if output_dir and not os.path.isdir(syspath(output_dir)):
                 os.makedirs(syspath(output_dir), exist_ok=True)
-            with open(syspath(self._output_path), "w", encoding="utf-8") as fp:
+
+            target_path: str
+            if self._keep <= 0:
+                # History disabled: overwrite the configured path directly.
+                target_path = self._output_path
+            else:
+                target_path = self._generate_timestamped_path()
+
+            with open(syspath(target_path), "w", encoding="utf-8") as fp:
                 fp.write(content)
+
+            self._last_written_path = target_path
             log.info(
                 "Diagnostic trace written to {} ({} bytes, {} events)",
-                self._output_path,
+                target_path,
                 len(content.encode("utf-8")),
                 content.count('"stage":'),  # approximate count
             )
+
+            if self._keep > 0:
+                self._prune_old_traces(target_path)
+
             return True
         except OSError as exc:
             self._write_error = str(exc)
@@ -671,6 +703,110 @@ class DiagnosticTraceWriter:
             )
             self._print_summary_stderr()
             return False
+
+    def _generate_timestamped_path(self) -> str:
+        """Generate a timestamped variant of ``self._output_path``.
+
+        For example, if the configured path is ``/tmp/trace.json`` and
+        the current time is 2026-06-11 22:30:45, the result is
+        ``/tmp/trace_20260611T223045.json``. In the rare case where the
+        timestamp already exists (two writes in the same second), a
+        counter suffix is appended to avoid overwriting.
+        """
+        assert self._output_path is not None
+        base, ext = os.path.splitext(self._output_path)
+        ts = time.strftime(self._timestamp_format or self.DEFAULT_TIMESTAMP_FMT)
+        candidate = f"{base}_{ts}{ext}"
+        counter = 1
+        while os.path.exists(syspath(candidate)):
+            candidate = f"{base}_{ts}_{counter}{ext}"
+            counter += 1
+        return candidate
+
+    def _prune_old_traces(self, current_path: str) -> None:
+        """Remove trace files older than the keep limit.
+
+        Scans the directory of ``current_path`` for files matching the
+        base name pattern of the configured output path, sorts them by
+        modification time (newest first), and deletes those beyond the
+        ``keep`` threshold. The most recent file (``current_path``) is
+        always kept.
+        """
+        if self._keep <= 0 or self._output_path is None:
+            return
+
+        try:
+            base_dir = os.path.dirname(self._output_path) or "."
+            base_name = os.path.basename(self._output_path)
+            stem, ext = os.path.splitext(base_name)
+
+            # Pattern: files starting with the stem and ending with the
+            # extension (e.g. trace_*.json for trace.json).  The
+            # original base name itself (trace.json) is also matched so
+            # that existing non-timestamped files get cleaned up too.
+            pattern_prefix = stem + "_"
+
+            candidates: list[tuple[float, str]] = []
+            for entry in os.listdir(syspath(base_dir)):
+                entry_path = os.path.join(base_dir, entry)
+                if not os.path.isfile(syspath(entry_path)):
+                    continue
+                # Match files named either exactly <stem><ext> or
+                # <stem>_*<ext>.
+                if entry == base_name:
+                    pass  # match
+                elif entry.startswith(pattern_prefix) and entry.endswith(ext):
+                    pass  # match
+                else:
+                    continue
+                try:
+                    mtime = os.path.getmtime(syspath(entry_path))
+                    candidates.append((mtime, entry_path))
+                except OSError:
+                    continue
+
+            # Sort newest first.
+            candidates.sort(key=lambda x: x[0], reverse=True)
+
+            # The current path might not be in the candidates (e.g.
+            # symlink race) but we know it exists and should be kept.
+            current_kept = False
+            kept = 0
+            for mtime, path in candidates:
+                if kept < self._keep:
+                    kept += 1
+                    if path == current_path:
+                        current_kept = True
+                else:
+                    try:
+                        os.remove(syspath(path))
+                        log.debug(
+                            "Pruned old diagnostic trace (keep={}): {}",
+                            self._keep,
+                            path,
+                        )
+                    except OSError as exc:
+                        log.debug(
+                            "Could not prune old trace {}: {}",
+                            path,
+                            exc,
+                        )
+
+            # If the current path wasn't in the list (unexpected),
+            # adjust the kept count and prune one fewer file.
+            if not current_kept and self._keep > 0 and len(candidates) >= self._keep:
+                # One slot is taken by current_path; remove the oldest
+                # candidate that would have been kept.
+                if candidates and len(candidates) >= self._keep:
+                    oldest_kept = candidates[self._keep - 1]
+                    try:
+                        os.remove(syspath(oldest_kept[1]))
+                    except OSError:
+                        pass
+        except OSError as exc:
+            log.debug(
+                "Error while pruning old diagnostic traces: {}", exc
+            )
 
     def _print_to_stdout(self, content: str) -> None:
         # Write via our own print_ helper when possible to respect
@@ -705,6 +841,8 @@ def diagnostics_config() -> dict[str, Any]:
         "trace_path": icfg["diagnose_trace"].get() or None,
         "max_events": icfg["diagnose_max_events"].get(int),
         "max_bytes": icfg["diagnose_max_bytes"].get(int),
+        "keep": icfg["diagnose_keep"].get(int),
+        "timestamp_format": icfg["diagnose_timestamp_format"].get(str),
     }
 
 
@@ -776,6 +914,8 @@ def create_writer_for_session(
     quiet: bool = False,
     max_bytes: int | None = None,
     max_events: int | None = None,
+    keep: int | None = None,
+    timestamp_format: str | None = None,
     library_path: str | bytes | None = None,
 ) -> DiagnosticTraceWriter:
     """Build a trace writer respecting quiet/dry-run modes.
@@ -806,6 +946,21 @@ def create_writer_for_session(
     else:
         resolved_path = None
 
+    # Resolve keep count and timestamp format, falling back to config
+    # values, then to class defaults.
+    if keep is None:
+        keep = (
+            config["import"]["diagnose_keep"].get(int)
+            if config["import"]["diagnose_keep"].exists()
+            else DiagnosticTraceWriter.DEFAULT_KEEP
+        )
+    if timestamp_format is None:
+        timestamp_format = (
+            config["import"]["diagnose_timestamp_format"].get(str)
+            if config["import"]["diagnose_timestamp_format"].exists()
+            else DiagnosticTraceWriter.DEFAULT_TIMESTAMP_FMT
+        )
+
     return DiagnosticTraceWriter(
         resolved_path,
         max_bytes=max_bytes
@@ -822,4 +977,6 @@ def create_writer_for_session(
         ),
         dry_run=dry_run,
         quiet=quiet,
+        keep=keep,
+        timestamp_format=timestamp_format,
     )
