@@ -46,7 +46,7 @@ import
 
 ::
 
-    beet import [-CMWAPRqst] [-l LOGPATH] PATH...
+    beet import [-CMWAPRqstD] [-l LOGPATH] [--diagnose-trace PATH] PATH...
     beet import [options] -L QUERY
 
 Add music to your library, attempting to get correct tags for it from
@@ -148,6 +148,28 @@ Optional command flags:
 .. code-block:: sh
 
     beet import --set genres="Alternative Rock" --set mood="emotional"
+
+- Use the ``-D`` / ``--diagnose`` flag to enable the import failure
+  diagnostics system. When enabled, beets collects detailed information
+  about every step of the import (metadata lookups, path parsing, file
+  operations, duplicate resolution) and writes a structured JSON trace
+  at the end of the run. This is useful when a batch of files fails to
+  match, import, or re-tag correctly and you need more detail than the
+  normal log output provides. Pass ``--no-diagnose`` to explicitly
+  disable diagnostics even when ``-vvv`` (or higher) is used.
+  Diagnostics are also automatically turned on when the global
+  ``verbose`` level is ``3`` or above (``beet -vvv import ...``), so
+  you don't have to remember the extra flag for ad-hoc debugging.
+- By default the diagnostics trace is written to stdout unless
+  ``--quiet`` is active. Use the ``--diagnose-trace PATH`` option to
+  have the JSON written to a specific file instead. The trace honors
+  the ``--pretend`` (``dry_run``) flag: in pretend mode the file is
+  never created but the would-be size and path are logged at info
+  level. Size and count limits (``import.diagnose_max_bytes`` and
+  ``import.diagnose_max_events``) keep the trace from growing
+  unbounded; oldest events are dropped first when the limits kick
+  in. Writing the trace can never crash the import -- permissions or
+  disk errors gracefully fall back to a short summary on stderr.
 
 .. _py7zr: https://pypi.org/project/py7zr/
 

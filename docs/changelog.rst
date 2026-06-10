@@ -26,6 +26,19 @@ New features
 - :doc:`plugins/musicbrainz`: Introduce
   :conf:`plugins.musicbrainz:aliases_as_credits` to make
   aliases-as-artist-credit optional.
+- :ref:`import-cmd`: Add an **optional failure diagnostics system** for the
+  import pipeline. Use ``-D`` / ``--diagnose`` (or ``beet -vvv import ...``) to
+  enable verbose collection of metadata-candidate details, path-parsing events,
+  file operations, duplicate-resolution decisions, and structured exception
+  tracebacks. The diagnostics are written out as a single JSON trace at the end
+  of the import session; use ``--diagnose-trace PATH`` to write to a file
+  instead of stdout, or pair with ``--quiet`` for silent, scriptable
+  operation. Volume is bounded by ``import.diagnose_max_bytes`` and
+  ``import.diagnose_max_events``; write errors (permissions, disk-full, ...)
+  degrade gracefully and never interrupt the import. The new
+  ``beets.importer.diagnostics`` module exposes the
+  ``ImportDiagnosticCollector`` and ``DiagnosticTraceWriter`` classes for
+  programmatic use.
 
 Bug fixes
 ~~~~~~~~~

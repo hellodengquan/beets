@@ -478,6 +478,7 @@ class DiagnosticTraceWriter:
         max_events: int = DEFAULT_MAX_EVENTS,
         pretty: bool = True,
         dry_run: bool = False,
+        quiet: bool = False,
     ) -> None:
         self._output_path = (
             os.fsdecode(output_path) if output_path is not None else None
@@ -486,6 +487,7 @@ class DiagnosticTraceWriter:
         self._max_events = max_events
         self._pretty = pretty
         self._dry_run = dry_run
+        self._quiet = quiet
         self._write_error: str | None = None
 
     # -- public API --------------------------------------------------------
@@ -559,6 +561,13 @@ class DiagnosticTraceWriter:
             return True
 
         if self._output_path is None:
+            if self._quiet:
+                # Quiet mode with no explicit trace path: produce no
+                # output at all, but still return True as if everything
+                # succeeded. This lets non-interactive users keep logs
+                # clean while still being able to turn diagnostics on
+                # via config.
+                return True
             self._print_to_stdout(serialised)
             return True
 
@@ -766,4 +775,5 @@ def create_writer_for_session(
             else DiagnosticTraceWriter.DEFAULT_MAX_EVENTS
         ),
         dry_run=dry_run,
+        quiet=quiet,
     )
