@@ -1938,7 +1938,7 @@ class ImportStateDirChangeTest(ImportTestCase):
 
         # --- First run: import first album, abort before the second ---
         self.importer = self.setup_importer(
-            autotag=False, resume=True, copy=True
+            autotag=False, resume=True
         )
 
         album_count = 0
@@ -1985,13 +1985,8 @@ class ImportStateDirChangeTest(ImportTestCase):
         # --- Second run: resume with the new library directory ---
         plugins_send.side_effect = None
         self.importer = self.setup_importer(
-            autotag=False, resume=True, copy=True
+            autotag=False, resume=True
         )
-        # Debug: list what's in the import directory
-        print(f"\nImport dir contents: {list(self.import_path.iterdir())}")
-        for d in self.import_path.iterdir():
-            if d.is_dir():
-                print(f"  {d}: {list(d.iterdir())}")
         self.importer.run()
 
         # Both albums should now be in the library.
