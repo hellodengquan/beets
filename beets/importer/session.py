@@ -296,7 +296,19 @@ class ImportSession:
 
         Determines the return value of `is_resuming(toppath)`.
         """
-        if self.want_resume and ImportState().progress_has(toppath):
+        # Only probe the state file if the user has actually enabled
+        # resumption. This avoids an unnecessary ImportState() instantiation
+        # (and its associated debug log output) when resume is off.
+        if not self.want_resume:
+            return
+        state = ImportState()
+        # Resume if either progress state or saved choice state exists
+        # for the toppath, since an import could have been interrupted
+        # after saving the user's choice but before recording progress.
+        has_state = state.progress_has(toppath) or any(
+            k[0] == (toppath or b"") for k in state.tagchoices
+        )
+        if has_state:
             # Either accept immediately or prompt for input to decide.
             if self.want_resume is True or self.should_resume(toppath):
                 log.warning(
@@ -306,4 +318,4 @@ class ImportSession:
                 self._is_resuming[toppath] = True
             else:
                 # Clear progress; we're starting from the top.
-                ImportState().progress_reset(toppath)
+                state.progress_reset(toppath)

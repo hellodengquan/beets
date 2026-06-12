@@ -31,7 +31,7 @@ from beets import config, library, plugins, util
 from beets.autotag.hooks import AlbumMatch
 from beets.autotag.match import tag_album, tag_item
 from beets.dbcore.query import PathQuery
-from beets.util import extension
+from beets.util import displayable_path, extension
 from beets.util.extension import remux_mpeglayer3_wav
 
 from .state import ImportState
@@ -207,6 +207,142 @@ class ImportTask(BaseImportTask):
             self.choice_flag = Action.APPLY  # Implicit choice.
             self.match = choice  # type: ignore[assignment]
 
+    def save_choice(self):
+        """Persist the current choice to the state file so that an
+        interrupted import can resume without re-asking the user.
+        """
+        if not self.toppath and not self.paths:
+            return
+        match_info = None
+        if self.choice_flag is Action.APPLY and self.match:
+            info = getattr(self.match, "info", None)
+            if info is not None:
+                match_info = {
+                    "mb_id": getattr(info, "mb_albumid", None)
+                    or getattr(info, "mb_trackid", None),
+                    "asin": getattr(info, "asin", None),
+                    "catalognum": getattr(info, "catalognum", None),
+                    "artist": getattr(info, "artist", None),
+                    "album": getattr(info, "album", None),
+                    "title": getattr(info, "title", None),
+                    "year": getattr(info, "year", None),
+                    "country": getattr(info, "country", None),
+                    "label": getattr(info, "label", None),
+                    "media": getattr(info, "media", None),
+                    "tracks": getattr(info, "tracks", None),
+                    "tracktotal": getattr(info, "tracktotal", None),
+                    "disctotal": getattr(info, "disctotal", None),
+                }
+        ImportState().choice_set(
+            self.toppath,
+            self.paths,
+            self.choice_flag.value if self.choice_flag else "",
+            match_info=match_info,
+            should_remove_duplicates=self.should_remove_duplicates,
+            should_merge_duplicates=getattr(
+                self, "should_merge_duplicates", False
+            ),
+        )
+
+    def _find_candidate_by_info(
+        self, candidates: Sequence[AlbumMatch | TrackMatch], info: dict
+    ) -> AlbumMatch | TrackMatch | None:
+        """Try to locate a specific candidate within ``candidates`` by
+        matching against the persisted ``info`` metadata.
+        """
+        def candidate_score(c) -> int:
+            c_info = getattr(c, "info", None)
+            if c_info is None:
+                return -1
+            score = 0
+            for attr in ("mb_albumid", "mb_trackid"):
+                if info.get("mb_id") and getattr(c_info, attr, None) == info[
+                    "mb_id"
+                ]:
+                    score += 1000
+            for attr in ("asin", "catalognum", "country", "label", "media"):
+                if info.get(attr) and getattr(c_info, attr, None) == info[attr]:
+                    score += 50
+            for attr in ("artist", "album", "title", "year"):
+                if info.get(attr) and getattr(c_info, attr, None) == info[attr]:
+                    score += 10
+            for attr in ("tracks", "tracktotal", "disctotal"):
+                if info.get(attr) and getattr(c_info, attr, None) == info[attr]:
+                    score += 5
+            return score
+
+        if not candidates:
+            return None
+        ranked = sorted(
+            ((c, candidate_score(c)) for c in candidates), key=lambda x: -x[1]
+        )
+        best, score = ranked[0]
+        # Need at least a few matching fields before we consider it a match.
+        if score >= 10:
+            return best
+        return None
+
+    def restore_choice(self, session: ImportSession) -> bool:
+        """Try to restore a previously-saved choice. Returns ``True`` if
+        a choice was restored. Used to avoid re-asking for confirmation
+        after an import interruption.
+        """
+        saved = ImportState().choice_get(self.toppath, self.paths)
+        if not saved:
+            return False
+        flag_value = saved.get("choice_flag", "")
+        if not flag_value:
+            return False
+        try:
+            restored_flag = Action(flag_value)
+        except ValueError:
+            return False
+
+        # If the user previously chose APPLY (a specific match), we
+        # need to re-run the lookup and locate the same candidate by
+        # its metadata identifiers.
+        if restored_flag is Action.APPLY:
+            if self.candidates is None:
+                self.lookup_candidates(
+                    session.config["search_ids"].as_str_seq()
+                )
+            match_info = saved.get("match_info") or {}
+            candidate = self._find_candidate_by_info(
+                self.candidates, match_info
+            )
+            if candidate is not None:
+                self.set_choice(candidate)
+                log.debug(
+                    "Restored saved match choice for {} ({} - {})",
+                    displayable_path(self.paths),
+                    match_info.get("artist"),
+                    match_info.get("album") or match_info.get("title"),
+                )
+            else:
+                # Could not re-identify the same candidate; fall back
+                # to asking the user again.
+                return False
+        else:
+            self.set_choice(restored_flag)
+            log.debug(
+                "Restored saved choice {} for {}",
+                restored_flag.value,
+                displayable_path(self.paths),
+            )
+
+        self.should_remove_duplicates = saved.get(
+            "should_remove_duplicates", False
+        )
+        self.should_merge_duplicates = saved.get(
+            "should_merge_duplicates", False
+        )
+        return True
+
+    def clear_saved_choice(self):
+        """Remove the persisted choice for this task after completion."""
+        if self.toppath or self.paths:
+            ImportState().choice_clear(self.toppath, self.paths)
+
     def save_progress(self):
         """Updates the progress state to indicate that this album has
         finished.
@@ -324,6 +460,8 @@ class ImportTask(BaseImportTask):
         # Update progress.
         if session.want_resume:
             self.save_progress()
+        # Clear the persisted choice now that the task is finished.
+        self.clear_saved_choice()
         if session.config["incremental"] and not (
             # Should we skip recording to incremental list?
             self.skip and session.config["incremental_skip_later"]
@@ -806,6 +944,7 @@ class SentinelImportTask(ImportTask):
         if not self.paths:
             # "Done" sentinel.
             ImportState().progress_reset(self.toppath)
+            ImportState().choices_forget_toppath(self.toppath)
         elif self.toppath:
             # "Directory progress" sentinel for singletons
             super().save_progress()

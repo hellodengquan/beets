@@ -167,9 +167,27 @@ def user_query(session: ImportSession, task: ImportTask):
     if session.already_merged(task.paths):
         return pipeline.BUBBLE
 
-    # Ask the user for a choice.
-    task.choose_match(session)
+    # Try to restore a previously-saved choice (for interrupted imports)
+    # so we don't re-ask the user for confirmation.
+    choice_restored = False
+    if session.is_resuming(task.toppath):
+        choice_restored = task.restore_choice(session)
+
+    if not choice_restored:
+        # Ask the user for a choice.
+        task.choose_match(session)
+        # Persist the choice immediately so that interruptions between
+        # here and finalize() do not require re-confirmation.
+        if session.want_resume:
+            task.save_choice()
+
     plugins.send("import_task_choice", session=session, task=task)
+
+    # If the user's choice was restored from state, we should also
+    # re-save the duplicate-related flags that may have been set in
+    # the meantime.
+    if choice_restored and session.want_resume:
+        task.save_choice()
 
     # As-tracks: transition to singleton workflow.
     if task.choice_flag is Action.TRACKS:
@@ -324,6 +342,14 @@ def _apply_choice(session: ImportSession, task: ImportTask):
 
     task.add(session.lib)
 
+    # Save progress immediately after successfully adding to the library.
+    # This prevents duplicate add/import operations when an import is
+    # interrupted between task.add() and finalize(). The later call to
+    # save_progress() in finalize() is still safe because progress_add
+    # is idempotent.
+    if session.want_resume:
+        task.save_progress()
+
     # If ``set_fields`` is set, set those fields to the
     # configured values.
     # NOTE: This cannot be done before the ``task.add()`` call above,
@@ -371,6 +397,11 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
                 session.resolve_duplicate(task, found_duplicates)
 
             session.log_choice(task, True)
+
+            # The duplicate resolution may have changed the choice or
+            # flags, so re-persist the state for resume.
+            if session.want_resume:
+                task.save_choice()
 
 
 def _freshen_items(items):

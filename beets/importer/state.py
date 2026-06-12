@@ -19,7 +19,7 @@ import os
 import pickle
 from bisect import bisect_left, insort
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from beets import config
 
@@ -41,6 +41,9 @@ class ImportState:
 
     Tagprogress allows long tagging tasks to be resumed when they pause.
 
+    Tagchoices persists the user's candidate selection for each album
+    so that interrupted imports can skip re-asking for confirmation.
+
     Taghistory is a utility for manipulating the "incremental" import log.
     This keeps track of all directories that were ever imported, which
     allows the importer to only import new stuff.
@@ -59,12 +62,14 @@ class ImportState:
 
     tagprogress: dict[PathBytes, list[PathBytes]]
     taghistory: set[tuple[PathBytes, ...]]
+    tagchoices: dict[tuple[PathBytes, tuple[PathBytes, ...]], dict]
     path: PathBytes
 
     def __init__(self, readonly=False, path: PathBytes | None = None):
         self.path = path or os.fsencode(config["statefile"].as_filename())
         self.tagprogress = {}
         self.taghistory = set()
+        self.tagchoices = {}
         self._open()
 
     def __enter__(self):
@@ -80,6 +85,7 @@ class ImportState:
                 # Read the states
                 self.tagprogress = state.get("tagprogress", {})
                 self.taghistory = state.get("taghistory", set())
+                self.tagchoices = state.get("tagchoices", {})
         except Exception as exc:
             # The `pickle` module can emit all sorts of exceptions during
             # unpickling, including ImportError. We use a catch-all
@@ -94,6 +100,7 @@ class ImportState:
                     {
                         "tagprogress": self.tagprogress,
                         "taghistory": self.taghistory,
+                        "tagchoices": self.tagchoices,
                     },
                     f,
                 )
@@ -127,10 +134,13 @@ class ImportState:
         return toppath in self.tagprogress
 
     def progress_reset(self, toppath: PathBytes | None):
-        """Reset the progress for `toppath`."""
+        """Reset the progress for `toppath` and also clear any saved
+        choices under it (they only make sense together with progress).
+        """
         with self as state:
             if toppath in state.tagprogress:
                 del state.tagprogress[toppath]
+            state.choices_forget_toppath(toppath)
 
     # -------------------------------- Taghistory -------------------------------- #
 
@@ -138,3 +148,58 @@ class ImportState:
         """Add the paths to the history."""
         with self as state:
             state.taghistory.add(tuple(paths))
+
+    # -------------------------------- Tagchoices ------------------------------- #
+
+    def choice_key(
+        self, toppath: PathBytes | None, paths: Sequence[PathBytes]
+    ) -> tuple[PathBytes, tuple[PathBytes, ...]]:
+        """Build the key used to index ``tagchoices``."""
+        return (toppath or b"", tuple(paths))
+
+    def choice_set(
+        self,
+        toppath: PathBytes | None,
+        paths: Sequence[PathBytes],
+        choice_flag: str,
+        match_info: dict | None = None,
+        should_remove_duplicates: bool = False,
+        should_merge_duplicates: bool = False,
+    ):
+        """Persist the user's choice for a task so that it can be
+        restored after an import interruption without re-asking.
+        """
+        key = self.choice_key(toppath, paths)
+        with self as state:
+            state.tagchoices[key] = {
+                "choice_flag": choice_flag,
+                "match_info": match_info or {},
+                "should_remove_duplicates": should_remove_duplicates,
+                "should_merge_duplicates": should_merge_duplicates,
+            }
+
+    def choice_get(
+        self, toppath: PathBytes | None, paths: Sequence[PathBytes]
+    ) -> dict | None:
+        """Return the previously-saved choice for a task or ``None``."""
+        key = self.choice_key(toppath, paths)
+        return self.tagchoices.get(key)
+
+    def choice_clear(self, toppath: PathBytes | None, paths: Sequence[PathBytes]):
+        """Remove a persisted choice once the task has finished."""
+        key = self.choice_key(toppath, paths)
+        with self as state:
+            state.tagchoices.pop(key, None)
+
+    def choices_forget_toppath(self, toppath: PathBytes | None):
+        """Remove all persisted choices under the given ``toppath``.
+
+        Used when the user declines to resume or when a toppath is
+        fully processed.
+        """
+        with self as state:
+            keys = [
+                k for k in state.tagchoices if k[0] == (toppath or b"")
+            ]
+            for k in keys:
+                del state.tagchoices[k]
