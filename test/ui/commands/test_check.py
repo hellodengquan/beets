@@ -498,3 +498,125 @@ class TestCheckCommandCLI(IOMixin, PytestTestHelper):
         for cat_items in data["checks"].values():
             for item in cat_items:
                 assert "suggestion" in item
+
+
+def _repo_root() -> str:
+    import pathlib
+
+    return str(pathlib.Path(__file__).parents[3])
+
+
+def _doc_path() -> str:
+    import os
+
+    return os.path.join(_repo_root(), "docs", "plugin-doctor.md")
+
+
+def _read_doc() -> str:
+    with open(_doc_path()) as f:
+        return f.read()
+
+
+def _extract_latest_version(doc_text: str) -> str:
+    for line in doc_text.splitlines():
+        line = line.strip()
+        match = re.match(r"^##\s+(\d+\.\d+\.\d+)\s*$", line)
+        if match:
+            return match.group(1)
+    raise AssertionError("No version heading (## x.y.z) found in doc")
+
+
+def _extract_table_first_column(doc_text: str, heading: str) -> set[str]:
+    lines = doc_text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == heading:
+            start = i
+            break
+    if start is None:
+        raise AssertionError(f"Heading '{heading}' not found in doc")
+
+    table_start = None
+    for i in range(start + 1, len(lines)):
+        line = lines[i].strip()
+        if line.startswith("|"):
+            table_start = i
+            break
+        if line.startswith("### ") or line.startswith("## "):
+            break
+    if table_start is None:
+        raise AssertionError(f"No table found under heading '{heading}'")
+
+    values: set[str] = set()
+    header_skipped = False
+    for i in range(table_start, len(lines)):
+        line = lines[i].strip()
+        if not line.startswith("|"):
+            break
+        if re.match(r"^\|[\s\-:]+\|", line):
+            header_skipped = True
+            continue
+        if not header_skipped:
+            header_skipped = True
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if cells:
+            raw_value = cells[0]
+            clean_value = raw_value.strip().strip("`")
+            if clean_value:
+                values.add(clean_value)
+    return values
+
+
+class TestDocSchemaConsistency:
+    def test_doc_file_exists(self):
+        import os
+
+        assert os.path.isfile(_doc_path()), (
+            f"Doc file not found at {_doc_path()}"
+        )
+
+    def test_doc_latest_version_matches_schema_version(self):
+        doc = _read_doc()
+        latest = _extract_latest_version(doc)
+        assert latest == SCHEMA_VERSION, (
+            f"Doc latest version '{latest}' does not match "
+            f"SCHEMA_VERSION '{SCHEMA_VERSION}'. "
+            f"Update the doc changelog or the SCHEMA_VERSION constant."
+        )
+
+    def test_doc_top_level_fields_match_fixture(self):
+        doc = _read_doc()
+        doc_fields = _extract_table_first_column(doc, "### Top-Level Object")
+        assert doc_fields == TOP_LEVEL_FIELDS, (
+            f"Top-level fields in doc ({sorted(doc_fields)}) "
+            f"do not match fixture ({sorted(TOP_LEVEL_FIELDS)}). "
+            f"Update the doc or TOP_LEVEL_FIELDS."
+        )
+
+    def test_doc_check_item_fields_match_fixture(self):
+        doc = _read_doc()
+        doc_fields = _extract_table_first_column(doc, "### Check Item Object")
+        assert doc_fields == CHECK_ITEM_FIELDS, (
+            f"Check item fields in doc ({sorted(doc_fields)}) "
+            f"do not match fixture ({sorted(CHECK_ITEM_FIELDS)}). "
+            f"Update the doc or CHECK_ITEM_FIELDS."
+        )
+
+    def test_doc_categories_match_fixture(self):
+        doc = _read_doc()
+        doc_cats = _extract_table_first_column(doc, "### Categories")
+        assert doc_cats == VALID_CATEGORIES, (
+            f"Categories in doc ({sorted(doc_cats)}) "
+            f"do not match fixture ({sorted(VALID_CATEGORIES)}). "
+            f"Update the doc or VALID_CATEGORIES."
+        )
+
+    def test_doc_statuses_match_fixture(self):
+        doc = _read_doc()
+        doc_statuses = _extract_table_first_column(doc, "### Statuses")
+        assert doc_statuses == VALID_STATUSES, (
+            f"Statuses in doc ({sorted(doc_statuses)}) "
+            f"do not match fixture ({sorted(VALID_STATUSES)}). "
+            f"Update the doc or VALID_STATUSES."
+        )
