@@ -18,6 +18,7 @@ interface.
 
 from beets.util.deprecation import deprecate_imports
 
+from .check import check_cmd
 from .completion import completion_cmd
 from .config import config_cmd
 from .fields import fields_cmd
@@ -48,6 +49,7 @@ def __getattr__(name: str):
 # The list of default subcommands. This is populated with Subcommand
 # objects that can be fed to a SubcommandsOptionParser.
 default_commands = [
+    check_cmd,
     fields_cmd,
     HelpCommand(),
     import_cmd,
