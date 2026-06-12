@@ -75,6 +75,27 @@ STATUS_STYLE: dict[CheckStatus, str] = {
     CheckStatus.ERROR: "text_error",
 }
 
+SCHEMA_VERSION: str = "1.0.0"
+
+TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "ok_count",
+        "warning_count",
+        "error_count",
+        "has_errors",
+        "checks",
+    }
+)
+
+CHECK_ITEM_FIELDS: frozenset[str] = frozenset(
+    {"plugin", "category", "status", "message", "suggestion"}
+)
+
+VALID_CATEGORIES: frozenset[str] = frozenset(c.value for c in CheckCategory)
+
+VALID_STATUSES: frozenset[str] = frozenset(s.value for s in CheckStatus)
+
 
 @dataclass
 class CheckResult:
@@ -126,7 +147,7 @@ class HealthReport:
                 by_category[cat.value] = items
 
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "ok_count": self.ok_count,
             "warning_count": self.warning_count,
             "error_count": self.error_count,
@@ -527,4 +548,15 @@ check_cmd.parser.add_option(
 )
 check_cmd.func = run_health_check
 
-__all__ = ["CheckCategory", "CheckResult", "CheckStatus", "HealthReport", "check_cmd"]
+__all__ = [
+    "CHECK_ITEM_FIELDS",
+    "SCHEMA_VERSION",
+    "TOP_LEVEL_FIELDS",
+    "VALID_CATEGORIES",
+    "VALID_STATUSES",
+    "CheckCategory",
+    "CheckResult",
+    "CheckStatus",
+    "HealthReport",
+    "check_cmd",
+]

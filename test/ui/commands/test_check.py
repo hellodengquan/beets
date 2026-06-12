@@ -1,8 +1,16 @@
 import json
+import re
 from unittest.mock import patch
+
+import pytest
 
 from beets.test.helper import IOMixin, PytestTestHelper
 from beets.ui.commands.check import (
+    CHECK_ITEM_FIELDS,
+    SCHEMA_VERSION,
+    TOP_LEVEL_FIELDS,
+    VALID_CATEGORIES,
+    VALID_STATUSES,
     CheckCategory,
     CheckResult,
     CheckStatus,
@@ -12,6 +20,34 @@ from beets.ui.commands.check import (
     _check_enabled,
     _collect_results,
 )
+
+SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+STABLE_SCHEMA_FIXTURE: dict[str, object] = {
+    "schema_version": "1.0.0",
+    "top_level_fields": {
+        "schema_version",
+        "ok_count",
+        "warning_count",
+        "error_count",
+        "has_errors",
+        "checks",
+    },
+    "check_item_fields": {
+        "plugin",
+        "category",
+        "status",
+        "message",
+        "suggestion",
+    },
+    "valid_categories": {"enabled", "dependency", "command", "config"},
+    "valid_statuses": {"ok", "warning", "error"},
+}
+
+
+@pytest.fixture(scope="module")
+def schema_stability_fixture():
+    return STABLE_SCHEMA_FIXTURE
 
 
 class TestCheckResultDataclass:
@@ -91,7 +127,7 @@ class TestHealthReport:
             "has_errors",
             "checks",
         }
-        assert d["schema_version"] == 1
+        assert d["schema_version"] == SCHEMA_VERSION
 
     def test_to_dict_checks_grouped_by_category(self):
         results = [
@@ -135,6 +171,105 @@ class TestHealthReport:
         for cat_items in d["checks"].values():
             for item in cat_items:
                 assert set(item.keys()) == required_keys
+
+    def test_schema_version_field_exists(self):
+        report = HealthReport()
+        d = report.to_dict()
+        assert "schema_version" in d
+
+    def test_schema_version_is_semver_string(self):
+        report = HealthReport()
+        d = report.to_dict()
+        version = d["schema_version"]
+        assert isinstance(version, str)
+        assert SEMVER_PATTERN.match(version) is not None
+
+    def test_schema_version_matches_module_constant(self):
+        report = HealthReport()
+        d = report.to_dict()
+        assert d["schema_version"] == SCHEMA_VERSION
+
+    def test_schema_version_module_constant_is_semver(self):
+        assert isinstance(SCHEMA_VERSION, str)
+        assert SEMVER_PATTERN.match(SCHEMA_VERSION) is not None
+
+
+class TestSchemaStability:
+    def test_top_level_fields_unchanged(self, schema_stability_fixture):
+        expected = schema_stability_fixture["top_level_fields"]
+        assert TOP_LEVEL_FIELDS == frozenset(expected)
+
+    def test_check_item_fields_unchanged(self, schema_stability_fixture):
+        expected = schema_stability_fixture["check_item_fields"]
+        assert CHECK_ITEM_FIELDS == frozenset(expected)
+
+    def test_valid_categories_unchanged(self, schema_stability_fixture):
+        expected = schema_stability_fixture["valid_categories"]
+        assert VALID_CATEGORIES == frozenset(expected)
+
+    def test_valid_statuses_unchanged(self, schema_stability_fixture):
+        expected = schema_stability_fixture["valid_statuses"]
+        assert VALID_STATUSES == frozenset(expected)
+
+    def test_schema_version_matches_fixture(self, schema_stability_fixture):
+        assert SCHEMA_VERSION == schema_stability_fixture["schema_version"]
+
+    def test_health_report_top_level_keys_exact_match(self, schema_stability_fixture):
+        report = HealthReport(results=[
+            CheckResult("p", CheckCategory.ENABLED, CheckStatus.OK, "m"),
+        ])
+        d = report.to_dict()
+        assert set(d.keys()) == schema_stability_fixture["top_level_fields"]
+
+    def test_health_report_check_item_keys_exact_match(self, schema_stability_fixture):
+        report = HealthReport(results=[
+            CheckResult("a", CheckCategory.COMMAND, CheckStatus.OK, "m", "s"),
+        ])
+        d = report.to_dict()
+        for cat_items in d["checks"].values():
+            for item in cat_items:
+                assert set(item.keys()) == schema_stability_fixture[
+                    "check_item_fields"
+                ]
+
+
+class TestSchemaStabilityCLI(IOMixin, PytestTestHelper):
+    def test_cli_json_output_top_level_keys_exact_match(
+        self, schema_stability_fixture
+    ):
+        out = self.run_with_output("check", "--format", "json")
+        data = json.loads(out)
+        assert set(data.keys()) == schema_stability_fixture["top_level_fields"]
+
+    def test_cli_json_check_item_keys_exact_match(self, schema_stability_fixture):
+        out = self.run_with_output("check", "--format", "json")
+        data = json.loads(out)
+        for cat_items in data["checks"].values():
+            for item in cat_items:
+                assert set(item.keys()) == schema_stability_fixture[
+                    "check_item_fields"
+                ]
+
+    def test_cli_json_category_values_match_fixture(
+        self, schema_stability_fixture
+    ):
+        out = self.run_with_output("check", "--format", "json")
+        data = json.loads(out)
+        expected = schema_stability_fixture["valid_categories"]
+        for cat_name in data["checks"]:
+            assert cat_name in expected
+            for item in data["checks"][cat_name]:
+                assert item["category"] in expected
+
+    def test_cli_json_status_values_match_fixture(
+        self, schema_stability_fixture
+    ):
+        out = self.run_with_output("check", "--format", "json")
+        data = json.loads(out)
+        expected = schema_stability_fixture["valid_statuses"]
+        for cat_items in data["checks"].values():
+            for item in cat_items:
+                assert item["status"] in expected
 
 
 class TestCheckEnabled:
@@ -251,7 +386,7 @@ class TestCollectResults:
             ["bucket"], set(), {"bucket"}
         )
         parsed = json.loads(report.to_json())
-        assert parsed["schema_version"] == 1
+        assert parsed["schema_version"] == SCHEMA_VERSION
         assert isinstance(parsed["ok_count"], int)
         assert isinstance(parsed["warning_count"], int)
         assert isinstance(parsed["error_count"], int)
@@ -267,7 +402,7 @@ class TestCheckCommandCLI(IOMixin, PytestTestHelper):
     def test_json_output_is_valid(self):
         out = self.run_with_output("check", "--format", "json")
         data = json.loads(out)
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == SCHEMA_VERSION
         assert isinstance(data["ok_count"], int)
         assert isinstance(data["warning_count"], int)
         assert isinstance(data["error_count"], int)
@@ -355,7 +490,7 @@ class TestCheckCommandCLI(IOMixin, PytestTestHelper):
     def test_json_short_flag(self):
         out = self.run_with_output("check", "-f", "json")
         data = json.loads(out)
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == SCHEMA_VERSION
 
     def test_json_suggestion_field_present(self):
         out = self.run_with_output("check", "--format", "json")
