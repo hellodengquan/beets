@@ -1552,9 +1552,19 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
             default=False,
             help="quiet mode: do not output albums that already have artwork",
         )
+        cmd.parser.add_option(
+            "-i",
+            "--interactive",
+            dest="interactive",
+            action="store_true",
+            default=False,
+            help="interactive mode: select and reorder art candidates",
+        )
 
         def func(lib: Library, opts, args) -> None:
-            self.batch_fetch_art(lib, lib.albums(args), opts.force, opts.quiet)
+            self.batch_fetch_art(
+                lib, lib.albums(args), opts.force, opts.quiet, opts.interactive
+            )
 
         cmd.func = func
         return [cmd]
@@ -1605,8 +1615,203 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
 
         return out
 
+    def get_candidates_for_album(
+        self,
+        album: Album,
+        paths: None | Sequence[bytes],
+        local_only: bool = False,
+    ) -> list[tuple[ArtSource, Candidate]]:
+        """Collect all valid candidates from all sources for an album.
+
+        Returns a list of (source, candidate) tuples in the order the
+        sources are configured. Invalid candidates are skipped.
+        """
+        candidates: list[tuple[ArtSource, Candidate]] = []
+
+        for source in self.sources:
+            if source.LOC == "local" or not local_only:
+                self._log.debug(
+                    "trying source {0.description}"
+                    " for album {1.albumartist} - {1.album}",
+                    source,
+                    album,
+                )
+                for candidate in source.get(album, self, paths):
+                    source.fetch_image(candidate, self)
+                    if candidate.validate(self) != ImageAction.BAD:
+                        assert candidate.path is not None
+                        candidates.append((source, candidate))
+                        self._log.debug(
+                            "found candidate from {0.NAME}: {1.path}",
+                            source,
+                            candidate,
+                        )
+                    else:
+                        source.cleanup(candidate)
+
+        return candidates
+
+    def _format_candidate_info(
+        self,
+        index: int,
+        source: ArtSource,
+        candidate: Candidate,
+        is_selected: bool = False,
+    ) -> str:
+        """Format a candidate's information for display.
+        """
+        match_str = (
+            colorize("text_success", "exact")
+            if candidate.match == MetadataMatch.EXACT
+            else colorize("text_highlight_minor", "fallback")
+        )
+        loc_str = colorize(
+            "action_description",
+            f"[{source.LOC}]",
+        )
+        size_str = ""
+        if candidate.size:
+            size_str = f" {candidate.size[0]}x{candidate.size[1]}"
+
+        selected_marker = (
+            colorize("text_success", "★ ") if is_selected else "  "
+        )
+
+        info = (
+            f"{selected_marker}{index + 1}. {colorize('action', source.NAME)} "
+            f"{loc_str} - match: {match_str}{size_str}"
+        )
+
+        if candidate.url:
+            info += f"\n     {candidate.url}"
+        elif candidate.path:
+            info += f"\n     {util.displayable_path(candidate.path)}"
+
+        return info
+
+    def _display_candidates(
+        self,
+        candidates: list[tuple[ArtSource, Candidate]],
+        selected_index: int = 0,
+    ) -> None:
+        """Display all candidates with their priority order.
+        """
+        ui.print_("Available album art candidates (in priority order):")
+        ui.print_()
+        for i, (source, candidate) in enumerate(candidates):
+            ui.print_(
+                self._format_candidate_info(
+                    i, source, candidate, i == selected_index
+                )
+            )
+            ui.print_()
+
+    def _interactive_select_candidate(
+        self,
+        candidates: list[tuple[ArtSource, Candidate]],
+    ) -> None | tuple[ArtSource, Candidate]:
+        """Interactively let the user select and reorder candidates.
+
+        Returns the selected (source, candidate) tuple, or None if canceled.
+        """
+        current_candidates = list(candidates)
+        selected_idx = 0
+
+        while True:
+            ui.print_()
+            self._display_candidates(current_candidates, selected_idx)
+            ui.print_(
+                colorize("action_description",
+                "Current selection: ")
+                + colorize("text_success",
+                    f"{current_candidates[selected_idx][0].NAME}"
+                )
+                if current_candidates
+                else colorize("text_error", "No candidates")
+            )
+            ui.print_()
+
+            options = ["Use", "Reorder", "Cancel"]
+            if len(current_candidates) > 1:
+                options.insert(1, "Move up")
+                options.insert(2, "Move down")
+
+            choice = ui.input_options(
+                options,
+                prompt="What would you like to do?",
+                default="u",
+            )
+
+            if choice == "u":  # Use
+                if current_candidates:
+                    source, candidate = current_candidates[selected_idx]
+                    candidate.resize(self)
+                    return source, candidate
+                return None
+
+            elif choice == "m":  # Move up
+                if selected_idx > 0:
+                    i = selected_idx
+                    current_candidates[i - 1], current_candidates[i] = (
+                        current_candidates[i],
+                        current_candidates[i - 1],
+                    )
+                    selected_idx -= 1
+
+            elif choice == "o":  # Move down
+                if selected_idx < len(current_candidates) - 1:
+                    i = selected_idx
+                    current_candidates[i], current_candidates[i + 1] = (
+                        current_candidates[i + 1],
+                        current_candidates[i],
+                    )
+                    selected_idx += 1
+
+            elif choice == "r":  # Reorder
+                ui.print_()
+                ui.print_("Enter new priority order (e.g., 2 1 3):")
+                ui.print_(
+                    colorize(
+                        "action_description",
+                        f"Enter numbers separated by spaces, "
+                        f"1-{len(current_candidates)}",
+                    )
+                )
+                try:
+                    resp = ui.input_("Order:")
+                    order = [int(x.strip()) - 1 for x in resp.split() if x.strip()]
+                    if (
+                        len(order) == len(current_candidates)
+                        and all(0 <= i < len(current_candidates) for i in order)
+                        and len(set(order)) == len(order)
+                    ):
+                        current_candidates = [current_candidates[i] for i in order]
+                        selected_idx = 0
+                    else:
+                        ui.print_(
+                            colorize(
+                                "text_error",
+                                "Invalid order. Please try again.",
+                            )
+                        )
+                except (ValueError, IndexError):
+                    ui.print_(
+                        colorize(
+                            "text_error",
+                            "Invalid input. Please enter numbers.",
+                        )
+                    )
+
+            elif choice == "c":  # Cancel
+                return None
+
     def batch_fetch_art(
-        self, lib: Library, albums: Iterable[Album], force: bool, quiet: bool
+        self,
+        lib: Library,
+        albums: Iterable[Album],
+        force: bool,
+        quiet: bool,
+        interactive: bool = False,
     ) -> None:
         """Fetch album art for each of the albums. This implements the manual
         fetchart CLI command.
@@ -1626,14 +1831,54 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
                 # sources.
                 local_paths = None if force else [album.path]
 
-                candidate = self.art_for_album(album, local_paths)
-                if candidate:
-                    if self._set_art(album, candidate):
-                        message = colorize("text_success", "found album art")
+                if interactive:
+                    candidates = self.get_candidates_for_album(
+                        album, local_paths
+                    )
+                    if not candidates:
+                        message = colorize("text_error", "no art found")
+                        ui.print_(f"{album}: {message}")
+                        continue
+
+                    ui.print_()
+                    ui.print_(
+                        colorize("action", "Album: ")
+                        + colorize("text_highlight", str(album))
+                    )
+                    result = self._interactive_select_candidate(candidates)
+                    if result:
+                        source, candidate = result
+                        if self._set_art(album, candidate):
+                            message = (
+                                colorize("text_success", "selected: ")
+                                + colorize(
+                                    "text_highlight",
+                                    f"{source.NAME}",
+                                )
+                            )
+                        else:
+                            message = colorize(
+                                "text_error", "error writing album art"
+                            )
                     else:
+                        # Clean up all temporary files
+                        for src, cand in candidates:
+                            src.cleanup(cand)
                         message = colorize(
-                            "text_error", "error writing album art"
+                            "text_highlight_minor", "cancelled by user"
                         )
+                    ui.print_(f"{album}: {message}")
                 else:
-                    message = colorize("text_error", "no art found")
-                ui.print_(f"{album}: {message}")
+                    candidate = self.art_for_album(album, local_paths)
+                    if candidate:
+                        if self._set_art(album, candidate):
+                            message = colorize(
+                                "text_success", "found album art"
+                            )
+                        else:
+                            message = colorize(
+                                "text_error", "error writing album art"
+                            )
+                    else:
+                        message = colorize("text_error", "no art found")
+                    ui.print_(f"{album}: {message}")
