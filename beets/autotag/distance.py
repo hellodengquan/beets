@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import cache, total_ordering
@@ -679,7 +680,9 @@ class TrackScoringPipeline:
 
         Each stage is wrapped in its own ``try``/``except`` so a failure in
         one stage (or its plugin hooks) is logged and skipped rather than
-        aborting the entire scoring pipeline.
+        aborting the entire scoring pipeline. Per-stage wall-clock time is
+        recorded into ``context.extra['stage_durations']`` so slow stages
+        (typically due to a slow plugin hook) can be easily diagnosed.
         """
         stage_methods = [
             (ScoringStage.INITIALIZE, self._stage_initialize),
@@ -688,8 +691,10 @@ class TrackScoringPipeline:
             (ScoringStage.PLUGIN_CUSTOM, self._stage_plugin_custom),
             (ScoringStage.FINALIZE, self._stage_finalize),
         ]
+        durations: dict[str, float] = {}
         for stage, method in stage_methods:
             self.ctx.stage = stage
+            start = time.perf_counter()
             try:
                 method()
             except Exception as exc:
@@ -704,6 +709,18 @@ class TrackScoringPipeline:
                     stage.name,
                     exc_info=True,
                 )
+            finally:
+                elapsed = time.perf_counter() - start
+                durations[stage.name] = elapsed
+                if elapsed > 0.5:  # Half a second is slow for a stage.
+                    log.debug(
+                        "Track scoring stage '%s' took %.2fs",
+                        stage.name,
+                        elapsed,
+                    )
+        self.ctx.extra.setdefault("stage_durations", {}).update(
+            {"track_" + k: v for k, v in durations.items()}
+        )
         return self.ctx.distance
 
     def _stage_initialize(self) -> None:
@@ -807,7 +824,9 @@ class AlbumScoringPipeline:
 
         Each stage is wrapped in its own ``try``/``except`` so a failure in
         one stage (or its plugin hooks) is logged and skipped rather than
-        aborting the entire scoring pipeline.
+        aborting the entire scoring pipeline. Per-stage wall-clock time is
+        recorded into ``context.extra['stage_durations']`` so slow stages
+        (typically due to a slow plugin hook) can be easily diagnosed.
         """
         stage_methods = [
             (ScoringStage.INITIALIZE, self._stage_initialize),
@@ -820,8 +839,10 @@ class AlbumScoringPipeline:
             (ScoringStage.PLUGIN_CUSTOM, self._stage_plugin_custom),
             (ScoringStage.FINALIZE, self._stage_finalize),
         ]
+        durations: dict[str, float] = {}
         for stage, method in stage_methods:
             self.ctx.stage = stage
+            start = time.perf_counter()
             try:
                 method()
             except Exception as exc:
@@ -836,6 +857,18 @@ class AlbumScoringPipeline:
                     stage.name,
                     exc_info=True,
                 )
+            finally:
+                elapsed = time.perf_counter() - start
+                durations[stage.name] = elapsed
+                if elapsed > 1.0:  # One second is slow for an album stage.
+                    log.debug(
+                        "Album scoring stage '%s' took %.2fs",
+                        stage.name,
+                        elapsed,
+                    )
+        self.ctx.extra.setdefault("stage_durations", {}).update(
+            {"album_" + k: v for k, v in durations.items()}
+        )
         return self.ctx.distance
 
     def _stage_initialize(self) -> None:

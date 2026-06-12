@@ -12,6 +12,11 @@ pluginpath: []
 
 raise_on_error: no
 
+# Plugin hook execution guardrails.
+# hook_timeout: maximum wall-clock seconds per plugin listener call.
+#   Set to 0 to disable timeout protection entirely.
+hook_timeout: 5.0
+
 # --------------- Import ---------------
 
 clutter: ["Thumbs.DB", ".DS_Store"]

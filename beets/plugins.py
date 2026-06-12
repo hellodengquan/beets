@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import abc
+import concurrent.futures
 import inspect
 import re
 import sys
+import threading
 from collections import defaultdict
 from functools import cached_property, wraps
 from importlib import import_module
@@ -644,40 +646,126 @@ def album_field_getters() -> TFuncMap[Album]:
 # Event dispatch.
 
 
+_hook_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_hook_executor_lock = threading.Lock()
+
+
+def _get_hook_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return a lazily-created, long-lived ThreadPoolExecutor for hook timeouts.
+
+    The executor is created once, on first use, and kept alive for the
+    remainder of the process. Using a single executor avoids the overhead
+    of spinning up fresh threads on every ``send()`` call.
+    """
+    global _hook_executor
+    if _hook_executor is None:
+        with _hook_executor_lock:
+            if _hook_executor is None:
+                _hook_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=8,
+                    thread_name_prefix="beets-hook",
+                )
+    return _hook_executor
+
+
+def _get_hook_timeout() -> float:
+    """Return the configured per-listener timeout in seconds.
+
+    Falls back to ``0.0`` (disabled) if the configuration is not yet
+    available, e.g. during very early plugin loading.
+    """
+    try:
+        return float(beets.config["hook_timeout"].as_number())
+    except Exception:
+        return 0.0
+
+
+def _run_handler_with_timeout(
+    handler: Callable[..., Any],
+    arguments: dict[str, Any],
+    event: str,
+    timeout: float,
+) -> tuple[bool, Any, Exception | None]:
+    """Execute a plugin listener with a wall-clock timeout.
+
+    Uses :class:`concurrent.futures.ThreadPoolExecutor` so the timeout
+    is effective even when the listener blocks on I/O. If the listener
+    does not return within ``timeout`` seconds, a sentinel failure is
+    returned and the thread is abandoned (Python cannot forcibly kill
+    threads, but the main thread is free to continue).
+
+    :returns: A 3-tuple ``(ok, return_value, exception)`` where ``ok``
+              is ``False`` for both raised exceptions and timeouts.
+    """
+    if timeout <= 0:
+        # Fast path: no timeout configured, run inline.
+        try:
+            return True, handler(**arguments), None
+        except Exception as exc:
+            return False, None, exc
+
+    executor = _get_hook_executor()
+    future = executor.submit(handler, **arguments)
+    try:
+        return True, future.result(timeout=timeout), None
+    except concurrent.futures.TimeoutError:
+        return False, None, TimeoutError(
+            f"exceeded {timeout:.1f}s timeout"
+        )
+    except Exception as exc:
+        return False, None, exc
+
+
 def send(event: EventType, **arguments: Any) -> list[Any]:
     """Send an event to all assigned event listeners.
 
     `event` is the name of  the event to send, all other named arguments
     are passed along to the handlers.
 
-    Each listener is wrapped in its own ``try``/``except`` block so a
-    failure in one plugin does not abort the event dispatch or the rest
-    of the pipeline. Exceptions are logged at the ``warning`` level (with
-    ``debug`` details) so the problem is visible to the user without
-    terminating the operation.
+    Each listener is executed with **two layers of protection**:
+
+    1. *Exception isolation*: a ``try``/``except`` around every call so
+       a failure in one plugin does not abort the dispatch.
+    2. *Timeout protection*: when ``hook_timeout`` is set (default 5s),
+       each listener runs in a worker thread. A hanging listener is
+       abandoned after the timeout so the remaining listeners and the
+       caller can make progress.
+
+    Exceptions and timeouts are logged at the ``warning`` level (with
+    ``debug``-level tracebacks).
 
     Return a list of non-None values returned from the handlers.
+    Listeners that timed out or raised are treated as if they returned
+    ``None``.
     """
     log.debug("Sending event: {}", event)
+    timeout = _get_hook_timeout()
     results: list[Any] = []
+
     for handler in BeetsPlugin.listeners[event]:
-        try:
-            r = handler(**arguments)
-        except Exception as exc:
+        ok, r, exc = _run_handler_with_timeout(
+            handler, arguments, event, timeout
+        )
+        if not ok:
+            assert exc is not None
+            is_timeout = isinstance(exc, TimeoutError)
+            level = "timed out" if is_timeout else f"raised {type(exc).__name__}"
             log.warning(
-                "Error in plugin listener for event '{}': {}: {}",
+                "Plugin listener for event '{}' {}: {}",
                 event,
-                type(exc).__name__,
+                level,
                 exc,
             )
             log.debug(
-                "Exception details during {} dispatch:",
+                "Details for {} during {} dispatch:",
+                level,
                 event,
-                exc_info=True,
+                exc_info=None if is_timeout else True,
             )
             continue
         if r is not None:
             results.append(r)
+
     return results
 
 

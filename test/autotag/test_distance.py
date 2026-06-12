@@ -1,4 +1,5 @@
 import re
+import time
 
 import pytest
 
@@ -664,3 +665,266 @@ class TestScoringPipelineExceptionSafety:
         penalties = dict(dist.items())
         assert "artist" in penalties
         assert penalties["artist"] > 0
+
+
+class TestScoringPipelineTimeoutSafety:
+    """Tests verifying that plugin-hook timeouts do not abort the pipeline.
+
+    Uses a very short ``hook_timeout`` configuration (0.1 s) together with
+    listeners that ``time.sleep(...)`` for longer than the threshold to
+    simulate a blocking / hanging external service call (e.g. a network
+    request to an unresponsive metadata source).
+    """
+
+    HOOK_TIMEOUT = 0.1
+    # A sleep strictly greater than the timeout, but still small so the
+    # test suite stays snappy even in the worst case.
+    HANGING_SLEEP = 1.5
+    # Permitted jitter above HOOK_TIMEOUT before we consider the test to
+    # have actually blocked.
+    TOLERANCE = 1.0
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, config):
+        config["hook_timeout"] = self.HOOK_TIMEOUT
+        BeetsPlugin.listeners.clear()
+
+    def _register_listener(self, event, listener):
+        BeetsPlugin.listeners[event].append(listener)
+
+    @pytest.fixture
+    def item(self):
+        return Item(
+            title="title", artist="artist", length=200, track=1, disc=1,
+        )
+
+    @pytest.fixture
+    def track_info(self):
+        return TrackInfo(
+            title="title", artist="artist", length=200, index=1, medium=1,
+        )
+
+    @pytest.fixture
+    def items(self):
+        return [
+            Item(
+                title=f"track_{i}",
+                artist="the artist",
+                album="the album",
+                length=200 + i,
+                track=i + 1,
+                disc=1,
+            )
+            for i in range(3)
+        ]
+
+    @pytest.fixture
+    def album_info(self, items):
+        return AlbumInfo(
+            artist="the artist",
+            album="the album",
+            tracks=[
+                TrackInfo(
+                    title=i.title, artist=i.artist,
+                    index=i.track, medium=i.disc, length=i.length,
+                )
+                for i in items
+            ],
+            va=False,
+        )
+
+    @pytest.fixture
+    def pairs(self, items, album_info):
+        return list(zip(items, album_info.tracks))
+
+    # ------------------------------------------------------------------ #
+    # Core send() timeout
+    # ------------------------------------------------------------------ #
+    def test_send_returns_within_tolerance_when_hook_sleeps(self):
+        """``send()`` completes in ~hook_timeout seconds despite a slow hook."""
+
+        def sleeping_listener(**_):
+            time.sleep(self.HANGING_SLEEP)
+
+        ok_listener_ran = []
+
+        def ok_listener(**_):
+            ok_listener_ran.append(True)
+            return "still-works"
+
+        self._register_listener("album_candidate_scored", sleeping_listener)
+        self._register_listener("album_candidate_scored", ok_listener)
+
+        start = time.perf_counter()
+        results = send("album_candidate_scored", context=None)
+        elapsed = time.perf_counter() - start
+
+        assert results == ["still-works"]
+        assert ok_listener_ran == [True]
+        assert elapsed < self.HOOK_TIMEOUT + self.TOLERANCE, (
+            f"send() blocked for {elapsed:.2f}s (expected < "
+            f"{self.HOOK_TIMEOUT + self.TOLERANCE:.2f}s)"
+        )
+
+    def test_send_mixes_timeout_and_exception_listeners(self):
+        """Timeouts, exceptions, and happy-path listeners all coexist."""
+
+        def sleeper(**_):
+            time.sleep(self.HANGING_SLEEP)
+
+        def raiser(**_):
+            raise ValueError("kaboom")
+
+        def good(**_):
+            return "good"
+
+        self._register_listener("track_candidate_scored", sleeper)
+        self._register_listener("track_candidate_scored", raiser)
+        self._register_listener("track_candidate_scored", good)
+
+        start = time.perf_counter()
+        results = send("track_candidate_scored", context=None)
+        elapsed = time.perf_counter() - start
+
+        assert results == ["good"]
+        assert elapsed < self.HOOK_TIMEOUT + self.TOLERANCE
+
+    def test_send_disable_timeout_with_zero(self, config):
+        """Setting ``hook_timeout=0`` disables thread-based timeout."""
+        config["hook_timeout"] = 0.0
+
+        SHORT_SLEEP = 0.02
+
+        def short_sleeper(**_):
+            time.sleep(SHORT_SLEEP)
+            return "slept"
+
+        self._register_listener("album_candidate_scored", short_sleeper)
+
+        results = send("album_candidate_scored", context=None)
+        assert results == ["slept"]
+
+    # ------------------------------------------------------------------ #
+    # TrackScoringPipeline with slow hooks
+    # ------------------------------------------------------------------ #
+    def test_track_pipeline_respects_hook_timeout(self, item, track_info):
+        """Track scoring returns quickly even when custom hook hangs."""
+
+        def slow_hook(context):
+            time.sleep(self.HANGING_SLEEP)
+
+        self._register_listener("track_candidate_scored", slow_hook)
+
+        start = time.perf_counter()
+        dist = TrackScoringPipeline(item, track_info, incl_artist=True).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        assert elapsed < self.HOOK_TIMEOUT + self.TOLERANCE, (
+            f"Track pipeline blocked for {elapsed:.2f}s"
+        )
+
+    def test_track_pipeline_slow_finalize_hook_still_returns_score(
+        self, item, track_info
+    ):
+        """FINALIZE stage slow hook does not swallow the Distance."""
+
+        def slow_finalize(context):
+            if context.stage == ScoringStage.FINALIZE:
+                time.sleep(self.HANGING_SLEEP)
+
+        self._register_listener("track_distance_calculated", slow_finalize)
+
+        start = time.perf_counter()
+        dist = TrackScoringPipeline(item, track_info, incl_artist=False).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        assert elapsed < self.HOOK_TIMEOUT + self.TOLERANCE
+
+    # ------------------------------------------------------------------ #
+    # AlbumScoringPipeline with slow hooks
+    # ------------------------------------------------------------------ #
+    def test_album_pipeline_respects_hook_timeout(
+        self, items, album_info, pairs
+    ):
+        """Album scoring returns quickly even when custom hook hangs."""
+
+        def slow_hook(context):
+            time.sleep(self.HANGING_SLEEP)
+
+        self._register_listener("album_candidate_scored", slow_hook)
+
+        start = time.perf_counter()
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        # Note: the timeout is per-listener, but the album pipeline fires
+        # per-listener timeouts more than once (INITIALIZE, FINALIZE, custom).
+        # Cap at ~3x the per-listener timeout plus tolerance.
+        assert elapsed < (3 * self.HOOK_TIMEOUT) + self.TOLERANCE, (
+            f"Album pipeline blocked for {elapsed:.2f}s"
+        )
+
+    def test_album_pipeline_mixed_slow_and_exception_hooks(
+        self, items, album_info, pairs
+    ):
+        """Slow hook + raising hook both handled; penalties still computed."""
+
+        def slow(context):
+            time.sleep(self.HANGING_SLEEP)
+
+        def boom(context):
+            raise RuntimeError("broken")
+
+        self._register_listener("album_distance_calculated", slow)
+        self._register_listener("album_candidate_scored", boom)
+
+        album_info.artist = "different artist"
+
+        start = time.perf_counter()
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        penalties = dict(dist.items())
+        assert "artist" in penalties and penalties["artist"] > 0
+        assert elapsed < (3 * self.HOOK_TIMEOUT) + self.TOLERANCE
+
+    # ------------------------------------------------------------------ #
+    # Stage-duration diagnostics recorded into context.extra
+    # ------------------------------------------------------------------ #
+    def test_album_context_records_stage_durations(
+        self, items, album_info, pairs
+    ):
+        """``ctx.extra['stage_durations']`` is populated after scoring."""
+        pipeline = AlbumScoringPipeline(items, album_info, pairs)
+        pipeline.score()
+
+        durations = pipeline.ctx.extra.get("stage_durations", {})
+        for name in (
+            "album_INITIALIZE",
+            "album_ALBUM_METADATA",
+            "album_PLUGIN_CUSTOM",
+            "album_FINALIZE",
+        ):
+            assert name in durations
+            assert isinstance(durations[name], float)
+            assert durations[name] >= 0.0
+
+    def test_track_context_records_stage_durations(self, item, track_info):
+        """``ctx.extra['stage_durations']`` exists after track scoring."""
+        pipeline = TrackScoringPipeline(item, track_info, incl_artist=False)
+        pipeline.score()
+
+        durations = pipeline.ctx.extra.get("stage_durations", {})
+        for name in (
+            "track_INITIALIZE",
+            "track_ALBUM_METADATA",
+            "track_PLUGIN_CUSTOM",
+            "track_FINALIZE",
+        ):
+            assert name in durations
+            assert isinstance(durations[name], float)
+            assert durations[name] >= 0.0
