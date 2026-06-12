@@ -193,6 +193,11 @@ class ImportSession:
         self.logger.info("import started {}", time.asctime())
         self.set_config(config["import"])
 
+        # Persist the current library directory on every run so that a
+        # future resume can detect if the directory has changed.
+        if self.want_resume:
+            ImportState().save_lib_directory(self.lib.directory)
+
         # Set up the pipeline.
         if self.query is None:
             stages = [stagefuncs.read_tasks(self)]
@@ -302,6 +307,27 @@ class ImportSession:
         if not self.want_resume:
             return
         state = ImportState()
+
+        # Detect library directory changes and rewrite stored paths.
+        current_dir = self.lib.directory
+        saved_dir = state.lib_directory
+        if saved_dir is not None and saved_dir != current_dir:
+            log.warning(
+                "Library directory has changed from {} to {}; "
+                "rewriting import state paths",
+                displayable_path(saved_dir),
+                displayable_path(current_dir),
+            )
+            # Rewrite paths in state that may reference the old lib dir
+            # (e.g. toppath during a reimport from the library itself).
+            state.rewrite_paths(saved_dir, current_dir)
+            # Rewrite paths of items/albums already in the database.
+            self._rewrite_db_paths(saved_dir, current_dir)
+
+        # Persist the current library directory so that future sessions
+        # can also detect changes.
+        state.save_lib_directory(current_dir)
+
         # Resume if either progress state or saved choice state exists
         # for the toppath, since an import could have been interrupted
         # after saving the user's choice but before recording progress.
@@ -319,3 +345,37 @@ class ImportSession:
             else:
                 # Clear progress; we're starting from the top.
                 state.progress_reset(toppath)
+
+    def _rewrite_db_paths(
+        self, old_prefix: PathBytes, new_prefix: PathBytes
+    ):
+        """Rewrite item and album paths in the library database that
+        start with ``old_prefix`` to use ``new_prefix`` instead.
+
+        This is called when the library root directory has been moved
+        between import sessions so that existing database records point
+        to valid file locations.
+        """
+        if old_prefix == new_prefix:
+            return
+
+        with self.lib.transaction():
+            for item in self.lib.items():
+                if item.path.startswith(old_prefix):
+                    item.path = new_prefix + item.path[len(old_prefix):]
+                    item.store()
+            for album in self.lib.albums():
+                if album.path.startswith(old_prefix):
+                    album.path = new_prefix + album.path[len(old_prefix):]
+                    album.store()
+                if album.artpath and album.artpath.startswith(old_prefix):
+                    album.artpath = (
+                        new_prefix + album.artpath[len(old_prefix):]
+                    )
+                    album.store()
+
+        log.debug(
+            "Rewrote database paths from {} to {}",
+            displayable_path(old_prefix),
+            displayable_path(new_prefix),
+        )

@@ -1920,3 +1920,159 @@ class MpeglayerWavImportTest(AsIsImporterMixin, ImportTestCase):
 
         self.run_asis_importer()
         assert os.path.exists(dest)
+
+
+class ImportStateDirChangeTest(ImportTestCase):
+    """Verify that when the library directory is moved between import
+    sessions (e.g. /music/old -> /music/new), the resumed import does
+    not write album files to the old path.
+    """
+
+    db_on_disk = True
+
+    @patch("beets.plugins.send")
+    def test_resume_after_libdir_change_albums_not_in_old_path(
+        self, plugins_send
+    ):
+        self.prepare_albums_for_import(2)
+
+        # --- First run: import first album, abort before the second ---
+        self.importer = self.setup_importer(
+            autotag=False, resume=True, copy=True
+        )
+
+        album_count = 0
+
+        def raise_exception(event, **kwargs):
+            nonlocal album_count
+            if event == "album_imported":
+                album_count += 1
+                if album_count >= 1:
+                    raise importer.ImportAbortError
+
+        plugins_send.side_effect = raise_exception
+        self.importer.run()
+        assert len(self.lib.albums()) == 1
+
+        # Verify the album files are under the old library path.
+        old_album = self.lib.albums("album:'Album 1'").get()
+        assert old_album is not None
+        old_lib_path = self.lib_path
+        old_album_dir = os.fsdecode(old_album.item_dir())
+        assert old_album_dir.startswith(str(old_lib_path))
+
+        # --- Simulate the admin moving the library directory ---
+        new_lib_path = self.temp_dir_path / "libdir_new"
+        new_lib_path.mkdir(exist_ok=True)
+
+        # Update the library object and global config.
+        self.lib.directory = bytestring_path(str(new_lib_path))
+        self.config["directory"] = str(new_lib_path)
+
+        # Move the already-imported album's files from old to new root
+        # so that the library is still internally consistent.
+        rel = os.path.relpath(old_album_dir, str(old_lib_path))
+        new_album_dir = new_lib_path / rel
+        new_album_dir.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.exists(old_album_dir):
+            shutil.move(old_album_dir, new_album_dir)
+        for item in old_album.items():
+            old_item_path = os.fsdecode(item.path)
+            rel_item = os.path.relpath(old_item_path, str(old_lib_path))
+            item.path = bytestring_path(str(new_lib_path / rel_item))
+            item.store()
+
+        # --- Second run: resume with the new library directory ---
+        plugins_send.side_effect = None
+        self.importer = self.setup_importer(
+            autotag=False, resume=True, copy=True
+        )
+        # Debug: list what's in the import directory
+        print(f"\nImport dir contents: {list(self.import_path.iterdir())}")
+        for d in self.import_path.iterdir():
+            if d.is_dir():
+                print(f"  {d}: {list(d.iterdir())}")
+        self.importer.run()
+
+        # Both albums should now be in the library.
+        assert len(self.lib.albums()) == 2
+
+        # Every album's files must live under the *new* library path,
+        # not the old one.
+        for album in self.lib.albums():
+            for item in album.items():
+                item_path = os.fsdecode(item.path)
+                assert not item_path.startswith(
+                    str(old_lib_path)
+                ), f"Item {item_path} still under old lib dir {old_lib_path}"
+
+
+class ImportStateRewritePathsTest(BeetsTestCase):
+    """Unit tests for ImportState.rewrite_paths()."""
+
+    db_on_disk = True
+
+    def test_rewrite_tagprogress(self):
+        from beets.importer.state import ImportState
+
+        state = ImportState()
+        old = b"/music/old"
+        new = b"/music/new"
+        toppath = b"/music/old/incoming"
+        album_path = b"/music/old/incoming/album1"
+        state.tagprogress[toppath] = [album_path]
+        state.lib_directory = old
+
+        state.rewrite_paths(old, new)
+        assert b"/music/new/incoming" in state.tagprogress
+        assert state.tagprogress[b"/music/new/incoming"] == [
+            b"/music/new/incoming/album1"
+        ]
+        assert state.lib_directory == new
+
+    def test_rewrite_tagchoices(self):
+        from beets.importer.state import ImportState
+
+        state = ImportState()
+        old = b"/music/old"
+        new = b"/music/new"
+        toppath = b"/music/old/incoming"
+        paths = (b"/music/old/incoming/album1",)
+        key = (toppath, paths)
+        state.tagchoices[key] = {"choice_flag": "ASIS"}
+
+        state.rewrite_paths(old, new)
+        new_key = (b"/music/new/incoming", (b"/music/new/incoming/album1",))
+        assert new_key in state.tagchoices
+        assert state.tagchoices[new_key]["choice_flag"] == "ASIS"
+
+    def test_no_rewrite_when_same_prefix(self):
+        from beets.importer.state import ImportState
+
+        state = ImportState()
+        same = b"/music/stable"
+        toppath = b"/music/stable/incoming"
+        state.tagprogress[toppath] = [b"/music/stable/incoming/album1"]
+        state.lib_directory = same
+
+        state.rewrite_paths(same, same)
+        assert toppath in state.tagprogress
+
+    def test_unaffected_paths_preserved(self):
+        from beets.importer.state import ImportState
+
+        state = ImportState()
+        old = b"/music/old"
+        new = b"/music/new"
+        other_top = b"/other/location/incoming"
+        state.tagprogress[other_top] = [b"/other/location/incoming/album"]
+        state.tagprogress[b"/music/old/incoming"] = [
+            b"/music/old/incoming/album1"
+        ]
+        state.lib_directory = old
+
+        state.rewrite_paths(old, new)
+        assert other_top in state.tagprogress
+        assert state.tagprogress[other_top] == [
+            b"/other/location/incoming/album"
+        ]

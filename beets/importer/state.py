@@ -48,6 +48,11 @@ class ImportState:
     This keeps track of all directories that were ever imported, which
     allows the importer to only import new stuff.
 
+    Lib_directory stores the library directory at the time the state was
+    last written.  When the library directory has changed between
+    sessions (e.g. the admin moved the root from ``/music/old`` to
+    ``/music/new``), :meth:`rewrite_paths` can remap all stored paths.
+
     Usage
     -----
     ```
@@ -63,6 +68,7 @@ class ImportState:
     tagprogress: dict[PathBytes, list[PathBytes]]
     taghistory: set[tuple[PathBytes, ...]]
     tagchoices: dict[tuple[PathBytes, tuple[PathBytes, ...]], dict]
+    lib_directory: PathBytes | None
     path: PathBytes
 
     def __init__(self, readonly=False, path: PathBytes | None = None):
@@ -70,6 +76,7 @@ class ImportState:
         self.tagprogress = {}
         self.taghistory = set()
         self.tagchoices = {}
+        self.lib_directory = None
         self._open()
 
     def __enter__(self):
@@ -86,6 +93,7 @@ class ImportState:
                 self.tagprogress = state.get("tagprogress", {})
                 self.taghistory = state.get("taghistory", set())
                 self.tagchoices = state.get("tagchoices", {})
+                self.lib_directory = state.get("lib_directory")
         except Exception as exc:
             # The `pickle` module can emit all sorts of exceptions during
             # unpickling, including ImportError. We use a catch-all
@@ -101,6 +109,7 @@ class ImportState:
                         "tagprogress": self.tagprogress,
                         "taghistory": self.taghistory,
                         "tagchoices": self.tagchoices,
+                        "lib_directory": self.lib_directory,
                     },
                     f,
                 )
@@ -203,3 +212,48 @@ class ImportState:
             ]
             for k in keys:
                 del state.tagchoices[k]
+
+    # --------------------------- Library directory ---------------------------- #
+
+    def save_lib_directory(self, directory: PathBytes):
+        """Persist the current library directory so that future sessions
+        can detect when it has changed.
+        """
+        with self as state:
+            state.lib_directory = directory
+
+    def rewrite_paths(self, old_prefix: PathBytes, new_prefix: PathBytes):
+        """Replace ``old_prefix`` with ``new_prefix`` in every path stored
+        in ``tagprogress`` and ``tagchoices``.
+
+        This is used when the library root directory has been moved
+        (e.g. from ``/music/old`` to ``/music/new``) between import
+        sessions.  Without rewriting, ``already_imported`` would fail
+        to match the new paths and albums would be re-processed.
+
+        The method also updates ``lib_directory`` to ``new_prefix``.
+        """
+        if old_prefix == new_prefix:
+            return
+
+        def _rewrite(p: PathBytes) -> PathBytes:
+            if p.startswith(old_prefix):
+                return new_prefix + p[len(old_prefix):]
+            return p
+
+        with self as state:
+            new_progress: dict[PathBytes, list[PathBytes]] = {}
+            for toppath, paths in state.tagprogress.items():
+                new_toppath = _rewrite(toppath)
+                new_paths = [_rewrite(p) for p in paths]
+                new_progress[new_toppath] = new_paths
+            state.tagprogress = new_progress
+
+            new_choices: dict[tuple[PathBytes, tuple[PathBytes, ...]], dict] = {}
+            for (toppath, paths_tuple), value in state.tagchoices.items():
+                new_toppath = _rewrite(toppath)
+                new_paths_tuple = tuple(_rewrite(p) for p in paths_tuple)
+                new_choices[(new_toppath, new_paths_tuple)] = value
+            state.tagchoices = new_choices
+
+            state.lib_directory = new_prefix
