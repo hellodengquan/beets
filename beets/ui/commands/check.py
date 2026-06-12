@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -61,6 +62,13 @@ class CheckCategory(Enum):
     CONFIG = "config"
 
 
+CATEGORIES_ORDER = [
+    CheckCategory.ENABLED,
+    CheckCategory.DEPENDENCY,
+    CheckCategory.COMMAND,
+    CheckCategory.CONFIG,
+]
+
 STATUS_STYLE: dict[CheckStatus, str] = {
     CheckStatus.OK: "text_success",
     CheckStatus.WARNING: "text_warning",
@@ -75,6 +83,59 @@ class CheckResult:
     status: CheckStatus
     message: str
     suggestion: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "plugin": self.plugin,
+            "category": self.category.value,
+            "status": self.status.value,
+            "message": self.message,
+            "suggestion": self.suggestion,
+        }
+
+
+@dataclass
+class HealthReport:
+    results: list[CheckResult] = field(default_factory=list)
+
+    @property
+    def ok_count(self) -> int:
+        return sum(1 for r in self.results if r.status == CheckStatus.OK)
+
+    @property
+    def warning_count(self) -> int:
+        return sum(1 for r in self.results if r.status == CheckStatus.WARNING)
+
+    @property
+    def error_count(self) -> int:
+        return sum(1 for r in self.results if r.status == CheckStatus.ERROR)
+
+    @property
+    def has_errors(self) -> bool:
+        return self.error_count > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        by_category: dict[str, list[dict[str, str]]] = {}
+        for cat in CATEGORIES_ORDER:
+            items = [
+                r.to_dict()
+                for r in self.results
+                if r.category == cat
+            ]
+            if items:
+                by_category[cat.value] = items
+
+        return {
+            "schema_version": 1,
+            "ok_count": self.ok_count,
+            "warning_count": self.warning_count,
+            "error_count": self.error_count,
+            "has_errors": self.has_errors,
+            "checks": by_category,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
 
 def _status_label(status: CheckStatus) -> str:
@@ -336,10 +397,14 @@ def _check_config(loaded: set[str]) -> list[CheckResult]:
                             plugin=name,
                             category=CheckCategory.CONFIG,
                             status=CheckStatus.ERROR,
-                            message=f"Plugin '{name}' has a configuration error: {exc}",
+                            message=(
+                                f"Plugin '{name}' has a "
+                                f"configuration error: {exc}"
+                            ),
                             suggestion=(
-                                f"Check the '{name}' section in your config file. "
-                                f"Run 'beet config -d' to see the full configuration"
+                                f"Check the '{name}' section in your "
+                                f"config file. Run 'beet config -d' to "
+                                f"see the full configuration"
                             ),
                         )
                     )
@@ -362,38 +427,35 @@ def _check_config(loaded: set[str]) -> list[CheckResult]:
     return results
 
 
-def run_health_check(lib: Library, opts: Any, args: list[str]) -> None:
-    configured = _get_configured_plugins()
-    disabled = _get_disabled_plugins()
-    loaded = _get_loaded_plugin_names()
-
-    ui.print_("")
-    ui.print_(colorize("text_highlight", "Plugin Health Check"))
-    ui.print_(colorize("text_faint", "=" * 50))
-
-    filter_plugins: set[str] = set()
-    if args:
-        filter_plugins = set(args)
-
+def _collect_results(
+    configured: list[str],
+    disabled: set[str],
+    loaded: set[str],
+    filter_plugins: set[str] | None = None,
+) -> HealthReport:
     all_results: list[CheckResult] = []
-
     all_results.extend(_check_enabled(configured, disabled, loaded))
     all_results.extend(_check_dependencies(configured, loaded))
     all_results.extend(_check_commands(configured, loaded))
     all_results.extend(_check_config(loaded))
 
     if filter_plugins:
-        all_results = [r for r in all_results if r.plugin in filter_plugins]
+        all_results = [
+            r for r in all_results if r.plugin in filter_plugins
+        ]
 
-    categories_order = [
-        CheckCategory.ENABLED,
-        CheckCategory.DEPENDENCY,
-        CheckCategory.COMMAND,
-        CheckCategory.CONFIG,
-    ]
+    return HealthReport(results=all_results)
 
-    for category in categories_order:
-        cat_results = [r for r in all_results if r.category == category]
+
+def _print_text_report(report: HealthReport) -> None:
+    ui.print_("")
+    ui.print_(colorize("text_highlight", "Plugin Health Check"))
+    ui.print_(colorize("text_faint", "=" * 50))
+
+    for category in CATEGORIES_ORDER:
+        cat_results = [
+            r for r in report.results if r.category == category
+        ]
         if not cat_results:
             continue
 
@@ -412,23 +474,43 @@ def run_health_check(lib: Library, opts: Any, args: list[str]) -> None:
                     )
                 )
 
-    error_count = sum(1 for r in all_results if r.status == CheckStatus.ERROR)
-    warn_count = sum(1 for r in all_results if r.status == CheckStatus.WARNING)
-    ok_count = sum(1 for r in all_results if r.status == CheckStatus.OK)
-
     ui.print_("")
     ui.print_(colorize("text_faint", "-" * 50))
-    summary_parts = [f"{ok_count} ok"]
-    if warn_count:
+    summary_parts = [f"{report.ok_count} ok"]
+    if report.warning_count:
         summary_parts.append(
-            colorize("text_warning", f"{warn_count} warning(s)")
+            colorize(
+                "text_warning", f"{report.warning_count} warning(s)"
+            )
         )
-    if error_count:
+    if report.error_count:
         summary_parts.append(
-            colorize("text_error", f"{error_count} error(s)")
+            colorize("text_error", f"{report.error_count} error(s)")
         )
     ui.print_(f"Summary: {', '.join(summary_parts)}")
     ui.print_("")
+
+
+def _print_json_report(report: HealthReport) -> None:
+    ui.print_(report.to_json())
+
+
+def run_health_check(lib: Library, opts: Any, args: list[str]) -> None:
+    configured = _get_configured_plugins()
+    disabled = _get_disabled_plugins()
+    loaded = _get_loaded_plugin_names()
+
+    filter_plugins: set[str] | None = None
+    if args:
+        filter_plugins = set(args)
+
+    report = _collect_results(configured, disabled, loaded, filter_plugins)
+
+    fmt = getattr(opts, "format", "text")
+    if fmt == "json":
+        _print_json_report(report)
+    else:
+        _print_text_report(report)
 
 
 check_cmd = ui.Subcommand(
@@ -436,6 +518,13 @@ check_cmd = ui.Subcommand(
     help="check plugin health status",
     aliases=("doctor",),
 )
+check_cmd.parser.add_option(
+    "-f",
+    "--format",
+    dest="format",
+    default="text",
+    help="output format: text (default) or json",
+)
 check_cmd.func = run_health_check
 
-__all__ = ["check_cmd"]
+__all__ = ["CheckCategory", "CheckResult", "CheckStatus", "HealthReport", "check_cmd"]
