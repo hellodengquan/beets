@@ -106,10 +106,22 @@ class CheckResult:
     suggestion: str = ""
 
     def to_dict(self) -> dict[str, str]:
+        category_val = self.category.value
+        status_val = self.status.value
+        if category_val not in VALID_CATEGORIES:
+            raise ValueError(
+                f"Invalid category value: {category_val!r} "
+                f"(allowed: {sorted(VALID_CATEGORIES)})"
+            )
+        if status_val not in VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status value: {status_val!r} "
+                f"(allowed: {sorted(VALID_STATUSES)})"
+            )
         return {
             "plugin": self.plugin,
-            "category": self.category.value,
-            "status": self.status.value,
+            "category": category_val,
+            "status": status_val,
             "message": self.message,
             "suggestion": self.suggestion,
         }
@@ -144,7 +156,20 @@ class HealthReport:
                 if r.category == cat
             ]
             if items:
-                by_category[cat.value] = items
+                cat_key = cat.value
+                if cat_key not in VALID_CATEGORIES:
+                    raise ValueError(
+                        f"Invalid category key: {cat_key!r} "
+                        f"(allowed: {sorted(VALID_CATEGORIES)})"
+                    )
+                by_category[cat_key] = items
+
+        for key in by_category:
+            if key not in VALID_CATEGORIES:
+                raise ValueError(
+                    f"Invalid checks key: {key!r} "
+                    f"(allowed: {sorted(VALID_CATEGORIES)})"
+                )
 
         return {
             "schema_version": SCHEMA_VERSION,

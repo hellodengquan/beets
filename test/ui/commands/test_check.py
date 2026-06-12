@@ -1,5 +1,6 @@
 import json
 import re
+from enum import Enum
 from unittest.mock import patch
 
 import pytest
@@ -568,6 +569,60 @@ def _extract_table_first_column(doc_text: str, heading: str) -> set[str]:
     return values
 
 
+def _extract_enum_allowed_values(
+    doc_text: str, heading: str, field_name: str
+) -> set[str]:
+    lines = doc_text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == heading:
+            start = i
+            break
+    if start is None:
+        raise AssertionError(f"Heading '{heading}' not found in doc")
+
+    table_start = None
+    for i in range(start + 1, len(lines)):
+        line = lines[i].strip()
+        if line.startswith("|"):
+            table_start = i
+            break
+        if line.startswith("### ") or line.startswith("## "):
+            break
+    if table_start is None:
+        raise AssertionError(
+            f"No table found under heading '{heading}'"
+        )
+
+    for i in range(table_start, len(lines)):
+        line = lines[i].strip()
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if not cells:
+            continue
+        first = cells[0].strip().strip("`")
+        if first != field_name:
+            continue
+        if len(cells) < 3:
+            raise AssertionError(
+                f"Row for '{field_name}' has fewer than 3 columns"
+            )
+        allowed_cell = cells[2]
+        if allowed_cell.strip() == "*(any)*":
+            return set()
+        values: set[str] = set()
+        for part in allowed_cell.split(","):
+            val = part.strip().strip("`").strip()
+            if val:
+                values.add(val)
+        return values
+
+    raise AssertionError(
+        f"Field '{field_name}' not found in table under '{heading}'"
+    )
+
+
 class TestDocSchemaConsistency:
     def test_doc_file_exists(self):
         import os
@@ -620,3 +675,142 @@ class TestDocSchemaConsistency:
             f"do not match fixture ({sorted(VALID_STATUSES)}). "
             f"Update the doc or VALID_STATUSES."
         )
+
+    def test_doc_category_allowed_values_inline_match_code(self):
+        doc = _read_doc()
+        doc_vals = _extract_enum_allowed_values(
+            doc, "### Check Item Object", "category"
+        )
+        assert doc_vals == VALID_CATEGORIES, (
+            f"category allowed values in doc ({sorted(doc_vals)}) "
+            f"do not match VALID_CATEGORIES ({sorted(VALID_CATEGORIES)}). "
+            f"Update the doc or VALID_CATEGORIES."
+        )
+
+    def test_doc_status_allowed_values_inline_match_code(self):
+        doc = _read_doc()
+        doc_vals = _extract_enum_allowed_values(
+            doc, "### Check Item Object", "status"
+        )
+        assert doc_vals == VALID_STATUSES, (
+            f"status allowed values in doc ({sorted(doc_vals)}) "
+            f"do not match VALID_STATUSES ({sorted(VALID_STATUSES)}). "
+            f"Update the doc or VALID_STATUSES."
+        )
+
+    def test_doc_category_section_matches_code(self):
+        doc = _read_doc()
+        doc_cats = _extract_table_first_column(doc, "### Categories")
+        assert doc_cats == VALID_CATEGORIES, (
+            f"Categories section in doc ({sorted(doc_cats)}) "
+            f"does not match VALID_CATEGORIES ({sorted(VALID_CATEGORIES)})."
+        )
+
+    def test_doc_status_section_matches_code(self):
+        doc = _read_doc()
+        doc_statuses = _extract_table_first_column(doc, "### Statuses")
+        assert doc_statuses == VALID_STATUSES, (
+            f"Statuses section in doc ({sorted(doc_statuses)}) "
+            f"does not match VALID_STATUSES ({sorted(VALID_STATUSES)})."
+        )
+
+    def test_doc_category_inline_matches_category_section(self):
+        doc = _read_doc()
+        inline = _extract_enum_allowed_values(
+            doc, "### Check Item Object", "category"
+        )
+        section = _extract_table_first_column(doc, "### Categories")
+        assert inline == section, (
+            f"Inline category values ({sorted(inline)}) "
+            f"don't match Categories section ({sorted(section)})."
+        )
+
+    def test_doc_status_inline_matches_status_section(self):
+        doc = _read_doc()
+        inline = _extract_enum_allowed_values(
+            doc, "### Check Item Object", "status"
+        )
+        section = _extract_table_first_column(doc, "### Statuses")
+        assert inline == section, (
+            f"Inline status values ({sorted(inline)}) "
+            f"don't match Statuses section ({sorted(section)})."
+        )
+
+
+class TestRuntimeEnumEnforcement:
+    def test_valid_category_passes_validation(self):
+        for cat in CheckCategory:
+            r = CheckResult("p", cat, CheckStatus.OK, "m")
+            d = r.to_dict()
+            assert d["category"] == cat.value
+
+    def test_valid_status_passes_validation(self):
+        for status in CheckStatus:
+            r = CheckResult("p", CheckCategory.ENABLED, status, "m")
+            d = r.to_dict()
+            assert d["status"] == status.value
+
+    def test_invalid_category_raises(self):
+        r = CheckResult.__new__(CheckResult)
+        r.plugin = "p"
+        r.category = CheckCategory.ENABLED
+        r.status = CheckStatus.OK
+        r.message = "m"
+        r.suggestion = ""
+
+        class FakeCategory(Enum):
+            INVALID = "nonexistent"
+
+        r.category = FakeCategory.INVALID
+
+        with pytest.raises(ValueError, match="Invalid category value"):
+            r.to_dict()
+
+    def test_invalid_status_raises(self):
+        r = CheckResult.__new__(CheckResult)
+        r.plugin = "p"
+        r.category = CheckCategory.ENABLED
+        r.status = CheckStatus.OK
+        r.message = "m"
+        r.suggestion = ""
+
+        class FakeStatus(Enum):
+            INVALID = "nonexistent"
+
+        r.status = FakeStatus.INVALID
+
+        with pytest.raises(ValueError, match="Invalid status value"):
+            r.to_dict()
+
+    def test_health_report_validates_checks_keys(self):
+        r = CheckResult("p", CheckCategory.ENABLED, CheckStatus.OK, "m")
+        report = HealthReport(results=[r])
+        d = report.to_dict()
+        for key in d["checks"]:
+            assert key in VALID_CATEGORIES
+
+
+class TestRuntimeEnumEnforcementCLI(IOMixin, PytestTestHelper):
+    def test_cli_json_all_category_values_within_doc_set(self):
+        out = self.run_with_output("check", "--format", "json")
+        data = json.loads(out)
+        for cat_name in data["checks"]:
+            assert cat_name in VALID_CATEGORIES, (
+                f"Category '{cat_name}' from CLI output "
+                f"not in VALID_CATEGORIES {sorted(VALID_CATEGORIES)}"
+            )
+            for item in data["checks"][cat_name]:
+                assert item["category"] in VALID_CATEGORIES, (
+                    f"category value '{item['category']}' "
+                    f"not in VALID_CATEGORIES"
+                )
+
+    def test_cli_json_all_status_values_within_doc_set(self):
+        out = self.run_with_output("check", "--format", "json")
+        data = json.loads(out)
+        for cat_items in data["checks"].values():
+            for item in cat_items:
+                assert item["status"] in VALID_STATUSES, (
+                    f"status value '{item['status']}' "
+                    f"not in VALID_STATUSES"
+                )

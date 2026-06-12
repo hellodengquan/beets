@@ -50,34 +50,36 @@ objects.
 
 Each entry in a category array has the following fields:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `plugin` | string | Name of the plugin this check relates to |
-| `category` | string | Check category (see [Categories](#categories)) |
-| `status` | string | Check result status (see [Statuses](#statuses)) |
-| `message` | string | Human-readable description of the check result |
-| `suggestion` | string | Recommended fix, or empty string when not applicable |
+| Field | Type | Allowed Values | Description |
+|-------|------|---------------|-------------|
+| `plugin` | string | *(any)* | Name of the plugin this check relates to |
+| `category` | enum | `enabled`, `dependency`, `command`, `config` | Check category (see [Categories](#categories)) |
+| `status` | enum | `ok`, `warning`, `error` | Check result severity (see [Statuses](#statuses)) |
+| `message` | string | *(any)* | Human-readable description of the check result |
+| `suggestion` | string | *(any)* | Recommended fix, or empty string when not applicable |
 
 ### Categories
 
-Valid values for `category` (and `checks` object keys):
+Valid values for the `category` field (and `checks` object keys). The output
+layer guarantees no other values will appear.
 
-| Value | Description |
-|-------|-------------|
-| `enabled` | Whether the plugin is enabled and loaded successfully |
-| `dependency` | Whether required optional dependencies are installed |
-| `command` | Whether subcommands are registered correctly and without conflicts |
-| `config` | Whether plugin configuration is valid and field names don't collide |
+| Value | Semantics |
+|-------|-----------|
+| `enabled` | Plugin enablement and load status — whether the plugin is configured, not disabled, and successfully loaded |
+| `dependency` | Optional dependency availability — whether the Python packages required by the plugin are importable |
+| `command` | Subcommand registration — whether the plugin's CLI commands are registered and free of name collisions |
+| `config` | Configuration validity — whether the plugin config section parses correctly and template fields don't collide with other plugins |
 
 ### Statuses
 
-Valid values for `status`:
+Valid values for the `status` field. The output layer guarantees no other
+values will appear.
 
-| Value | Description |
-|-------|-------------|
-| `ok` | Check passed — no action needed |
-| `warning` | Potential issue — review and fix if desired |
-| `error` | Definite problem — the plugin likely won't work correctly |
+| Value | Semantics |
+|-------|-----------|
+| `ok` | Check passed — the plugin is healthy in this dimension, no action needed |
+| `warning` | Potential issue detected — the plugin may still function but a configuration conflict or suboptimal state was found; review recommended |
+| `error` | Definite problem — the plugin is likely broken or non-functional in this dimension; immediate fix required |
 
 ### Example Output
 
@@ -132,8 +134,9 @@ Initial release of the Plugin Doctor JSON schema.
 **Added:**
 - `schema_version` field (SemVer string: `"1.0.0"`)
 - Top-level fields: `ok_count`, `warning_count`, `error_count`, `has_errors`, `checks`
-- Four check categories: `enabled`, `dependency`, `command`, `config`
 - Per-item fields: `plugin`, `category`, `status`, `message`, `suggestion`
-- Three status values: `ok`, `warning`, `error`
+- `category` enum: `enabled`, `dependency`, `command`, `config`
+- `status` enum: `ok`, `warning`, `error`
+- Runtime validation: output layer rejects any enum value outside the declared sets
 - `beet check` command with `--format text` (default) and `--format json` options
 - `beet doctor` alias for the `check` command
