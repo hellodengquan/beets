@@ -632,3 +632,314 @@ class TestHasCoverArtQuery:
     )
     def test_has_cover_art_query(self, lib, query, expected_titles):
         assert {i.title for i in lib.items(query)} == expected_titles
+
+
+class TestBooleanNesting:
+    """Test nested boolean queries (AND inside OR, OR inside AND, deep nesting)."""
+
+    @pytest.fixture(scope="class")
+    def lib(self, helper):
+        album_items = [
+            helper.create_item(
+                title="rock_old",
+                artist="Alice",
+                album="RockAlbum",
+                year=1990,
+                comp=True,
+                genres=["rock"],
+            ),
+            helper.create_item(
+                title="pop_old",
+                artist="Bob",
+                album="PopAlbum",
+                year=1995,
+                comp=False,
+                genres=["pop"],
+            ),
+            helper.create_item(
+                title="rock_new",
+                artist="Carol",
+                album="RockAlbum2",
+                year=2020,
+                comp=True,
+                genres=["rock"],
+            ),
+            helper.create_item(
+                title="pop_new",
+                artist="Dave",
+                album="PopAlbum2",
+                year=2021,
+                comp=False,
+                genres=["pop"],
+            ),
+        ]
+        helper.lib.add_album(album_items[:2])
+        helper.lib.add_album(album_items[2:])
+
+        return helper.lib
+
+    def test_and_inside_or(self, lib):
+        q = OrQuery(
+            [
+                AndQuery(
+                    [SubstringQuery("genres", "rock"), NumericQuery("year", "2020")]
+                ),
+                AndQuery(
+                    [SubstringQuery("genres", "pop"), NumericQuery("year", "1995")]
+                ),
+            ]
+        )
+        assert {i.title for i in lib.items(q)} == {"rock_new", "pop_old"}
+
+    def test_or_inside_and(self, lib):
+        q = AndQuery(
+            [
+                OrQuery(
+                    [SubstringQuery("genres", "rock"), SubstringQuery("genres", "pop")]
+                ),
+                NumericQuery("year", "2000.."),
+            ]
+        )
+        assert {i.title for i in lib.items(q)} == {"rock_new", "pop_new"}
+
+    def test_deep_nesting_and_in_or_in_and(self, lib):
+        q = AndQuery(
+            [
+                OrQuery(
+                    [
+                        AndQuery(
+                            [SubstringQuery("genres", "rock"), NumericQuery("year", "2020")]
+                        ),
+                        SubstringQuery("artist", "Bob"),
+                    ]
+                ),
+                BooleanQuery("comp", True),
+            ]
+        )
+        assert {i.title for i in lib.items(q)} == {"rock_new"}
+
+    def test_or_of_ands_de_morgan(self, lib):
+        not_rock = NotQuery(SubstringQuery("genres", "rock"))
+        not_old = NotQuery(NumericQuery("year", "1990..1999"))
+        not_rock_and_not_old = AndQuery([not_rock, not_old])
+
+        not_rock_or_not_old = OrQuery([not_rock, not_old])
+
+        all_titles = {i.title for i in lib.items()}
+        and_results = {i.title for i in lib.items(not_rock_and_not_old)}
+        or_results = {i.title for i in lib.items(not_rock_or_not_old)}
+
+        assert and_results.issubset(or_results)
+        assert or_results.issubset(all_titles)
+        assert or_results == {"pop_old", "rock_new", "pop_new"}
+
+    def test_comma_separated_or_with_and(self, lib):
+        results = {i.title for i in lib.items("comp:true year:2020, comp:false year:1995")}
+        assert results == {"rock_new", "pop_old"}
+
+
+class TestNegationConditions:
+    """Test negation conditions: double negation, NotQuery with AndQuery/OrQuery,
+    negation prefix combined with field queries."""
+
+    @pytest.fixture(scope="class")
+    def lib(self, helper):
+        album_items = [
+            helper.create_item(
+                title="visible",
+                artist="Alpha",
+                album="AlbumA",
+                year=2001,
+                comp=True,
+                genres=["rock"],
+            ),
+            helper.create_item(
+                title="hidden",
+                artist="Beta",
+                album="AlbumA",
+                year=2002,
+                comp=False,
+                genres=["pop"],
+            ),
+            helper.create_item(
+                title="special",
+                artist="Gamma",
+                album="AlbumB",
+                year=2003,
+                comp=True,
+                genres=["jazz"],
+            ),
+        ]
+        helper.lib.add_album(album_items)
+
+        return helper.lib
+
+    def test_double_negation(self, lib):
+        q = NotQuery(NotQuery(SubstringQuery("artist", "Alpha")))
+        results = {i.title for i in lib.items(q)}
+        assert results == {"visible"}
+
+    def test_not_and_query(self, lib):
+        inner = AndQuery(
+            [BooleanQuery("comp", True), SubstringQuery("genres", "rock")]
+        )
+        q = NotQuery(inner)
+        results = {i.title for i in lib.items(q)}
+        assert results == {"hidden", "special"}
+
+    def test_not_or_query(self, lib):
+        inner = OrQuery(
+            [SubstringQuery("genres", "rock"), SubstringQuery("genres", "pop")]
+        )
+        q = NotQuery(inner)
+        results = {i.title for i in lib.items(q)}
+        assert results == {"special"}
+
+    def test_negation_prefix_with_multiple_fields(self, lib):
+        results = {i.title for i in lib.items("-genres:rock -genres:pop")}
+        assert results == {"special"}
+
+    def test_negation_prefix_or_combined(self, lib):
+        results = {i.title for i in lib.items("-genres:rock , -genres:pop")}
+        assert results == {"visible", "hidden", "special"}
+
+    def test_not_query_inside_and(self, lib):
+        q = AndQuery(
+            [BooleanQuery("comp", True), NotQuery(SubstringQuery("genres", "rock"))]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"special"}
+
+    def test_not_query_inside_or(self, lib):
+        q = OrQuery(
+            [SubstringQuery("artist", "Alpha"), NotQuery(BooleanQuery("comp", True))]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"visible", "hidden"}
+
+    def test_negation_of_numeric_range(self, lib):
+        q = NotQuery(NumericQuery("year", "2002"))
+        results = {i.title for i in lib.items(q)}
+        assert results == {"visible", "special"}
+
+
+class TestPathFilterCombinations:
+    """Test path filtering combined with other query types: path + field query,
+    path + negation, path + boolean, path in OR/AND queries."""
+
+    @pytest.fixture(scope="class")
+    def lib(self, helper):
+        helper.add_item(
+            path=b"/music/rock/song1.mp3",
+            title="rock_song",
+            artist="RockBand",
+            comp=True,
+            genres=["rock"],
+        )
+        helper.add_item(
+            path=b"/music/pop/song2.mp3",
+            title="pop_song",
+            artist="PopStar",
+            comp=False,
+            genres=["pop"],
+        )
+        helper.add_item(
+            path=b"/music/rock/song3.mp3",
+            title="another_rock",
+            artist="RockBand2",
+            comp=False,
+            genres=["rock"],
+        )
+        helper.add_item(
+            path=b"/other/jazz/song4.mp3",
+            title="jazz_song",
+            artist="JazzMan",
+            comp=True,
+            genres=["jazz"],
+        )
+
+        return helper.lib
+
+    def test_path_and_field_query(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = AndQuery(
+            [
+                PathQuery("path", b"/music/rock"),
+                SubstringQuery("genres", "rock"),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song", "another_rock"}
+
+    def test_path_and_boolean_query(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = AndQuery(
+            [
+                PathQuery("path", b"/music/rock"),
+                BooleanQuery("comp", True),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song"}
+
+    def test_path_and_negation(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = AndQuery(
+            [
+                PathQuery("path", b"/music"),
+                NotQuery(SubstringQuery("genres", "pop")),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song", "another_rock"}
+
+    def test_path_in_or_query(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = OrQuery(
+            [
+                PathQuery("path", b"/music/rock"),
+                SubstringQuery("genres", "jazz"),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song", "another_rock", "jazz_song"}
+
+    def test_path_not_query(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = NotQuery(PathQuery("path", b"/music/rock"))
+        results = {i.title for i in lib.items(q)}
+        assert results == {"pop_song", "jazz_song"}
+
+    def test_path_or_negation_combined(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = OrQuery(
+            [
+                PathQuery("path", b"/music/rock"),
+                NotQuery(BooleanQuery("comp", True)),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song", "another_rock", "pop_song"}
+
+    def test_path_and_numeric_query(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = AndQuery(
+            [
+                PathQuery("path", b"/music"),
+                NotQuery(SubstringQuery("artist", "RockBand2")),
+                BooleanQuery("comp", True),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song"}
+
+    def test_multiple_paths_in_or(self, monkeypatch, lib):
+        monkeypatch.setattr("beets.util.case_sensitive", lambda *_: True)
+        q = OrQuery(
+            [
+                PathQuery("path", b"/music/rock"),
+                PathQuery("path", b"/other/jazz"),
+            ]
+        )
+        results = {i.title for i in lib.items(q)}
+        assert results == {"rock_song", "another_rock", "jazz_song"}
