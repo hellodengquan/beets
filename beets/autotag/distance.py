@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import datetime
 import re
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from functools import cache, total_ordering
 from typing import TYPE_CHECKING, Any
 
 from jellyfish import levenshtein_distance
 from unidecode import unidecode
 
-from beets import config, metadata_plugins
+from beets import config, metadata_plugins, plugins
 from beets.util import as_string, cached_classproperty, get_most_common_tags
 from beets.util.color import colorize
 
@@ -540,3 +542,416 @@ def distance(
     dist.add_data_source(likelies["data_source"], album_info.data_source)
 
     return dist
+
+
+# ============================================================================
+# Scoring Pipeline Architecture
+# ============================================================================
+
+
+class ScoringStage(Enum):
+    """Defines the sequential stages of the candidate scoring pipeline.
+
+    Plugins can hook into each stage to customize scoring behavior. The stages
+    are executed in the defined order, with each stage building upon the
+    previous stage's results.
+    """
+
+    INITIALIZE = auto()
+    ALBUM_METADATA = auto()
+    PREFERRED_METADATA = auto()
+    YEAR_METADATA = auto()
+    TRACK_MATCHING = auto()
+    TRACK_COMPLETENESS = auto()
+    DATA_SOURCE = auto()
+    PLUGIN_CUSTOM = auto()
+    FINALIZE = auto()
+
+
+@dataclass
+class TrackScoringContext:
+    """Context for scoring a single track candidate.
+
+    Attributes:
+        item: The library item being matched.
+        track_info: The candidate track metadata.
+        incl_artist: Whether to include track artist in scoring.
+        distance: The Distance object being built up during scoring.
+        stage: The current scoring stage being executed.
+        extra: Extra data for plugins to attach custom information.
+    """
+
+    item: Item
+    track_info: TrackInfo
+    incl_artist: bool
+    distance: Distance = field(default_factory=Distance)
+    stage: ScoringStage = ScoringStage.INITIALIZE
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AlbumScoringContext:
+    """Context for scoring an album candidate.
+
+    Attributes:
+        items: The library items being matched (the album's tracks).
+        album_info: The candidate album metadata.
+        item_info_pairs: List of (item, track_info) matched pairs.
+        likelies: Most common tag values from the input items.
+        distance: The Distance object being built up during scoring.
+        stage: The current scoring stage being executed.
+        extra: Extra data for plugins to attach custom information.
+    """
+
+    items: Sequence[Item]
+    album_info: AlbumInfo
+    item_info_pairs: list[tuple[Item, TrackInfo]]
+    likelies: dict[str, Any]
+    distance: Distance = field(default_factory=Distance)
+    stage: ScoringStage = ScoringStage.INITIALIZE
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+class TrackScoringPipeline:
+    """Pipeline for scoring individual track candidates.
+
+    Encapsulates the full sequence of scoring stages for a single track, with
+    plugin hooks at each stage for customization.
+
+    Usage::
+
+        pipeline = TrackScoringPipeline(item, track_info, incl_artist=True)
+        distance = pipeline.score()
+
+    Or with a pre-built context::
+
+        distance = TrackScoringPipeline.run(ctx)
+    """
+
+    def __init__(
+        self,
+        item: Item,
+        track_info: TrackInfo,
+        incl_artist: bool = False,
+    ) -> None:
+        self.ctx = TrackScoringContext(
+            item=item,
+            track_info=track_info,
+            incl_artist=incl_artist,
+        )
+
+    @classmethod
+    def run(cls, ctx: TrackScoringContext) -> Distance:
+        """Execute the full scoring pipeline on a pre-built context."""
+        pipeline = cls.__new__(cls)
+        pipeline.ctx = ctx
+        return pipeline.score()
+
+    def score(self) -> Distance:
+        """Execute all scoring stages sequentially."""
+        stage_methods = [
+            (ScoringStage.INITIALIZE, self._stage_initialize),
+            (ScoringStage.ALBUM_METADATA, self._stage_track_metadata),
+            (ScoringStage.DATA_SOURCE, self._stage_data_source),
+            (ScoringStage.PLUGIN_CUSTOM, self._stage_plugin_custom),
+            (ScoringStage.FINALIZE, self._stage_finalize),
+        ]
+        for stage, method in stage_methods:
+            self.ctx.stage = stage
+            method()
+        return self.ctx.distance
+
+    def _stage_initialize(self) -> None:
+        """Initialize scoring context (hook point for plugins)."""
+        plugins.send("track_distance_calculated", context=self.ctx)
+
+    def _stage_track_metadata(self) -> None:
+        """Score core track metadata: length, title, artist, index, ID, medium."""
+        item, track = self.ctx.item, self.ctx.track_info
+        dist = self.ctx.distance
+
+        if info_length := track.length:
+            diff = abs(item.length - info_length) - get_track_length_grace()
+            dist.add_ratio("track_length", diff, get_track_length_max())
+
+        dist.add_string("track_title", item.title, track.title)
+
+        if (
+            self.ctx.incl_artist
+            and track.artist
+            and item.artist.lower() not in VA_ARTISTS
+        ):
+            dist.add_string("track_artist", item.artist, track.artist)
+
+        if track.index and item.track:
+            dist.add_expr("track_index", track_index_changed(item, track))
+
+        if item.mb_trackid:
+            dist.add_expr("track_id", item.mb_trackid != track.track_id)
+
+        if track.medium and item.disc:
+            dist.add_expr("medium", item.disc != track.medium)
+
+    def _stage_data_source(self) -> None:
+        """Score data source mismatch."""
+        self.ctx.distance.add_data_source(
+            self.ctx.item.get("data_source"),
+            self.ctx.track_info.data_source,
+        )
+
+    def _stage_plugin_custom(self) -> None:
+        """Allow plugins to inject custom penalties or adjust scoring."""
+        plugins.send("track_candidate_scored", context=self.ctx)
+
+    def _stage_finalize(self) -> None:
+        """Finalize scoring (post-processing hook for plugins)."""
+        plugins.send("track_distance_calculated", context=self.ctx)
+
+
+class AlbumScoringPipeline:
+    """Pipeline for scoring album candidates.
+
+    Encapsulates the full sequence of scoring stages for an album, breaking
+    the monolithic ``distance()`` function into composable stages with plugin
+    hooks at each boundary.
+
+    Stages:
+        1. **INITIALIZE**: Set up the scoring context.
+        2. **ALBUM_METADATA**: Score artist, album, label, catalog, etc.
+        3. **PREFERRED_METADATA**: Score preferred media, country options.
+        4. **YEAR_METADATA**: Score release year and original year preference.
+        5. **TRACK_MATCHING**: Score individual track matches.
+        6. **TRACK_COMPLETENESS**: Score missing and unmatched tracks.
+        7. **DATA_SOURCE**: Score data source mismatch penalty.
+        8. **PLUGIN_CUSTOM**: Plugin custom scoring hook.
+        9. **FINALIZE**: Post-processing and final hook.
+
+    Usage::
+
+        pipeline = AlbumScoringPipeline(items, album_info, item_info_pairs)
+        distance = pipeline.score()
+
+    Or with a pre-built context::
+
+        distance = AlbumScoringPipeline.run(ctx)
+    """
+
+    def __init__(
+        self,
+        items: Sequence[Item],
+        album_info: AlbumInfo,
+        item_info_pairs: list[tuple[Item, TrackInfo]],
+    ) -> None:
+        likelies, _ = get_most_common_tags(items)
+        self.ctx = AlbumScoringContext(
+            items=items,
+            album_info=album_info,
+            item_info_pairs=item_info_pairs,
+            likelies=likelies,
+        )
+
+    @classmethod
+    def run(cls, ctx: AlbumScoringContext) -> Distance:
+        """Execute the full scoring pipeline on a pre-built context."""
+        pipeline = cls.__new__(cls)
+        pipeline.ctx = ctx
+        return pipeline.score()
+
+    def score(self) -> Distance:
+        """Execute all scoring stages sequentially."""
+        stage_methods = [
+            (ScoringStage.INITIALIZE, self._stage_initialize),
+            (ScoringStage.ALBUM_METADATA, self._stage_album_metadata),
+            (ScoringStage.PREFERRED_METADATA, self._stage_preferred_metadata),
+            (ScoringStage.YEAR_METADATA, self._stage_year_metadata),
+            (ScoringStage.TRACK_MATCHING, self._stage_track_matching),
+            (ScoringStage.TRACK_COMPLETENESS, self._stage_track_completeness),
+            (ScoringStage.DATA_SOURCE, self._stage_data_source),
+            (ScoringStage.PLUGIN_CUSTOM, self._stage_plugin_custom),
+            (ScoringStage.FINALIZE, self._stage_finalize),
+        ]
+        for stage, method in stage_methods:
+            self.ctx.stage = stage
+            method()
+        return self.ctx.distance
+
+    def _stage_initialize(self) -> None:
+        """Initialize the scoring context.
+
+        Hook point for plugins to set up custom state before scoring begins.
+        """
+        plugins.send("album_distance_calculated", context=self.ctx)
+
+    def _stage_album_metadata(self) -> None:
+        """Score core album metadata fields.
+
+        Scores: artist (non-VA), album title, label, catalog number,
+        album disambiguation, and album ID.
+        """
+        album_info = self.ctx.album_info
+        likelies = self.ctx.likelies
+        dist = self.ctx.distance
+
+        if not album_info.va:
+            dist.add_string("artist", likelies["artist"], album_info.artist)
+
+        dist.add_string("album", likelies["album"], album_info.album)
+
+        if likelies["disctotal"] and album_info.mediums:
+            dist.add_number("mediums", likelies["disctotal"], album_info.mediums)
+
+        if likelies["label"] and album_info.label:
+            dist.add_string("label", likelies["label"], album_info.label)
+
+        if likelies["catalognum"] and album_info.catalognum:
+            dist.add_string(
+                "catalognum", likelies["catalognum"], album_info.catalognum
+            )
+
+        if likelies["albumdisambig"] and album_info.albumdisambig:
+            dist.add_string(
+                "albumdisambig",
+                likelies["albumdisambig"],
+                album_info.albumdisambig,
+            )
+
+        if likelies["mb_albumid"]:
+            dist.add_equality(
+                "album_id", likelies["mb_albumid"], album_info.album_id
+            )
+
+    def _stage_preferred_metadata(self) -> None:
+        """Score preferred/configured metadata preferences.
+
+        Scores: media type (with regex patterns) and country (with patterns).
+        Falls back to equality comparison if no preferred patterns are set.
+        """
+        album_info = self.ctx.album_info
+        likelies = self.ctx.likelies
+        dist = self.ctx.distance
+        preferred_config = config["match"]["preferred"]
+
+        if album_info.media:
+            media_patterns: Sequence[str] = preferred_config["media"].as_str_seq()
+            options = [
+                re.compile(rf"(\d+x)?({pat})", re.I) for pat in media_patterns
+            ]
+            if options:
+                dist.add_priority("media", album_info.media, options)
+            elif likelies["media"]:
+                dist.add_equality("media", album_info.media, likelies["media"])
+
+        country_patterns: Sequence[str] = preferred_config["countries"].as_str_seq()
+        options = [re.compile(pat, re.I) for pat in country_patterns]
+        if album_info.country and options:
+            dist.add_priority("country", album_info.country, options)
+        elif likelies["country"] and album_info.country:
+            dist.add_string("country", likelies["country"], album_info.country)
+
+    def _stage_year_metadata(self) -> None:
+        """Score release year and original-year preference.
+
+        Handles multiple cases:
+        - Prefer earliest release when configured.
+        - Match against release year or original year.
+        - Proximity-based penalty when original year is known.
+        - Full penalty when no original year reference exists.
+        """
+        album_info = self.ctx.album_info
+        likelies = self.ctx.likelies
+        dist = self.ctx.distance
+        preferred_config = config["match"]["preferred"]
+
+        if album_info.year and preferred_config["original_year"]:
+            original = album_info.original_year or 1889
+            diff = abs(album_info.year - original)
+            diff_max = abs(datetime.date.today().year - original)
+            dist.add_ratio("year", diff, diff_max)
+        elif likelies["year"] and album_info.year:
+            if likelies["year"] in (album_info.year, album_info.original_year):
+                dist.add("year", 0.0)
+            elif album_info.original_year:
+                diff = abs(likelies["year"] - album_info.year)
+                diff_max = abs(
+                    datetime.date.today().year - album_info.original_year
+                )
+                dist.add_ratio("year", diff, diff_max)
+            else:
+                dist.add("year", 1.0)
+
+    def _stage_track_matching(self) -> None:
+        """Score individual track matches via the TrackScoringPipeline.
+
+        Delegates per-track scoring to :class:`TrackScoringPipeline` and
+        aggregates each track's distance into the album score.
+        """
+        dist = self.ctx.distance
+        dist.tracks = {}
+        for item, track in self.ctx.item_info_pairs:
+            track_ctx = TrackScoringContext(
+                item=item,
+                track_info=track,
+                incl_artist=self.ctx.album_info.va,
+            )
+            track_dist = TrackScoringPipeline.run(track_ctx)
+            dist.tracks[track] = track_dist
+            dist.add("tracks", track_dist.distance)
+
+    def _stage_track_completeness(self) -> None:
+        """Score missing tracks (in candidate but not in items) and unmatched
+        tracks (in items but not matched to a candidate track).
+        """
+        dist = self.ctx.distance
+        for _ in range(len(self.ctx.album_info.tracks) - len(self.ctx.item_info_pairs)):
+            dist.add("missing_tracks", 1.0)
+
+        for _ in range(len(self.ctx.items) - len(self.ctx.item_info_pairs)):
+            dist.add("unmatched_tracks", 1.0)
+
+    def _stage_data_source(self) -> None:
+        """Score data source mismatch penalty."""
+        self.ctx.distance.add_data_source(
+            self.ctx.likelies["data_source"],
+            self.ctx.album_info.data_source,
+        )
+
+    def _stage_plugin_custom(self) -> None:
+        """Custom plugin scoring stage.
+
+        Plugins can modify the ``distance`` object or inspect the context
+        to inject domain-specific penalties via the
+        ``album_candidate_scored`` event.
+        """
+        plugins.send("album_candidate_scored", context=self.ctx)
+
+    def _stage_finalize(self) -> None:
+        """Finalize scoring and emit completion hook.
+
+        Allows plugins to perform post-processing on the fully computed
+        distance before it is returned to the caller.
+        """
+        plugins.send("album_distance_calculated", context=self.ctx)
+
+
+def track_distance_pipeline(
+    item: Item, track_info: TrackInfo, incl_artist: bool = False
+) -> Distance:
+    """Convenience wrapper for :class:`TrackScoringPipeline`.
+
+    Maintains API compatibility with the original ``track_distance()``
+    function while using the new pipeline internally.
+    """
+    return TrackScoringPipeline(item, track_info, incl_artist).score()
+
+
+def distance_pipeline(
+    items: Sequence[Item],
+    album_info: AlbumInfo,
+    item_info_pairs: list[tuple[Item, TrackInfo]],
+) -> Distance:
+    """Convenience wrapper for :class:`AlbumScoringPipeline`.
+
+    Maintains API compatibility with the original ``distance()`` function
+    while using the new pipeline internally.
+    """
+    return AlbumScoringPipeline(items, album_info, item_info_pairs).score()

@@ -18,16 +18,23 @@ releases and tracks.
 
 from __future__ import annotations
 
-from enum import IntEnum
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 import lap
 import numpy as np
 
-from beets import config, logging, metadata_plugins
+from beets import config, logging, metadata_plugins, plugins
 from beets.util import get_most_common_tags
 
-from .distance import VA_ARTISTS, distance, track_distance
+from .distance import (
+    AlbumScoringContext,
+    AlbumScoringPipeline,
+    TrackScoringContext,
+    TrackScoringPipeline,
+    VA_ARTISTS,
+)
 from .hooks import AlbumMatch, Info, TrackMatch
 
 if TYPE_CHECKING:
@@ -43,6 +50,52 @@ Candidates = dict[Info.Identifier, AnyMatch]
 
 # Global logger.
 log = logging.getLogger("beets")
+
+
+# Candidate processing pipeline stages.
+
+
+class CandidateStage(Enum):
+    """Defines sequential stages in the candidate processing pipeline.
+
+    Covers the lifecycle from raw candidate reception through validation,
+    scoring, filtering, sorting, and final recommendation calculation.
+    """
+
+    CANDIDATE_RECEIVED = auto()
+    VALIDATION = auto()
+    TRACK_ASSIGNMENT = auto()
+    SCORING = auto()
+    FILTERING = auto()
+    SORTING = auto()
+    RECOMMENDATION = auto()
+    FINALIZED = auto()
+
+
+@dataclass
+class CandidateProcessingContext:
+    """Shared context for the end-to-end candidate processing pipeline.
+
+    Holds the input data, intermediate results, and output data, along with
+    the current processing stage and a plugin-accessible ``extra`` dict.
+
+    Attributes:
+        items: Library items being tagged (album mode) or singleton (item mode).
+        candidates: Mapping of identifier to scored candidate objects.
+        sorted_candidates: Final candidate list after sorting.
+        recommendation: Computed recommendation level.
+        stage: Current pipeline stage being executed.
+        extra: Free-form dictionary for plugin authors to attach custom data.
+    """
+
+    items: Sequence[Item]
+    candidates: Candidates[AnyMatch] = field(default_factory=dict)
+    sorted_candidates: Sequence[AlbumMatch | TrackMatch] = field(
+        default_factory=list
+    )
+    recommendation: Recommendation = Recommendation.none
+    stage: CandidateStage = CandidateStage.CANDIDATE_RECEIVED
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 # Recommendation enumeration.
@@ -80,11 +133,18 @@ def assign_items(
     objects, a set of extra Items, and a set of extra TrackInfo
     objects. These "extra" objects occur when there is an unequal number
     of objects of the two types.
+
+    Uses :class:`TrackScoringPipeline` internally so plugins may customize
+    the per-track distances that feed the cost matrix.
     """
     log.debug("Computing track assignment...")
-    # Construct the cost matrix.
-    costs = [[float(track_distance(i, t)) for t in tracks] for i in items]
-    # Assign items to tracks
+    costs = [
+        [
+            float(TrackScoringPipeline(i, t).score().distance)
+            for t in tracks
+        ]
+        for i in items
+    ]
     _, _, assigned_item_idxs = lap.lapjv(np.array(costs), extend_cost=True)
     log.debug("...done.")
 
@@ -178,8 +238,112 @@ def _recommendation(
 
 
 def _sort_candidates(candidates: Iterable[AnyMatch]) -> Sequence[AnyMatch]:
-    """Sort candidates by distance."""
-    return sorted(candidates, key=lambda match: match.distance)
+    """Sort candidates by distance and emit ``candidates_sorted`` hook.
+
+    Plugins can reorder the result via the ``candidates_sorted`` event by
+    replacing ``context.sorted_candidates``.
+    """
+    sorted_list = sorted(candidates, key=lambda match: match.distance)
+    ctx = type(
+        "_SortCtx",
+        (),
+        {"sorted_candidates": list(sorted_list), "extra": {}},
+    )()
+    plugins.send("candidates_sorted", context=ctx)
+    return list(ctx.sorted_candidates)
+
+
+class CandidateProcessingPipeline:
+    """End-to-end pipeline for processing a batch of album candidates.
+
+    Orchestrates candidate validation, track assignment, scoring, filtering,
+    sorting, and recommendation calculation, emitting plugin events at each
+    stage boundary for customization.
+
+    Usage::
+
+        pipeline = CandidateProcessingPipeline(items, info_iterator)
+        proposal = pipeline.process_albums()
+    """
+
+    def __init__(
+        self,
+        items: Sequence[Item],
+        info_iterator: Iterable[AlbumInfo | TrackInfo],
+    ) -> None:
+        self.ctx = CandidateProcessingContext(items=items)
+        self._info_iterator = info_iterator
+
+    def process_albums(self) -> tuple[str, str, Proposal]:
+        """Execute the full album candidate processing pipeline."""
+        self.ctx.stage = CandidateStage.CANDIDATE_RECEIVED
+        likelies, _ = get_most_common_tags(self.ctx.items)
+        cur_artist, cur_album = likelies["artist"], likelies["album"]
+
+        for info in self._info_iterator:
+            if isinstance(info, AlbumInfo):
+                self._process_single_album(info)
+
+        self.ctx.stage = CandidateStage.SORTING
+        self.ctx.sorted_candidates = _sort_candidates(self.ctx.candidates.values())
+
+        self.ctx.stage = CandidateStage.RECOMMENDATION
+        self.ctx.recommendation = _recommendation(self.ctx.sorted_candidates)
+
+        self.ctx.stage = CandidateStage.FINALIZED
+        return cur_artist, cur_album, Proposal(
+            self.ctx.sorted_candidates, self.ctx.recommendation
+        )
+
+    def _process_single_album(self, info: AlbumInfo) -> None:
+        """Validate, score, and add a single album candidate."""
+        self.ctx.stage = CandidateStage.VALIDATION
+
+        log.debug(
+            "Candidate: {0.artist} - {0.album} ({0.album_id}) from {0.data_source}",
+            info,
+        )
+
+        if not info.tracks:
+            log.debug("No tracks.")
+            return
+
+        if info.album_id and info.identifier in self.ctx.candidates:
+            log.debug("Duplicate.")
+            return
+
+        required_tags: Sequence[str] = config["match"]["required"].as_str_seq()
+        for req_tag in required_tags:
+            if getattr(info, req_tag) is None:
+                log.debug("Ignored. Missing required tag: {}", req_tag)
+                return
+
+        self.ctx.stage = CandidateStage.TRACK_ASSIGNMENT
+        item_info_pairs, extra_items, extra_tracks = assign_items(
+            self.ctx.items, info.tracks
+        )
+
+        self.ctx.stage = CandidateStage.SCORING
+        scoring_ctx = AlbumScoringContext(
+            items=self.ctx.items,
+            album_info=info,
+            item_info_pairs=item_info_pairs,
+            likelies=get_most_common_tags(self.ctx.items)[0],
+        )
+        dist = AlbumScoringPipeline.run(scoring_ctx)
+
+        self.ctx.stage = CandidateStage.FILTERING
+        penalties = [key for key, _ in dist]
+        ignored_tags: Sequence[str] = config["match"]["ignored"].as_str_seq()
+        for penalty in ignored_tags:
+            if penalty in penalties:
+                log.debug("Ignored. Penalty: {}", penalty)
+                return
+
+        log.debug("Success. Distance: {}", dist)
+        self.ctx.candidates[info.identifier] = AlbumMatch(
+            dist, info, dict(item_info_pairs), extra_items, extra_tracks
+        )
 
 
 def _add_candidate(
@@ -189,6 +353,9 @@ def _add_candidate(
     to the output dictionary of AlbumMatch objects. This involves
     checking the track count, ordering the items, checking for
     duplicates, and calculating the distance.
+
+    Uses :class:`AlbumScoringPipeline` for scoring so plugins may customize
+    behavior at each stage.
     """
     log.debug(
         "Candidate: {0.artist} - {0.album} ({0.album_id}) from {0.data_source}",
@@ -217,8 +384,14 @@ def _add_candidate(
         items, info.tracks
     )
 
-    # Get the change distance.
-    dist = distance(items, info, item_info_pairs)
+    # Get the change distance via the scoring pipeline.
+    scoring_ctx = AlbumScoringContext(
+        items=items,
+        album_info=info,
+        item_info_pairs=item_info_pairs,
+        likelies=get_most_common_tags(items)[0],
+    )
+    dist = AlbumScoringPipeline.run(scoring_ctx)
 
     # Skip matches with ignored penalties.
     penalties = [key for key, _ in dist]
@@ -345,7 +518,10 @@ def tag_item(
     if trackids:
         log.debug("Searching for track IDs: {}", ", ".join(trackids))
         for info in metadata_plugins.tracks_for_ids(trackids):
-            dist = track_distance(item, info, incl_artist=True)
+            track_ctx = TrackScoringContext(
+                item=item, track_info=info, incl_artist=True
+            )
+            dist = TrackScoringPipeline.run(track_ctx)
             candidates[info.identifier] = TrackMatch(dist, info, item)
 
         # If this is a good match, then don't keep searching.
@@ -371,7 +547,10 @@ def tag_item(
     for track_info in metadata_plugins.item_candidates(
         item, search_artist, search_name
     ):
-        dist = track_distance(item, track_info, incl_artist=True)
+        track_ctx = TrackScoringContext(
+            item=item, track_info=track_info, incl_artist=True
+        )
+        dist = TrackScoringPipeline.run(track_ctx)
         candidates[track_info.identifier] = TrackMatch(dist, track_info, item)
 
     # Sort by distance and return with recommendation.
