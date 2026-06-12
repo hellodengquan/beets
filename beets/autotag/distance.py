@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from jellyfish import levenshtein_distance
 from unidecode import unidecode
 
-from beets import config, metadata_plugins, plugins
+from beets import config, logging, metadata_plugins, plugins
 from beets.util import as_string, cached_classproperty, get_most_common_tags
 from beets.util.color import colorize
 
@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from beets.util.color import ColorName
 
     from .hooks import AlbumInfo, TrackInfo
+
+log = logging.getLogger("beets")
 
 # Candidate distance scoring.
 
@@ -549,6 +551,31 @@ def distance(
 # ============================================================================
 
 
+def _safe_plugin_send(event: str, **kwargs: Any) -> list[Any]:
+    """Safely emit a plugin event, catching and logging any exceptions.
+
+    Provides an extra layer of defensive protection around ``plugins.send``
+    for the scoring pipeline. While the core ``send()`` already wraps each
+    listener individually, this wrapper ensures that any *other* exception
+    (e.g. from argument construction) also cannot break the pipeline.
+
+    :param event: Name of the plugin event to dispatch.
+    :param kwargs: Keyword arguments forwarded to every listener.
+    :returns: List of non-None return values from successful listeners.
+    """
+    try:
+        return plugins.send(event, **kwargs)
+    except Exception as exc:
+        log.warning(
+            "Scoring pipeline: failed to emit event '{}': {}: {}",
+            event,
+            type(exc).__name__,
+            exc,
+        )
+        log.debug("Plugin event dispatch error details:", exc_info=True)
+        return []
+
+
 class ScoringStage(Enum):
     """Defines the sequential stages of the candidate scoring pipeline.
 
@@ -648,7 +675,12 @@ class TrackScoringPipeline:
         return pipeline.score()
 
     def score(self) -> Distance:
-        """Execute all scoring stages sequentially."""
+        """Execute all scoring stages sequentially.
+
+        Each stage is wrapped in its own ``try``/``except`` so a failure in
+        one stage (or its plugin hooks) is logged and skipped rather than
+        aborting the entire scoring pipeline.
+        """
         stage_methods = [
             (ScoringStage.INITIALIZE, self._stage_initialize),
             (ScoringStage.ALBUM_METADATA, self._stage_track_metadata),
@@ -658,12 +690,25 @@ class TrackScoringPipeline:
         ]
         for stage, method in stage_methods:
             self.ctx.stage = stage
-            method()
+            try:
+                method()
+            except Exception as exc:
+                log.warning(
+                    "Track scoring stage '%s' failed: %s: %s",
+                    stage.name,
+                    type(exc).__name__,
+                    exc,
+                )
+                log.debug(
+                    "Exception during track scoring stage %s:",
+                    stage.name,
+                    exc_info=True,
+                )
         return self.ctx.distance
 
     def _stage_initialize(self) -> None:
         """Initialize scoring context (hook point for plugins)."""
-        plugins.send("track_distance_calculated", context=self.ctx)
+        _safe_plugin_send("track_distance_calculated", context=self.ctx)
 
     def _stage_track_metadata(self) -> None:
         """Score core track metadata: length, title, artist, index, ID, medium."""
@@ -701,11 +746,11 @@ class TrackScoringPipeline:
 
     def _stage_plugin_custom(self) -> None:
         """Allow plugins to inject custom penalties or adjust scoring."""
-        plugins.send("track_candidate_scored", context=self.ctx)
+        _safe_plugin_send("track_candidate_scored", context=self.ctx)
 
     def _stage_finalize(self) -> None:
         """Finalize scoring (post-processing hook for plugins)."""
-        plugins.send("track_distance_calculated", context=self.ctx)
+        _safe_plugin_send("track_distance_calculated", context=self.ctx)
 
 
 class AlbumScoringPipeline:
@@ -758,7 +803,12 @@ class AlbumScoringPipeline:
         return pipeline.score()
 
     def score(self) -> Distance:
-        """Execute all scoring stages sequentially."""
+        """Execute all scoring stages sequentially.
+
+        Each stage is wrapped in its own ``try``/``except`` so a failure in
+        one stage (or its plugin hooks) is logged and skipped rather than
+        aborting the entire scoring pipeline.
+        """
         stage_methods = [
             (ScoringStage.INITIALIZE, self._stage_initialize),
             (ScoringStage.ALBUM_METADATA, self._stage_album_metadata),
@@ -772,7 +822,20 @@ class AlbumScoringPipeline:
         ]
         for stage, method in stage_methods:
             self.ctx.stage = stage
-            method()
+            try:
+                method()
+            except Exception as exc:
+                log.warning(
+                    "Album scoring stage '%s' failed: %s: %s",
+                    stage.name,
+                    type(exc).__name__,
+                    exc,
+                )
+                log.debug(
+                    "Exception during album scoring stage %s:",
+                    stage.name,
+                    exc_info=True,
+                )
         return self.ctx.distance
 
     def _stage_initialize(self) -> None:
@@ -780,7 +843,7 @@ class AlbumScoringPipeline:
 
         Hook point for plugins to set up custom state before scoring begins.
         """
-        plugins.send("album_distance_calculated", context=self.ctx)
+        _safe_plugin_send("album_distance_calculated", context=self.ctx)
 
     def _stage_album_metadata(self) -> None:
         """Score core album metadata fields.
@@ -922,7 +985,7 @@ class AlbumScoringPipeline:
         to inject domain-specific penalties via the
         ``album_candidate_scored`` event.
         """
-        plugins.send("album_candidate_scored", context=self.ctx)
+        _safe_plugin_send("album_candidate_scored", context=self.ctx)
 
     def _stage_finalize(self) -> None:
         """Finalize scoring and emit completion hook.
@@ -930,7 +993,7 @@ class AlbumScoringPipeline:
         Allows plugins to perform post-processing on the fully computed
         distance before it is returned to the caller.
         """
-        plugins.send("album_distance_calculated", context=self.ctx)
+        _safe_plugin_send("album_distance_calculated", context=self.ctx)
 
 
 def track_distance_pipeline(

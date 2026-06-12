@@ -3,15 +3,21 @@ import re
 import pytest
 
 from beets.autotag.distance import (
+    AlbumScoringContext,
+    AlbumScoringPipeline,
     Distance,
+    ScoringStage,
+    TrackScoringContext,
+    TrackScoringPipeline,
     distance,
     string_dist,
     track_distance,
+    _safe_plugin_send,
 )
 from beets.autotag.hooks import AlbumInfo, TrackInfo
 from beets.library import Item
 from beets.metadata_plugins import MetadataSourcePlugin, get_penalty
-from beets.plugins import BeetsPlugin
+from beets.plugins import BeetsPlugin, send
 
 _p = pytest.param
 
@@ -361,3 +367,300 @@ class TestDataSourceDistance:
         dist = track_distance(item, info)
 
         assert dist.distance == expected_distance
+
+
+class TestScoringPipelineExceptionSafety:
+    """Tests that ensure plugin hook exceptions do not abort the pipeline."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_config(self, config):
+        config["match"]["track_length_grace"] = 10
+        config["match"]["track_length_max"] = 30
+        BeetsPlugin.listeners.clear()
+
+    def _register_listener(self, event, listener):
+        BeetsPlugin.listeners[event].append(listener)
+
+    @pytest.fixture
+    def item(self):
+        return Item(
+            title="title",
+            artist="artist",
+            length=200,
+            track=1,
+            disc=1,
+        )
+
+    @pytest.fixture
+    def track_info(self):
+        return TrackInfo(
+            title="title",
+            artist="artist",
+            length=200,
+            index=1,
+            medium=1,
+        )
+
+    @pytest.fixture
+    def items(self):
+        return [
+            Item(
+                title=f"track_{i}",
+                artist="the artist",
+                album="the album",
+                length=200 + i,
+                track=i + 1,
+                disc=1,
+            )
+            for i in range(3)
+        ]
+
+    @pytest.fixture
+    def album_info(self, items):
+        return AlbumInfo(
+            artist="the artist",
+            album="the album",
+            tracks=[
+                TrackInfo(
+                    title=i.title,
+                    artist=i.artist,
+                    index=i.track,
+                    medium=i.disc,
+                    length=i.length,
+                )
+                for i in items
+            ],
+            va=False,
+        )
+
+    @pytest.fixture
+    def pairs(self, items, album_info):
+        return list(zip(items, album_info.tracks))
+
+    # ------------------------------------------------------------------ #
+    # plugins.send() listener isolation
+    # ------------------------------------------------------------------ #
+    def test_send_isolates_listener_valueerror(self):
+        """A ValueError from one listener does not affect others."""
+
+        def bad_listener(**_):
+            raise ValueError("boom from bad listener")
+
+        ok_results = []
+
+        def good_listener(**_):
+            ok_results.append("I ran")
+            return "return-value"
+
+        self._register_listener("album_candidate_scored", bad_listener)
+        self._register_listener("album_candidate_scored", good_listener)
+
+        results = send("album_candidate_scored", context=None)
+
+        assert results == ["return-value"]
+        assert ok_results == ["I ran"]
+
+    def test_send_isolates_listener_runtimeerror(self):
+        """A RuntimeError from one listener does not affect others."""
+
+        def bad_listener(**_):
+            raise RuntimeError("runtime boom")
+
+        ok_results = []
+
+        def good_listener(**_):
+            ok_results.append("I ran too")
+
+        self._register_listener("track_candidate_scored", bad_listener)
+        self._register_listener("track_candidate_scored", good_listener)
+
+        send("track_candidate_scored", context=None)
+
+        assert ok_results == ["I ran too"]
+
+    # ------------------------------------------------------------------ #
+    # _safe_plugin_send() top-level safety
+    # ------------------------------------------------------------------ #
+    def test_safe_plugin_send_returns_empty_on_unexpected_error(self, monkeypatch):
+        """_safe_plugin_send catches even errors raised before dispatch."""
+
+        def explode(**_):
+            raise TypeError("pre-dispatch error")
+
+        monkeypatch.setattr(
+            "beets.autotag.distance.plugins.send", explode
+        )
+
+        assert _safe_plugin_send("any_event") == []
+
+    # ------------------------------------------------------------------ #
+    # TrackScoringPipeline: hook exceptions
+    # ------------------------------------------------------------------ #
+    def test_track_pipeline_survives_valueerror_in_plugin_custom_hook(
+        self, item, track_info
+    ):
+        """ValueError in track_candidate_scored hook does not abort scoring."""
+
+        def raise_valueerror(context):
+            raise ValueError("custom plugin crashed")
+
+        self._register_listener("track_candidate_scored", raise_valueerror)
+
+        dist = TrackScoringPipeline(item, track_info, incl_artist=True).score()
+
+        assert dist is not None
+        assert isinstance(dist, Distance)
+
+    def test_track_pipeline_survives_runtimeerror_in_plugin_custom_hook(
+        self, item, track_info
+    ):
+        """RuntimeError in track_candidate_scored hook does not abort scoring."""
+
+        def raise_runtime(context):
+            raise RuntimeError("runtime plugin crashed")
+
+        self._register_listener("track_candidate_scored", raise_runtime)
+
+        dist = TrackScoringPipeline(item, track_info, incl_artist=True).score()
+
+        assert dist is not None
+        assert isinstance(dist, Distance)
+
+    def test_track_pipeline_survives_exception_in_initialize_hook(
+        self, item, track_info
+    ):
+        """Exception during INITIALIZE stage is swallowed."""
+
+        def raise_it(context):
+            raise ValueError("init hook broken")
+
+        self._register_listener("track_distance_calculated", raise_it)
+
+        dist = TrackScoringPipeline(item, track_info, incl_artist=False).score()
+
+        assert isinstance(dist, Distance)
+
+    def test_track_pipeline_completes_score_even_when_finalize_hook_raises(
+        self, item, track_info
+    ):
+        """FINALIZE hook exception is logged but score is still returned."""
+
+        def raise_finalize(context):
+            if context.stage == ScoringStage.FINALIZE:
+                raise RuntimeError("finalize failed")
+
+        self._register_listener("track_distance_calculated", raise_finalize)
+
+        dist = TrackScoringPipeline(item, track_info, incl_artist=False).score()
+
+        assert isinstance(dist, Distance)
+
+    # ------------------------------------------------------------------ #
+    # AlbumScoringPipeline: hook exceptions
+    # ------------------------------------------------------------------ #
+    def test_album_pipeline_survives_valueerror_in_plugin_custom_hook(
+        self, items, album_info, pairs
+    ):
+        """ValueError in album_candidate_scored hook does not abort scoring."""
+
+        def raise_valueerror(context):
+            raise ValueError("album plugin broken")
+
+        self._register_listener("album_candidate_scored", raise_valueerror)
+
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+
+        assert isinstance(dist, Distance)
+
+    def test_album_pipeline_survives_runtimeerror_in_plugin_custom_hook(
+        self, items, album_info, pairs
+    ):
+        """RuntimeError in album_candidate_scored hook does not abort scoring."""
+
+        def raise_runtime(context):
+            raise RuntimeError("album runtime failed")
+
+        self._register_listener("album_candidate_scored", raise_runtime)
+
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+
+        assert isinstance(dist, Distance)
+
+    def test_album_pipeline_survives_multiple_bad_listeners(
+        self, items, album_info, pairs
+    ):
+        """Multiple failing listeners on different events are all handled."""
+
+        def raise_valueerror(context):
+            raise ValueError("value error")
+
+        def raise_runtime(context):
+            raise RuntimeError("runtime error")
+
+        self._register_listener("album_distance_calculated", raise_valueerror)
+        self._register_listener("album_candidate_scored", raise_runtime)
+
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+
+        assert isinstance(dist, Distance)
+
+    def test_album_pipeline_stage_exception_is_isolated(
+        self, items, album_info, pairs
+    ):
+        """A direct stage failure (not only hooks) is caught by the loop."""
+
+        ctx = AlbumScoringContext(
+            items=items, album_info=album_info, item_info_pairs=pairs,
+            likelies={},
+        )
+        pipeline = AlbumScoringPipeline.__new__(AlbumScoringPipeline)
+        pipeline.ctx = ctx
+
+        def broken_stage():
+            raise KeyError("stage missing data")
+
+        pipeline._stage_album_metadata = broken_stage
+
+        dist = pipeline.score()
+
+        assert isinstance(dist, Distance)
+
+    # ------------------------------------------------------------------ #
+    # Distance results remain meaningful after hook exceptions
+    # ------------------------------------------------------------------ #
+    def test_track_score_still_computed_after_plugin_exception(
+        self, item, track_info
+    ):
+        """Base penalties are recorded even when plugin custom hook raises."""
+
+        def raise_valueerror(context):
+            raise ValueError("plugin crashed")
+
+        self._register_listener("track_candidate_scored", raise_valueerror)
+
+        item.title = "different title"
+        track_info.title = "totally different"
+
+        dist = TrackScoringPipeline(item, track_info, incl_artist=False).score()
+
+        penalties = dict(dist.items())
+        assert "track_title" in penalties
+        assert penalties["track_title"] > 0
+
+    def test_album_score_still_computed_after_plugin_exception(
+        self, items, album_info, pairs
+    ):
+        """Album penalties accumulate even when plugin custom hook raises."""
+
+        def raise_runtime(context):
+            raise RuntimeError("boom")
+
+        self._register_listener("album_candidate_scored", raise_runtime)
+
+        album_info.artist = "different artist"
+
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+
+        penalties = dict(dist.items())
+        assert "artist" in penalties
+        assert penalties["artist"] > 0

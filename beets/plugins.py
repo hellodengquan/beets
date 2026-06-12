@@ -650,14 +650,35 @@ def send(event: EventType, **arguments: Any) -> list[Any]:
     `event` is the name of  the event to send, all other named arguments
     are passed along to the handlers.
 
+    Each listener is wrapped in its own ``try``/``except`` block so a
+    failure in one plugin does not abort the event dispatch or the rest
+    of the pipeline. Exceptions are logged at the ``warning`` level (with
+    ``debug`` details) so the problem is visible to the user without
+    terminating the operation.
+
     Return a list of non-None values returned from the handlers.
     """
     log.debug("Sending event: {}", event)
-    return [
-        r
-        for handler in BeetsPlugin.listeners[event]
-        if (r := handler(**arguments)) is not None
-    ]
+    results: list[Any] = []
+    for handler in BeetsPlugin.listeners[event]:
+        try:
+            r = handler(**arguments)
+        except Exception as exc:
+            log.warning(
+                "Error in plugin listener for event '{}': {}: {}",
+                event,
+                type(exc).__name__,
+                exc,
+            )
+            log.debug(
+                "Exception details during {} dispatch:",
+                event,
+                exc_info=True,
+            )
+            continue
+        if r is not None:
+            results.append(r)
+    return results
 
 
 def feat_tokens(

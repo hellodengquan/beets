@@ -19,7 +19,7 @@ releases and tracks.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 import lap
@@ -50,6 +50,39 @@ Candidates = dict[Info.Identifier, AnyMatch]
 
 # Global logger.
 log = logging.getLogger("beets")
+
+
+# Recommendation enumeration.
+
+
+class Recommendation(IntEnum):
+    """Indicates a qualitative suggestion to the user about what should
+    be done with a given match.
+    """
+
+    none = 0
+    low = 1
+    medium = 2
+    strong = 3
+
+
+def _safe_plugin_send(event: str, **kwargs: Any) -> list[Any]:
+    """Safely emit a plugin event, catching and logging any exceptions.
+
+    Provides an extra layer of defensive protection for candidate-processing
+    hooks in addition to the per-listener isolation inside ``plugins.send``.
+    """
+    try:
+        return plugins.send(event, **kwargs)
+    except Exception as exc:
+        log.warning(
+            "Candidate pipeline: failed to emit event '{}': {}: {}",
+            event,
+            type(exc).__name__,
+            exc,
+        )
+        log.debug("Plugin event dispatch error details:", exc_info=True)
+        return []
 
 
 # Candidate processing pipeline stages.
@@ -96,20 +129,6 @@ class CandidateProcessingContext:
     recommendation: Recommendation = Recommendation.none
     stage: CandidateStage = CandidateStage.CANDIDATE_RECEIVED
     extra: dict[str, Any] = field(default_factory=dict)
-
-
-# Recommendation enumeration.
-
-
-class Recommendation(IntEnum):
-    """Indicates a qualitative suggestion to the user about what should
-    be done with a given match.
-    """
-
-    none = 0
-    low = 1
-    medium = 2
-    strong = 3
 
 
 # A structure for holding a set of possible matches to choose between. This
@@ -249,7 +268,7 @@ def _sort_candidates(candidates: Iterable[AnyMatch]) -> Sequence[AnyMatch]:
         (),
         {"sorted_candidates": list(sorted_list), "extra": {}},
     )()
-    plugins.send("candidates_sorted", context=ctx)
+    _safe_plugin_send("candidates_sorted", context=ctx)
     return list(ctx.sorted_candidates)
 
 
