@@ -19,6 +19,8 @@ from __future__ import annotations
 import abc
 import concurrent.futures
 import inspect
+import multiprocessing as _mp
+import pickle
 import re
 import sys
 import threading
@@ -653,9 +655,8 @@ _hook_executor_lock = threading.Lock()
 def _get_hook_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Return a lazily-created, long-lived ThreadPoolExecutor for hook timeouts.
 
-    The executor is created once, on first use, and kept alive for the
-    remainder of the process. Using a single executor avoids the overhead
-    of spinning up fresh threads on every ``send()`` call.
+    Used when ``hook_timeout_mode`` is ``thread`` or as a fallback when the
+    arguments for the ``process`` mode are not pickleable.
     """
     global _hook_executor
     if _hook_executor is None:
@@ -680,40 +681,214 @@ def _get_hook_timeout() -> float:
         return 0.0
 
 
-def _run_handler_with_timeout(
+def _get_hook_timeout_mode() -> str:
+    """Return the configured hook timeout mode: ``"process"`` or ``"thread"``.
+
+    Defaults to ``"process"`` when the configuration is unavailable.
+    """
+    try:
+        mode = str(beets.config["hook_timeout_mode"].as_str()).lower()
+        return mode if mode in ("process", "thread") else "process"
+    except Exception:
+        return "process"
+
+
+def _handler_is_resolvable(handler: Callable[..., Any]) -> bool:
+    """Return ``True`` if *handler* can be re-imported in a child process.
+
+    Process-based dispatch resolves the handler via
+    ``import_module(handler.__module__).__getattr__(handler.__qualname__)``.
+    Nested functions (e.g. defined inside a test method) have a valid
+    ``__qualname__`` but the dotted path cannot be imported, so we also
+    try to re-import the callable end-to-end before trusting process mode.
+    """
+    module_name = getattr(handler, "__module__", None)
+    qualname = getattr(handler, "__qualname__", None) or getattr(
+        handler, "__name__", None
+    )
+    if not (module_name and qualname):
+        return False
+    try:
+        obj = import_module(module_name)
+    except Exception:
+        return False
+    for part in qualname.split("."):
+        try:
+            obj = getattr(obj, part)
+        except Exception:
+            return False
+    return obj is handler
+
+
+def _can_pickle(*values: Any) -> bool:
+    """Return ``True`` iff every value in ``values`` can be pickled.
+
+    Used to decide whether ``process`` mode is viable for a given
+    (handler, arguments) pair.
+    """
+    try:
+        for v in values:
+            pickle.dumps(v)
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Child-process runner (pickleable top-level helper)
+# --------------------------------------------------------------------------- #
+
+
+def _mp_hook_runner(
+    handler_module: str,
+    handler_name: str,
+    arguments: dict[str, Any],
+    result_queue: "_mp.Queue[Any]",
+) -> None:
+    """Execute a plugin listener inside a child process.
+
+    The handler is resolved by *module*/*name* (rather than being passed
+    directly) because bound methods, lambdas, and closures are frequently
+    not pickleable. A top-level listener (typical for plugins registered
+    via ``@listen`` or ``register_listener``) is always resolvable.
+
+    On success the return value is placed onto *result_queue*; any
+    exception is serialised and returned via the same queue using the
+    marker tuple ``(False, exc_type, exc_repr)``.
+    """
+    try:
+        module = import_module(handler_module)
+        handler = getattr(module, handler_name)
+    except Exception as exc:
+        result_queue.put((False, type(exc).__name__, str(exc)))
+        return
+    try:
+        result = handler(**arguments)
+    except Exception as exc:
+        result_queue.put((False, type(exc).__name__, str(exc)))
+        return
+    result_queue.put((True, result, None))
+
+
+# --------------------------------------------------------------------------- #
+# Per-listener execution backends
+# --------------------------------------------------------------------------- #
+
+
+def _run_handler_inline(
     handler: Callable[..., Any],
     arguments: dict[str, Any],
-    event: str,
+) -> tuple[bool, Any, Exception | None]:
+    """Run handler synchronously in the caller's thread.
+
+    Used when timeout protection is disabled (``hook_timeout == 0``).
+    """
+    try:
+        return True, handler(**arguments), None
+    except Exception as exc:
+        return False, None, exc
+
+
+def _run_handler_in_thread(
+    handler: Callable[..., Any],
+    arguments: dict[str, Any],
     timeout: float,
 ) -> tuple[bool, Any, Exception | None]:
-    """Execute a plugin listener with a wall-clock timeout.
+    """Run handler inside a worker thread with ``timeout`` seconds.
 
-    Uses :class:`concurrent.futures.ThreadPoolExecutor` so the timeout
-    is effective even when the listener blocks on I/O. If the listener
-    does not return within ``timeout`` seconds, a sentinel failure is
-    returned and the thread is abandoned (Python cannot forcibly kill
-    threads, but the main thread is free to continue).
-
-    :returns: A 3-tuple ``(ok, return_value, exception)`` where ``ok``
-              is ``False`` for both raised exceptions and timeouts.
+    Cannot interrupt pure-CPU busy loops (the GIL is held continuously),
+    but is lightweight and works for any callable regardless of
+    pickleability.
     """
-    if timeout <= 0:
-        # Fast path: no timeout configured, run inline.
-        try:
-            return True, handler(**arguments), None
-        except Exception as exc:
-            return False, None, exc
-
     executor = _get_hook_executor()
     future = executor.submit(handler, **arguments)
     try:
         return True, future.result(timeout=timeout), None
     except concurrent.futures.TimeoutError:
         return False, None, TimeoutError(
-            f"exceeded {timeout:.1f}s timeout"
+            f"exceeded {timeout:.1f}s timeout (thread mode)"
         )
     except Exception as exc:
         return False, None, exc
+
+
+def _run_handler_in_process(
+    handler: Callable[..., Any],
+    arguments: dict[str, Any],
+    timeout: float,
+) -> tuple[bool, Any, Exception | None]:
+    """Run handler inside a dedicated subprocess, forcibly terminating on timeout.
+
+    This is the only backend that can interrupt a pure-CPU infinite loop
+    such as ``while True: pass`` because the OS-level process can be
+    killed via ``SIGTERM`` / ``SIGKILL``.
+
+    Falls back to :func:`_run_handler_in_thread` if either the handler or
+    any argument fails the pickleability check, or if the handler cannot
+    be re-imported in the child process (e.g. nested functions / lambdas).
+    """
+    handler_module = getattr(handler, "__module__", None)
+    handler_name = getattr(handler, "__qualname__", None) or getattr(
+        handler, "__name__", None
+    )
+    if (
+        not (handler_module and handler_name)
+        or not _handler_is_resolvable(handler)
+        or not _can_pickle(arguments)
+    ):
+        return _run_handler_in_thread(handler, arguments, timeout)
+
+    ctx = _mp.get_context("fork" if sys.platform != "win32" else "spawn")
+    result_queue: "_mp.Queue[Any]" = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_mp_hook_runner,
+        args=(handler_module, handler_name, arguments, result_queue),
+        name=f"beets-hook-{handler_name}",
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=timeout)
+
+    if proc.is_alive():
+        # Hard kill: first SIGTERM, then SIGKILL as a last resort.
+        proc.terminate()
+        proc.join(timeout=0.5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=1.0)
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+        return False, None, TimeoutError(
+            f"exceeded {timeout:.1f}s timeout (process mode) — terminated"
+        )
+
+    if not result_queue.empty():
+        ok, payload, err = result_queue.get_nowait()
+    else:
+        ok, payload, err = False, "RuntimeError", "child exited without result"
+
+    try:
+        result_queue.close()
+    except Exception:
+        pass
+
+    if ok:
+        return True, payload, None
+    # payload is the exception *type name* (e.g. "ValueError"), err is a
+    # string message.  Reconstruct the closest matching exception so the
+    # caller can ``isinstance(exc, ValueError)`` etc. when possible.
+    exc_type = {
+        "ValueError": ValueError,
+        "RuntimeError": RuntimeError,
+        "TypeError": TypeError,
+        "KeyError": KeyError,
+        "IndexError": IndexError,
+        "AttributeError": AttributeError,
+        "TimeoutError": TimeoutError,
+    }.get(payload, RuntimeError)
+    return False, None, exc_type(str(err))
 
 
 def send(event: EventType, **arguments: Any) -> list[Any]:
@@ -722,17 +897,24 @@ def send(event: EventType, **arguments: Any) -> list[Any]:
     `event` is the name of  the event to send, all other named arguments
     are passed along to the handlers.
 
-    Each listener is executed with **two layers of protection**:
+    Each listener is executed with **three layers of protection**:
 
-    1. *Exception isolation*: a ``try``/``except`` around every call so
-       a failure in one plugin does not abort the dispatch.
-    2. *Timeout protection*: when ``hook_timeout`` is set (default 5s),
-       each listener runs in a worker thread. A hanging listener is
-       abandoned after the timeout so the remaining listeners and the
-       caller can make progress.
+    1. *Exception isolation*: every call is wrapped in ``try``/``except``
+       so a failure in one plugin does not abort the dispatch.
+    2. *Timeout protection*: according to ``hook_timeout`` (default 5s):
+       - ``"process"`` mode (default): each listener runs in a dedicated
+         subprocess. Timeouts are enforced by ``SIGTERM`` (and, if that
+         fails, ``SIGKILL``), which is the only way to forcibly stop a
+         pure-CPU busy loop (e.g. ``while True: pass``). Falls back to
+         ``"thread"`` mode automatically if arguments are not pickleable.
+       - ``"thread"`` mode: each listener runs in a worker thread from a
+         shared pool. Lighter-weight but cannot interrupt pure-CPU loops.
+    3. *Graceful fallback*: if a listener cannot be executed in the
+       configured mode it is run using the next viable mode down to a
+       bare synchronous call.
 
     Exceptions and timeouts are logged at the ``warning`` level (with
-    ``debug``-level tracebacks).
+    ``debug``-level details).
 
     Return a list of non-None values returned from the handlers.
     Listeners that timed out or raised are treated as if they returned
@@ -740,16 +922,23 @@ def send(event: EventType, **arguments: Any) -> list[Any]:
     """
     log.debug("Sending event: {}", event)
     timeout = _get_hook_timeout()
+    mode = _get_hook_timeout_mode()
     results: list[Any] = []
 
     for handler in BeetsPlugin.listeners[event]:
-        ok, r, exc = _run_handler_with_timeout(
-            handler, arguments, event, timeout
-        )
+        if timeout <= 0:
+            ok, r, exc = _run_handler_inline(handler, arguments)
+        elif mode == "process":
+            ok, r, exc = _run_handler_in_process(handler, arguments, timeout)
+        else:
+            ok, r, exc = _run_handler_in_thread(handler, arguments, timeout)
+
         if not ok:
             assert exc is not None
             is_timeout = isinstance(exc, TimeoutError)
-            level = "timed out" if is_timeout else f"raised {type(exc).__name__}"
+            level = (
+                "timed out" if is_timeout else f"raised {type(exc).__name__}"
+            )
             log.warning(
                 "Plugin listener for event '{}' {}: {}",
                 event,

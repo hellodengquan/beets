@@ -15,7 +15,16 @@ raise_on_error: no
 # Plugin hook execution guardrails.
 # hook_timeout: maximum wall-clock seconds per plugin listener call.
 #   Set to 0 to disable timeout protection entirely.
+# hook_timeout_mode: execution mode for enforcing hook timeouts.
+#   - "process" (default): forks a subprocess for each hook. Can forcibly
+#     terminate pure-CPU infinite loops (e.g. ``while True: pass``) via
+#     SIGTERM, at the cost of higher per-hook overhead and a requirement
+#     that all arguments be pickleable. Falls back to "thread" mode
+#     automatically if arguments are not serializable.
+#   - "thread": runs hooks in a thread pool. Lighter-weight, but cannot
+#     interrupt pure-CPU busy loops because Python threads share the GIL.
 hook_timeout: 5.0
+hook_timeout_mode: process
 
 # --------------- Import ---------------
 

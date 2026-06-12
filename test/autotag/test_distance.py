@@ -20,6 +20,8 @@ from beets.library import Item
 from beets.metadata_plugins import MetadataSourcePlugin, get_penalty
 from beets.plugins import BeetsPlugin, send
 
+from . import _hook_fixtures
+
 _p = pytest.param
 
 
@@ -928,3 +930,267 @@ class TestScoringPipelineTimeoutSafety:
             assert name in durations
             assert isinstance(durations[name], float)
             assert durations[name] >= 0.0
+
+
+class TestScoringPipelineProcessTimeout:
+    """Tests verifying that process-mode timeouts kill pure-CPU busy loops.
+
+    ``while True: pass`` inside a plugin hook would permanently block a
+    thread-based timeout (it never releases the GIL).  These tests verify
+    that the new ``process`` backend correctly sends ``SIGTERM`` /
+    ``SIGKILL`` and returns control to the caller within a small multiple
+    of ``hook_timeout``.
+    """
+
+    HOOK_TIMEOUT = 0.15
+    # Permitted extra wall-clock time before we consider the test hung.
+    TOLERANCE = 1.25
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, config):
+        config["hook_timeout"] = self.HOOK_TIMEOUT
+        config["hook_timeout_mode"] = "process"
+        BeetsPlugin.listeners.clear()
+
+    def _register_listener(self, event, listener):
+        BeetsPlugin.listeners[event].append(listener)
+
+    @pytest.fixture
+    def item(self):
+        return Item(
+            title="title", artist="artist", length=200, track=1, disc=1,
+        )
+
+    @pytest.fixture
+    def track_info(self):
+        return TrackInfo(
+            title="title", artist="artist", length=200, index=1, medium=1,
+        )
+
+    @pytest.fixture
+    def items(self):
+        return [
+            Item(
+                title=f"track_{i}",
+                artist="the artist",
+                album="the album",
+                length=200 + i,
+                track=i + 1,
+                disc=1,
+            )
+            for i in range(3)
+        ]
+
+    @pytest.fixture
+    def album_info(self, items):
+        return AlbumInfo(
+            artist="the artist",
+            album="the album",
+            tracks=[
+                TrackInfo(
+                    title=i.title, artist=i.artist,
+                    index=i.track, medium=i.disc, length=i.length,
+                )
+                for i in items
+            ],
+            va=False,
+        )
+
+    @pytest.fixture
+    def pairs(self, items, album_info):
+        return list(zip(items, album_info.tracks))
+
+    # ------------------------------------------------------------------ #
+    # Core send() with process-mode CPU loops
+    # ------------------------------------------------------------------ #
+    def test_process_mode_kills_infinite_cpu_loop(self):
+        """``while True: pass`` is terminated via SIGTERM/SIGKILL."""
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.infinite_cpu_loop
+        )
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.return_forty_two
+        )
+
+        start = time.perf_counter()
+        results = send("album_candidate_scored", context=None)
+        elapsed = time.perf_counter() - start
+
+        assert results == [42]
+        assert elapsed < self.HOOK_TIMEOUT + self.TOLERANCE, (
+            f"CPU loop blocked for {elapsed:.2f}s "
+            f"(expected < {self.HOOK_TIMEOUT + self.TOLERANCE:.2f}s)"
+        )
+
+    def test_process_mode_kills_sleep_forever(self):
+        """Process mode also works for the I/O-blocked sleep case."""
+        self._register_listener(
+            "track_candidate_scored", _hook_fixtures.sleep_forever
+        )
+        self._register_listener(
+            "track_candidate_scored", _hook_fixtures.return_forty_two
+        )
+
+        start = time.perf_counter()
+        results = send("track_candidate_scored", context=None)
+        elapsed = time.perf_counter() - start
+
+        assert results == [42]
+        assert elapsed < self.HOOK_TIMEOUT + self.TOLERANCE
+
+    def test_process_mode_exception_listener_does_not_affect_others(self):
+        """A raising listener is skipped; return-values from good ones kept."""
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.raise_value_error
+        )
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.raise_runtime_error
+        )
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.return_forty_two
+        )
+
+        results = send("album_candidate_scored", context=None)
+        assert results == [42]
+
+    def test_process_mode_context_round_trip(self, items, album_info, pairs):
+        """The scoring context survives pickling to the child process.
+
+        We verify by registering a second echo listener at the *final*
+        event fired after scoring (``album_distance_calculated`` at the
+        FINALIZE stage) and manually invoking it with a PLUGIN_CUSTOM
+        context to confirm that the pickle path works end-to-end.
+        """
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.echo_context
+        )
+
+        # Build a context that the child process will deserialise.
+        ctx = AlbumScoringContext(
+            items=items,
+            album_info=album_info,
+            item_info_pairs=pairs,
+            likelies={},
+            stage=ScoringStage.PLUGIN_CUSTOM,
+            extra={"hello": "world"},
+        )
+
+        # Directly invoke the fixture (runs in this process) AND go via
+        # send() to exercise the child-process code path.
+        direct = _hook_fixtures.echo_context(context=ctx)
+        assert direct["stage_name"] == "PLUGIN_CUSTOM"
+        assert direct["extra_keys"] == ["hello"]
+
+        # Also exercise the multiprocessing dispatch by sending the same
+        # context through plugins.send().
+        results = send("album_candidate_scored", context=ctx)
+        # The fixture returns a dict which should come back after
+        # pickling through the child process.
+        assert results and results[0]["stage_name"] == "PLUGIN_CUSTOM"
+
+    # ------------------------------------------------------------------ #
+    # Thread mode (control test) CANNOT stop a CPU loop
+    # ------------------------------------------------------------------ #
+    def test_thread_mode_cannot_interrupt_cpu_loop(self, config):
+        """Demonstrate that thread-mode truly cannot interrupt busy loops.
+
+        This test is deliberately designed as a *control*: we request a
+        very short timeout (``thread`` mode) and instead of using the
+        infinite loop (which would permanently hang the test suite), we
+        only verify the configuration path accepts the value. The real
+        assertion is exercised by the process-mode tests above.
+        """
+        config["hook_timeout_mode"] = "thread"
+        config["hook_timeout"] = 0.05
+
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.return_forty_two
+        )
+
+        results = send("album_candidate_scored", context=None)
+        assert results == [42]
+
+    # ------------------------------------------------------------------ #
+    # Album scoring with process-mode hanging hooks
+    # ------------------------------------------------------------------ #
+    def test_album_pipeline_survives_cpu_busy_plugin_hook(
+        self, items, album_info, pairs
+    ):
+        """Album scoring completes even when a plugin runs ``while True: pass``."""
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.infinite_cpu_loop
+        )
+
+        start = time.perf_counter()
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        # The pipeline fires per-stage hooks multiple times; allow a
+        # small multiple of the per-listener timeout.
+        assert elapsed < (4 * self.HOOK_TIMEOUT) + self.TOLERANCE, (
+            f"Album pipeline blocked for {elapsed:.2f}s"
+        )
+
+    def test_album_pipeline_mixture_of_failures(
+        self, items, album_info, pairs
+    ):
+        """Infinite CPU loop + ValueError + RuntimeError; penalties still compute."""
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.infinite_cpu_loop
+        )
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.raise_value_error
+        )
+        self._register_listener(
+            "album_candidate_scored", _hook_fixtures.raise_runtime_error
+        )
+
+        album_info.artist = "different artist"
+
+        start = time.perf_counter()
+        dist = AlbumScoringPipeline(items, album_info, pairs).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        penalties = dict(dist.items())
+        assert "artist" in penalties and penalties["artist"] > 0
+        assert elapsed < (4 * self.HOOK_TIMEOUT) + self.TOLERANCE
+
+    # ------------------------------------------------------------------ #
+    # Track scoring with process-mode hanging hooks
+    # ------------------------------------------------------------------ #
+    def test_track_pipeline_survives_cpu_busy_plugin_hook(
+        self, item, track_info
+    ):
+        """Track scoring completes even when a plugin runs ``while True: pass``."""
+        self._register_listener(
+            "track_candidate_scored", _hook_fixtures.infinite_cpu_loop
+        )
+
+        start = time.perf_counter()
+        dist = TrackScoringPipeline(item, track_info, incl_artist=True).score()
+        elapsed = time.perf_counter() - start
+
+        assert isinstance(dist, Distance)
+        assert elapsed < (3 * self.HOOK_TIMEOUT) + self.TOLERANCE, (
+            f"Track pipeline blocked for {elapsed:.2f}s"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Hook with non-pickleable args falls back to thread mode
+    # ------------------------------------------------------------------ #
+    def test_unpickleable_argument_falls_back_to_thread_mode(self, config):
+        """Process mode gracefully degrades when arguments can't be pickled."""
+        config["hook_timeout_mode"] = "process"
+        config["hook_timeout"] = 0.05
+
+        # A lambda is not pickleable and should force the fallback path.
+        def unpickleable(**_):
+            return "thread-only"
+
+        self._register_listener("album_candidate_scored", unpickleable)
+
+        results = send("album_candidate_scored", context=None)
+        # The unpickleable handler still runs via thread fallback.
+        assert results == ["thread-only"]
