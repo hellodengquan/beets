@@ -451,6 +451,23 @@ def remove(self, delete=False, with_items=True):
 
 4. **关于 import 命令内的删除**：`beet import --delete` 同样走 `util.remove()`（`importer/tasks.py:356`），也不经回收站。同理 `beet convert --keep-new --delete-originals` 也是 `util.remove(source_path)`（`convert.py:692-698`），**整个 beets 生态中不存在任何"安全删除"抽象层**。
 
+**为何不集成 send2trash 等跨平台垃圾箱库**：
+
+1. **依赖缺失**：`pyproject.toml` 中完全没有 `send2trash`、`trash-cli`、`Send2Trash` 或任何垃圾箱相关依赖。整个代码库 `grep -ri "send2trash\|trash\|recycle"` 无任何结果（除本文档外）。
+
+2. **设计哲学考量**：
+   - beets 定位为"严肃的音乐库管理工具"，CLI 工具默认假定用户理解 `--delete` 的含义
+   - 跨平台垃圾箱行为不一致：macOS Finder 的"Put Back"、Linux freedesktop `~/.local/share/Trash`、Windows `$Recycle.Bin` 在 headless 服务器、Docker 容器、网络文件系统上经常不可用
+   - 已有更可控的替代方案：`--move` 到隔离区，由用户最终决定是否 `rm`，比依赖系统回收站更可靠
+
+3. **用户可自行扩展**：如果需要垃圾箱功能，可用 `--move` 指向系统垃圾箱路径模拟：
+   ```bash
+   # macOS
+   beet dup --move ~/.Trash/
+   # Linux (freedesktop)
+   beet dup --move ~/.local/share/Trash/files/
+   ```
+
 **风险等级**：极高，文件永久释放，无任何兜底
 
 ---
@@ -465,6 +482,78 @@ def remove(self, delete=False, with_items=True):
 | 移动 | `--move` | 更新路径 | 位置变化 | 部分可逆 | 中 | 手动移回 + 重新导入 |
 | 仅移除库 | `--remove` | 删除记录 | 保留 | 部分可逆 | 中低 | 重新导入 |
 | 彻底删除 | `--delete` | 删除记录 | 删除文件 | 不可逆 | 极高 | 无（靠备份） |
+
+---
+
+### 3.4 批量清理的事务回滚与部分失败处理
+
+**主循环无事务包裹**（`duplicates.py:190-212`）：
+
+```python
+for obj_id, obj_count, objs in self._duplicates(...):
+    if obj_id:
+        for o in objs:
+            self._process_item(o, ...)  # 每个 item 独立处理
+```
+
+> **关键事实**：
+> - 外层 `for o in objs:` 循环**没有任何 try-except**，也**没有包裹在数据库事务中**
+> - `_process_item()` 内部也没有 try-except 包装（除了 `--tag` 解析错误会 `raise UserError`）
+> - 一个 item 处理失败（如文件被占用、权限不足）会**立即终止整个批处理**，已处理的 item **不会回滚**
+
+**单个 item 的处理原子性**：
+
+每个 `item.remove(delete=True)` 的内部执行顺序（`library/models.py:1060-1086`）：
+
+```python
+def remove(self, delete=False, with_album=True):
+    super().remove()  # 1. 数据库删除（事务内）
+    # ...
+    if delete:
+        util.remove(self.path)     # 2. 文件硬删（事务外！）
+        util.prune_dirs(...)        # 3. 目录清理（事务外！）
+```
+
+**数据库层事务**（`dbcore/db.py:704-710`）仅包裹 SQL 操作：
+```python
+def remove(self):
+    with self.db.transaction() as tx:
+        tx.mutate(f"DELETE FROM {self._table} WHERE id=?", (self.id,))
+        tx.mutate(f"DELETE FROM {self._flex_table} WHERE entity_id=?", (self.id,))
+```
+
+**文件系统操作在事务外**。`Transaction.__exit__` 方法（`dbcore/db.py:988-1015`）仅处理数据库回滚：
+- 异常发生时，SQLite 事务会回滚（`return None` 不 suppress 异常）
+- 但 `util.remove()` 已经执行过的文件删除**不会回滚**
+
+**部分失败的典型场景**：
+
+假设批量清理 100 个重复项，第 50 个文件被另一进程锁定：
+
+| 阶段 | 已处理 49 个 | 第 50 个 | 剩余 50 个 |
+|------|-------------|----------|-----------|
+| 数据库删除 | ✓ 已提交 | ✗ 回滚 | ✗ 未执行 |
+| 文件硬删 | ✓ 已硬删 | ✗ 未执行（`OSError`） | ✗ 未执行 |
+| 目录清理 | ✓ 已清理 | ✗ 未执行 | ✗ 未执行 |
+
+**结果**：
+- 前 49 个文件永久删除，数据库记录也永久删除
+- 第 50 个文件完好，但因 SQL 回滚数据库记录也完好
+- 第 51-100 个完全未动
+- **无任何自动回滚机制**，出现"半删除"不一致状态
+
+**兜底手段**：
+
+1. **数据库备份**：批量操作前必须备份 SQLite 文件（参见 5.2 节）
+2. **分小批量执行**：用查询分片控制每次处理数量
+   ```bash
+   # 每次只处理 10 个，降低失败影响面
+   beet dup -k title -k albumartist --delete added-
+   ```
+3. **先 `--move` 后 `--delete`**：移动操作是可逆的（文件还在），确认无误再删
+4. **`--pretend` 预演**：convert 等命令支持 `--pretend`，但 duplicates 插件**不支持**，只能靠 `--tag` 打标后人工复核
+
+**代码验证**：duplicates 插件没有任何 `--pretend`/`--dry-run` 逻辑，也没有 `try: ... except: ... rollback` 结构。整个批处理是"尽力而为"的线性执行，失败即中断，无回滚。
 
 ---
 
@@ -700,6 +789,93 @@ def convert_on_import(self, _, item):
 
 ---
 
+### 7.6 与 fetchart、embedart 等下载型插件的钩子交互
+
+#### 7.6.1 事件监听器对比
+
+首先明确：**duplicates 插件不注册任何事件监听器**，它是一个纯命令驱动的后处理工具。
+
+**各插件监听的事件**：
+
+| 插件 | `import_stages` | `register_listener` 监听的事件 | 触发时机 |
+|------|----------------|------------------------------|---------|
+| **duplicates** | 无 | 无 | 仅手动执行 `beet dup` 时 |
+| **fetchart** | `[self.fetch_art]` | `import_task_files` → `self.assign_art` | 导入时抓取封面 |
+| **embedart** | 无 | `import_task_files` → `self.import_task_files` | 导入时嵌入封面 |
+| **lyrics** | `[self.imported]` | 无 | 导入后抓取歌词 |
+| **lastgenre** | `[self.imported]` | 无 | 导入后补全流派 |
+| **scrub** | 无 | `import_task_files` → `self.import_task_files` | 导入后清理元数据 |
+
+代码验证（`duplicates.py:34-61`）：
+```python
+class DuplicatesPlugin(BeetsPlugin):
+    def __init__(self):
+        super().__init__()
+        self.config.add({...})
+        self._command = Subcommand("duplicates", ...)
+        # 无 self.import_stages = [...]
+        # 无 self.register_listener(...)
+```
+
+#### 7.6.2 无直接钩子冲突，但存在间接影响
+
+**结论**：duplicates 插件与 fetchart 等下载型插件**不存在直接的钩子冲突**——它们监听的事件完全不重叠，执行时机完全分离。
+
+但存在以下**间接交互**：
+
+1. **fetchart 修改 `artpath` 字段**：
+   - `fetchart.fetch_art()` 下载封面后 `item.store()`（`fetchart.py:1403`）
+   - `fetchart.assign_art()` 设置 `album.artpath` 后 `album.store()`
+   - 如果 duplicates 的 `tiebreak.items` 配置包含 `artpath` 或封面相关字段，**导入前后排序优先级可能变化**
+
+2. **embedart 修改文件元数据**：
+   - `embedart.import_task_files()` 写入内嵌封面到文件
+   - 文件修改后 `mtime` 变化，若分组键含 `mtime` 会受影响
+   - 但默认分组键是 MBID，不受影响
+
+3. **事件广播的接收差异**：
+   - duplicates 执行 `item.remove()` 时会发送 `item_removed` 事件（`library/models.py:1077`）
+   - `plugins.send("item_removed", item=self)` 会广播给所有监听该事件的插件
+   - 但 fetchart/embedart/lyrics 等**都不监听** `item_removed` 事件（代码搜索无匹配）
+   - **不会出现"删了条目但封面还在下载"的竞态问题**
+
+4. **`database_change` 事件**：
+   - `item.store()` 和 `item.remove()` 都会发送 `database_change` 事件（`library/models.py:86-91`）
+   - fetchart 不监听此事件，无副作用
+
+#### 7.6.3 典型组合使用的注意事项
+
+| 场景 | 行为分析 | 风险 |
+|------|---------|------|
+| 先 `import`（fetchart/embedart 自动运行），后 `beet dup` | 下载型插件在 import 时已完成工作，duplicates 事后清理无冲突 | 低 |
+| `beet fetchart` 手动补封面期间跑 `beet dup --delete` | fetchart 正在写入文件时，duplicates 可能尝试删同一个文件 → `OSError` 导致批处理中断 | 中 |
+| 自定义 `tiebreak: [artpath]` + fetchart | 有封面的条目排序优先，无封面的可能被误删 | 中 |
+| `beet dup --merge --delete` + 刚导入的新条目 | merge 时可能从 fetchart 刚补的封面条目中取值填充 | 低（有益） |
+
+**规避方案**：
+1. 顺序执行：先完成 import 让所有下载型插件跑完，再执行 duplicates 清理
+2. 避免在 `tiebreak` 中使用可能动态变化的字段（如 `artpath`、`mtime`）
+3. 手动 `beet fetchart` 批量补封面时，不要并行跑 `beet dup --delete`
+
+#### 7.6.4 插件事件系统的执行模型
+
+`plugins.send()` 是**同步顺序执行**的（`plugins.py:642-655`）：
+```python
+def send(event, **arguments):
+    log.debug("Sending event: {}", event)
+    return [
+        r
+        for handler in BeetsPlugin.listeners[event]
+        if (r := handler(**arguments)) is not None
+    ]
+```
+
+- 无并行，无竞态
+- 监听者列表固定，duplicates 不注册任何监听
+- 因此不存在"多个插件同时修改同一个 item"的并发问题
+
+---
+
 ## 八、代码速查索引
 
 | 功能 | 文件位置 | 方法/行号 |
@@ -722,3 +898,6 @@ def convert_on_import(self, _, item):
 | **import 侧重复检测** | `beets/importer/tasks.py` | `find_duplicates()` L391-422 / L711-730 |
 | **import 侧删重复** | `beets/importer/tasks.py` | `remove_duplicates()` L272-292 / L734-746 |
 | **convert 导入时转码** | `beetsplug/convert.py` | `auto_convert()` / `convert_on_import()` L662-698 |
+| **事务回滚机制** | `beets/dbcore/db.py` | `Transaction.__exit__()` L988-1015 |
+| **事件广播机制** | `beets/plugins.py` | `send()` L642-655 |
+| **fetchart 注册监听** | `beetsplug/fetchart.py` | `__init__` L1403-1404 |
