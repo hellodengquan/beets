@@ -20,6 +20,7 @@ from beets.util.deprecation import deprecate_imports
 
 from .completion import completion_cmd
 from .config import config_cmd
+from .doctor import doctor_cmd
 from .fields import fields_cmd
 from .help import HelpCommand
 from .import_ import import_cmd
@@ -61,6 +62,7 @@ default_commands = [
     write_cmd,
     config_cmd,
     completion_cmd,
+    doctor_cmd,
 ]
 
 
