@@ -108,6 +108,11 @@ class ImportSession:
 
         Syncs the session's internal state (_is_resuming, _merged_items,
         _merged_dirs) into the session_snapshot object before persisting.
+
+        Uses the :meth:`ImportState.checkpoint` API with ``flush=False``
+        (non-blocking) because session snapshots are updated frequently
+        during import and do not need to block the main thread on
+        every write.
         """
         # Sync resumption flags to snapshot.
         for k, v in self._is_resuming.items():
@@ -115,8 +120,10 @@ class ImportSession:
         # Sync merged paths to snapshot.
         self.session_snapshot.add_merged_items(list(self._merged_items))
         self.session_snapshot.add_merged_dirs(list(self._merged_dirs))
-        # Persist to disk.
-        ImportState().save_session_snapshot(self.session_snapshot)
+        # Persist to disk (async).
+        state = ImportState()
+        state.save_session_snapshot(self.session_snapshot)
+        state.checkpoint(flush=False)
 
     def record_task_snapshot(self, task_snapshot: TaskSnapshot):
         """Record a task snapshot on the session and persist both."""
@@ -306,12 +313,9 @@ class ImportSession:
                 pass
             raise
         finally:
-            # Always persist the final session state.
+            # Always persist the final session state and flush to disk.
             self._persist_session_snapshot()
-            # Flush all pending async writes so state is durable before
-            # returning to the caller (and before any teardown / tempdir
-            # cleanup runs in tests).
-            ImportState.flush_pending_writes(timeout=30.0)
+            ImportState().checkpoint(flush=True, timeout=30.0)
 
     # Incremental and resumed imports
 
@@ -368,8 +372,11 @@ class ImportSession:
         user if they want to resume the import.
 
         Determines the return value of `is_resuming(toppath)`.
+        Uses :meth:`ImportState.try_resume` to discover pending tasks
+        from a previous run.
         """
-        if self.want_resume and ImportState().progress_has(toppath):
+        state = ImportState()
+        if self.want_resume and state.progress_has(toppath):
             # Either accept immediately or prompt for input to decide.
             if self.want_resume is True or self.should_resume(toppath):
                 log.warning(
@@ -377,10 +384,18 @@ class ImportSession:
                     util.displayable_path(toppath),
                 )
                 self._is_resuming[toppath] = True
+                # Report recoverable tasks via try_resume.
+                pending = state.try_resume(toppath=toppath, lib=self.lib)
+                if pending:
+                    log.debug(
+                        "Found {} resumable task(s) for {}",
+                        len(pending),
+                        util.displayable_path(toppath),
+                    )
             else:
                 # Clear progress; we're starting from the top.
-                ImportState().progress_reset(toppath)
+                state.progress_reset(toppath)
                 # Also clear any stale task snapshots for this path.
-                ImportState().clear_task_snapshots(toppath)
-                ImportState().clear_factory_snapshots(toppath)
+                state.clear_task_snapshots(toppath)
+                state.clear_factory_snapshots(toppath)
         self._persist_session_snapshot()

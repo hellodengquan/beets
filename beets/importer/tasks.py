@@ -147,11 +147,14 @@ class BaseImportTask:
         """Write the current task snapshot to disk.
 
         Called automatically whenever the task's state changes in a
-        way that should survive a crash. Subclasses may override to
-        add additional fields before saving.
+        way that should survive a crash. Uses
+        :meth:`ImportState.checkpoint` with ``flush=False`` so that
+        high-frequency stage transitions do not block the main thread.
         """
         self.snapshot.updated_at = time.time()
-        ImportState().save_task_snapshot(self.snapshot)
+        state = ImportState()
+        state.save_task_snapshot(self.snapshot)
+        state.checkpoint(flush=False)
 
     def _enter_stage(self, stage: TaskStage):
         """Transition the task into a new pipeline stage and persist."""
@@ -1023,7 +1026,7 @@ class ArchiveImportTask(SentinelImportTask):
         # Flush any pending async state writes that might be writing state
         # files into the extraction directory — otherwise the rmtree below
         # will fail with "Directory not empty".
-        ImportState.flush_pending_writes(timeout=10.0)
+        ImportState().checkpoint(flush=True, timeout=10.0)
 
         all_files_imported = move and not any(
             files for _, _, files in os.walk(util.syspath(self.toppath))
@@ -1116,10 +1119,16 @@ class ImportTaskFactory:
         self._persist_factory_snapshot()
 
     def _persist_factory_snapshot(self):
-        """Sync the counters into the snapshot and persist it."""
+        """Sync the counters into the snapshot and persist it.
+
+        Uses :meth:`ImportState.checkpoint` with ``flush=False`` to
+        avoid blocking the main import pipeline.
+        """
         self.factory_snapshot.skipped = self.skipped
         self.factory_snapshot.imported = self.imported
-        ImportState().save_factory_snapshot(self.toppath, self.factory_snapshot)
+        state = ImportState()
+        state.save_factory_snapshot(self.toppath, self.factory_snapshot)
+        state.checkpoint(flush=False)
 
     def tasks(self) -> Iterable[ImportTask]:
         """Yield all import tasks for music found in the user-specified

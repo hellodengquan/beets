@@ -380,7 +380,7 @@ class TestHelper(RunMixin, ConfigMixin):
         try:
             from beets.importer.state import ImportState
 
-            ImportState.flush_pending_writes(timeout=5.0)
+            ImportState().checkpoint(flush=True, timeout=5.0)
         except Exception:
             pass
         shutil.rmtree(self.temp_dir_path)

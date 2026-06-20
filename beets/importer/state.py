@@ -77,6 +77,8 @@ class DowngradedSnapshotWarning(Warning):
 # -----------------------------------------------------------------------------
 STATE_FILE_PERMISSIONS = 0o600
 
+SHUTDOWN_MAX_WAIT = 15.0
+
 # -----------------------------------------------------------------------------
 # Asynchronous checkpoint writer.
 # -----------------------------------------------------------------------------
@@ -256,25 +258,52 @@ class _AsyncStateWriter:
         except queue.Empty:
             return False
 
-    def shutdown(self):
+    def shutdown(self, max_wait: float | None = None):
         """Stop the worker thread, flushing pending work first.
 
         Idempotent: calling shutdown() multiple times is safe.
+
+        Parameters
+        ----------
+        max_wait:
+            Hard ceiling on how long (in seconds) the method may block.
+            Defaults to :data:`SHUTDOWN_MAX_WAIT`. When the ceiling is
+            reached, any remaining queued writes are **abandoned** and
+            the worker thread is left to die (it is a daemon). This
+            prevents atexit from hanging the process on very large
+            libraries.
         """
+        if max_wait is None:
+            max_wait = SHUTDOWN_MAX_WAIT
+
         with self._shutdown_lock:
             if self._shutdown_complete:
                 return
             self._shutdown_complete = True
 
-        # Drain all queued work.
-        self.flush(timeout=60.0)
+        deadline = time.monotonic() + max_wait
+
+        # Drain queued work, but respect the deadline.
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            self.flush(timeout=remaining)
+
         # Tell the worker to exit.
         try:
             self._queue.put_nowait(self._STOP)
         except queue.Full:
             pass
-        # Wait for the thread to actually exit.
-        self._worker.join(timeout=10.0)
+
+        # Wait for the thread, but respect the deadline.
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            self._worker.join(timeout=remaining)
+        else:
+            log.warning(
+                "Async state writer shutdown exceeded max_wait ({:.1f}s); "
+                "some pending writes may be lost.",
+                max_wait,
+            )
 
     # ---- internals -----------------------------------------------------------
 
@@ -422,6 +451,33 @@ class _AsyncStateWriter:
             )
         except Exception as exc:
             log.error("pickle state file could not be written: {}", exc)
+
+
+def _backup_corrupted_file(path: bytes) -> None:
+    """Rename a corrupted state file so it is not overwritten on the
+    next save but can still be inspected for manual recovery.
+
+    The backup name includes a timestamp so multiple failures produce
+    a clear sequence (``state.json.corrupt.1718956800``,
+    ``state.json.corrupt.1718956801``, …).
+    """
+    path_str = os.fsdecode(path)
+    if not os.path.exists(path_str):
+        return
+    backup = f"{path_str}.corrupt.{int(time.time())}"
+    try:
+        os.rename(path_str, backup)
+        log.warning(
+            "Corrupted state file renamed to {} for manual inspection",
+            backup,
+        )
+    except OSError as exc:
+        log.error(
+            "Could not rename corrupted state file {} to {}: {}",
+            path_str,
+            backup,
+            exc,
+        )
 
 
 def _write_with_perms(
@@ -866,8 +922,18 @@ class TaskSnapshot:
 
     @classmethod
     def from_json(cls, json_str: str) -> "TaskSnapshot":
-        """Deserialize a snapshot from a JSON string."""
-        return cls.from_dict(json.loads(json_str))
+        """Deserialize a snapshot from a JSON string.
+
+        Raises :class:`SnapshotMigrationError` if the JSON is malformed
+        or the resulting data cannot be parsed into a valid snapshot.
+        """
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise SnapshotMigrationError(
+                f"TaskSnapshot JSON parse error: {exc}"
+            ) from exc
+        return cls.from_dict(data)
 
     def verify_consistency(self, lib: library.Library | None) -> tuple[bool, str]:
         """Verify that this snapshot is consistent with the library database.
@@ -1156,8 +1222,17 @@ class SessionSnapshot:
 
     @classmethod
     def from_json(cls, json_str: str) -> "SessionSnapshot":
-        """Deserialize a session snapshot from a JSON string."""
-        return cls.from_dict(json.loads(json_str))
+        """Deserialize a session snapshot from a JSON string.
+
+        Raises :class:`SnapshotMigrationError` if the JSON is malformed.
+        """
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise SnapshotMigrationError(
+                f"SessionSnapshot JSON parse error: {exc}"
+            ) from exc
+        return cls.from_dict(data)
 
     def verify_consistency(self, lib: library.Library) -> tuple[bool, list[str]]:
         """Verify all task snapshots are consistent with the database.
@@ -1288,8 +1363,17 @@ class FactorySnapshot:
 
     @classmethod
     def from_json(cls, json_str: str) -> "FactorySnapshot":
-        """Deserialize from a JSON string."""
-        return cls.from_dict(json.loads(json_str))
+        """Deserialize from a JSON string.
+
+        Raises :class:`SnapshotMigrationError` if the JSON is malformed.
+        """
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise SnapshotMigrationError(
+                f"FactorySnapshot JSON parse error: {exc}"
+            ) from exc
+        return cls.from_dict(data)
 
 
 @dataclass
@@ -1406,15 +1490,17 @@ class ImportState:
         return os.fsencode(root + ".json")
 
     def _open(self):
-        # Try JSON format first (primary format), fallback to pickle.
+        # Try JSON format first (primary format), fallback to pickle,
+        # then fallback to empty state with a backup of the corrupted file.
         json_path = self._json_path()
+        loaded = False
 
         if os.path.exists(json_path):
             try:
                 with open(json_path, "r", encoding="utf-8") as f:
                     state = json.load(f)
                     self._deserialize_from_dict(state)
-                return
+                loaded = True
             except (OSError, json.JSONDecodeError, SnapshotMigrationError) as exc:
                 log.warning(
                     "JSON state file could not be read ({}), "
@@ -1422,73 +1508,115 @@ class ImportState:
                     os.fsdecode(json_path),
                     exc,
                 )
+                _backup_corrupted_file(json_path)
 
-        # Fall back to pickle format.
-        try:
-            with open(self.path, "rb") as f:
-                state = pickle.load(f)
-                self._deserialize_from_dict(state)
-        except Exception as exc:
-            log.debug("state file could not be read: {}", exc)
+        if not loaded and os.path.exists(self.path):
+            try:
+                with open(self.path, "rb") as f:
+                    state = pickle.load(f)
+                    self._deserialize_from_dict(state)
+                loaded = True
+            except Exception as exc:
+                log.warning(
+                    "Pickle state file could not be read ({}): {}. "
+                    "Starting with empty state.",
+                    os.fsdecode(self.path),
+                    exc,
+                )
+                _backup_corrupted_file(self.path)
+
+        if not loaded:
+            log.info(
+                "No usable state file found; starting with empty import state."
+            )
 
     def _deserialize_from_dict(self, state: dict[str, Any]) -> None:
         """Deserialize state from a dictionary (either JSON or pickle source).
 
         Handles both old pickle format (with raw objects) and new JSON
         format (with nested dicts that need to be rehydrated).
+
+        Each section is parsed inside its own try/except so that a
+        corrupt tagprogress does not prevent taghistory from being
+        loaded, and vice-versa.
         """
         # tagprogress: dict may be in JSON format (str keys/values) or
         # pickle format (bytes keys/values). Convert to bytes format.
-        tagprogress_raw = state.get("tagprogress", {})
-        self.tagprogress = {}
-        for k, v in tagprogress_raw.items():
-            key = os.fsencode(k) if isinstance(k, str) else k
-            value = [os.fsencode(p) if isinstance(p, str) else p for p in v]
-            self.tagprogress[key] = value
+        try:
+            tagprogress_raw = state.get("tagprogress", {})
+            self.tagprogress = {}
+            for k, v in tagprogress_raw.items():
+                key = os.fsencode(k) if isinstance(k, str) else k
+                value = [os.fsencode(p) if isinstance(p, str) else p for p in v]
+                self.tagprogress[key] = value
+        except Exception as exc:
+            log.warning(
+                "Corrupt tagprogress section, resetting: {}", exc
+            )
+            self.tagprogress = {}
 
         # taghistory may be a list (JSON) or set (pickle). Convert to set of tuples of bytes.
-        taghistory_raw = state.get("taghistory", [])
-        self.taghistory = set()
-        for paths in taghistory_raw:
-            converted_paths = tuple(
-                os.fsencode(p) if isinstance(p, str) else p
-                for p in paths
+        try:
+            taghistory_raw = state.get("taghistory", [])
+            self.taghistory = set()
+            for paths in taghistory_raw:
+                converted_paths = tuple(
+                    os.fsencode(p) if isinstance(p, str) else p
+                    for p in paths
+                )
+                self.taghistory.add(converted_paths)
+        except Exception as exc:
+            log.warning(
+                "Corrupt taghistory section, resetting: {}", exc
             )
-            self.taghistory.add(converted_paths)
+            self.taghistory = set()
 
-        task_snapshots_raw = state.get("task_snapshots", {})
-        self.task_snapshots = {}
-        for tid, raw in task_snapshots_raw.items():
-            try:
-                if isinstance(raw, dict):
-                    self.task_snapshots[tid] = TaskSnapshot.from_dict(raw)
-                else:
-                    self.task_snapshots[tid] = raw
-            except SnapshotMigrationError as e:
-                log.warning("Skipping corrupted task snapshot {}: {}", tid, e)
+        try:
+            task_snapshots_raw = state.get("task_snapshots", {})
+            self.task_snapshots = {}
+            for tid, raw in task_snapshots_raw.items():
+                try:
+                    if isinstance(raw, dict):
+                        self.task_snapshots[tid] = TaskSnapshot.from_dict(raw)
+                    else:
+                        self.task_snapshots[tid] = raw
+                except Exception as e:
+                    log.warning("Skipping corrupted task snapshot {}: {}", tid, e)
+        except Exception as exc:
+            log.warning("Corrupt task_snapshots section, resetting: {}", exc)
+            self.task_snapshots = {}
 
-        session_raw = state.get("session_snapshot", None)
-        if session_raw is not None:
-            try:
-                if isinstance(session_raw, dict):
-                    self.session_snapshot = SessionSnapshot.from_dict(session_raw)
-                else:
-                    self.session_snapshot = session_raw
-            except SnapshotMigrationError as e:
-                log.warning("Skipping corrupted session snapshot: {}", e)
-                self.session_snapshot = None
+        try:
+            session_raw = state.get("session_snapshot", None)
+            self.session_snapshot = None
+            if session_raw is not None:
+                try:
+                    if isinstance(session_raw, dict):
+                        self.session_snapshot = SessionSnapshot.from_dict(session_raw)
+                    else:
+                        self.session_snapshot = session_raw
+                except Exception as e:
+                    log.warning("Skipping corrupted session snapshot: {}", e)
+                    self.session_snapshot = None
+        except Exception as exc:
+            log.warning("Corrupt session_snapshot section, resetting: {}", exc)
+            self.session_snapshot = None
 
-        factory_snapshots_raw = state.get("factory_snapshots", {})
-        self.factory_snapshots = {}
-        for toppath, raw in factory_snapshots_raw.items():
-            try:
-                key = os.fsencode(toppath) if isinstance(toppath, str) else toppath
-                if isinstance(raw, dict):
-                    self.factory_snapshots[key] = FactorySnapshot.from_dict(raw)
-                else:
-                    self.factory_snapshots[key] = raw
-            except SnapshotMigrationError as e:
-                log.warning("Skipping corrupted factory snapshot: {}", e)
+        try:
+            factory_snapshots_raw = state.get("factory_snapshots", {})
+            self.factory_snapshots = {}
+            for toppath, raw in factory_snapshots_raw.items():
+                try:
+                    key = os.fsencode(toppath) if isinstance(toppath, str) else toppath
+                    if isinstance(raw, dict):
+                        self.factory_snapshots[key] = FactorySnapshot.from_dict(raw)
+                    else:
+                        self.factory_snapshots[key] = raw
+                except Exception as e:
+                    log.warning("Skipping corrupted factory snapshot {}: {}", toppath, e)
+        except Exception as exc:
+            log.warning("Corrupt factory_snapshots section, resetting: {}", exc)
+            self.factory_snapshots = {}
 
     def _save(self):
         """Schedule an asynchronous state write.
@@ -1627,6 +1755,71 @@ class ImportState:
                 snapshot.task_id,
                 tx_id,
             )
+
+    # --------------------------- Public Recovery API ---------------------------- #
+
+    def try_resume(
+        self,
+        toppath: PathBytes | None = None,
+        lib: library.Library | None = None,
+    ) -> list[TaskSnapshot]:
+        """Attempt to resume a previously interrupted import.
+
+        Loads persisted state from disk, verifies consistency with the
+        database, and returns a list of :class:`TaskSnapshot` objects
+        representing tasks that were **not** in a terminal state
+        (COMPLETED / SKIPPED) when the previous run was interrupted.
+
+        This is the primary entry point for crash recovery. Typical usage::
+
+            state = ImportState()
+            pending = state.try_resume(toppath=b"/music", lib=my_lib)
+            for snap in pending:
+                # Re-create and re-run the task from `snap.stage`.
+
+        Parameters
+        ----------
+        toppath:
+            Restrict to tasks under this top-level path. ``None`` returns
+            active tasks for all paths.
+        lib:
+            Library instance used to verify snapshot ↔ DB consistency.
+            Snapshots that are inconsistent with the DB are excluded
+            (with a warning) so that the recovery loop does not try to
+            replay already-committed work.
+
+        Returns
+        -------
+        list[TaskSnapshot]
+            Active (non-terminal) task snapshots, already verified for
+            consistency if *lib* was provided.
+        """
+        return self.get_active_task_snapshots(toppath=toppath, lib=lib)
+
+    def checkpoint(self, flush: bool = True, timeout: float = 30.0) -> None:
+        """Persist the current in-memory state to disk.
+
+        This is the high-level "save now" API for callers that need a
+        guarantee that their changes have reached durable storage. It
+        wraps the low-level ``_save`` + ``flush_pending_writes``
+        sequence and is the preferred replacement for ad-hoc
+        ``with ImportState() as state: …`` blocks followed by manual
+        flush calls.
+
+        Parameters
+        ----------
+        flush:
+            If ``True`` (the default), block until the write reaches
+            disk. If ``False``, just schedule the write and return
+            immediately (useful for non-critical, high-frequency
+            checkpoints where eventual durability is acceptable).
+        timeout:
+            Maximum time (in seconds) to wait for the flush when
+            ``flush=True``.
+        """
+        self._save()
+        if flush:
+            ImportState.flush_pending_writes(timeout=timeout)
 
     # -------------------------------- Tagprogress ------------------------------- #
 
