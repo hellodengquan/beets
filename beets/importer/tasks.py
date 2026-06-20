@@ -561,28 +561,50 @@ class ImportTask(BaseImportTask):
         plugins.send("import_task_files", session=session, task=self)
 
     def add(self, lib: library.Library):
-        """Add the items as an album to the library and remove replaced items."""
+        """Add the items as an album to the library and remove replaced items.
+
+        This method enforces the transaction-snapshot consistency contract:
+        the snapshot is only persisted to disk **after** the database
+        transaction has committed successfully. If the transaction rolls
+        back, the snapshot is not persisted, ensuring that recovery from
+        a crash will re-run the task.
+        """
         self._enter_stage(TaskStage.ADD)
         self.align_album_level_fields()
-        with lib.transaction():
-            self.record_replaced(lib)
-            self.remove_replaced(lib)
 
-            self.album = lib.add_album(self.imported_items())
-            self.snapshot.album_id = self.album.id
-            self.snapshot.imported_items_count = len(self.imported_items())
-            if self.choice_flag == Action.APPLY and isinstance(
-                self.match, AlbumMatch
-            ):
-                # Copy album flexible fields to the DB
-                # TODO: change the flow so we create the `Album` object earlier,
-                #   and we can move this into `self.apply_metadata`, just like
-                #   is done for tracks.
-                self.match.apply_album_metadata(self.album)
-                self.album.store()
+        tx_id = f"tx-{self.snapshot.task_id}-{int(time.time() * 1000000)}"
+        committed = False
 
-            self.reimport_metadata(lib)
-        self._persist_snapshot()
+        try:
+            with lib.transaction():
+                self.record_replaced(lib)
+                self.remove_replaced(lib)
+
+                self.album = lib.add_album(self.imported_items())
+                self.snapshot.album_id = self.album.id
+                self.snapshot.imported_items_count = len(self.imported_items())
+                if self.choice_flag == Action.APPLY and isinstance(
+                    self.match, AlbumMatch
+                ):
+                    # Copy album flexible fields to the DB
+                    # TODO: change the flow so we create the `Album` object earlier,
+                    #   and we can move this into `self.apply_metadata`, just like
+                    #   is done for tracks.
+                    self.match.apply_album_metadata(self.album)
+                    self.album.store()
+
+                self.reimport_metadata(lib)
+
+            committed = True
+        finally:
+            # Persist the snapshot only after the transaction outcome is known.
+            # This ensures that on recovery, we never replay a transaction
+            # that was already committed, and never skip one that wasn't.
+            ImportState().save_task_snapshot_after_tx(
+                self.snapshot,
+                tx_id=tx_id,
+                committed=committed,
+            )
 
     def record_replaced(self, lib: library.Library):
         """Records the replaced items and albums in the `replaced_items`
@@ -808,14 +830,32 @@ class SingletonImportTask(ImportTask):
                 )
 
     def add(self, lib):
+        """Add the singleton item to the library.
+
+        Enforces the transaction-snapshot consistency contract: the
+        snapshot is only persisted to disk after the database
+        transaction has committed successfully.
+        """
         self._enter_stage(TaskStage.ADD)
-        with lib.transaction():
-            self.record_replaced(lib)
-            self.remove_replaced(lib)
-            lib.add(self.item)
-            self.snapshot.imported_items_count = 1
-            self.reimport_metadata(lib)
-        self._persist_snapshot()
+
+        tx_id = f"tx-{self.snapshot.task_id}-{int(time.time() * 1000000)}"
+        committed = False
+
+        try:
+            with lib.transaction():
+                self.record_replaced(lib)
+                self.remove_replaced(lib)
+                lib.add(self.item)
+                self.snapshot.imported_items_count = 1
+                self.reimport_metadata(lib)
+
+            committed = True
+        finally:
+            ImportState().save_task_snapshot_after_tx(
+                self.snapshot,
+                tx_id=tx_id,
+                committed=committed,
+            )
 
     def infer_album_fields(self):
         raise NotImplementedError

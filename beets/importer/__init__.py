@@ -21,6 +21,7 @@ from .state import (
     FactorySnapshot,
     ImportState,
     SessionSnapshot,
+    SnapshotMigrationError,
     TaskSnapshot,
     TaskStage,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "SentinelImportTask",
     "SessionSnapshot",
     "SingletonImportTask",
+    "SnapshotMigrationError",
     "TaskSnapshot",
     "TaskStage",
 ]

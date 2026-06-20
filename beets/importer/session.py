@@ -104,10 +104,18 @@ class ImportSession:
         self._persist_session_snapshot()
 
     def _persist_session_snapshot(self):
-        """Write the current session snapshot to the state file."""
-        self.session_snapshot.is_resuming = dict(self._is_resuming)
-        self.session_snapshot.merged_items = set(self._merged_items)
-        self.session_snapshot.merged_dirs = set(self._merged_dirs)
+        """Write the current session snapshot to the state file.
+
+        Syncs the session's internal state (_is_resuming, _merged_items,
+        _merged_dirs) into the session_snapshot object before persisting.
+        """
+        # Sync resumption flags to snapshot.
+        for k, v in self._is_resuming.items():
+            self.session_snapshot.set_resuming(k, v)
+        # Sync merged paths to snapshot.
+        self.session_snapshot.add_merged_items(list(self._merged_items))
+        self.session_snapshot.add_merged_dirs(list(self._merged_dirs))
+        # Persist to disk.
         ImportState().save_session_snapshot(self.session_snapshot)
 
     def record_task_snapshot(self, task_snapshot: TaskSnapshot):
