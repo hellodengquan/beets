@@ -460,6 +460,12 @@ def _get_plugin(name: str) -> BeetsPlugin | None:
     within it, and return an instance. Handles import failures gracefully and
     logs warnings for missing plugins or loading errors.
 
+    Fatal exceptions raised during module import (e.g. SystemExit from a
+    misbehaving plugin, RecursionError from a circular dependency) are caught
+    and recorded as PluginLoadFailure entries so that the doctor command can
+    surface a friendly diagnosis instead of propagating into the beets
+    process.
+
     Note we load the *last* plugin class found in the plugin namespace. This
     allows plugins to define helper classes that inherit from BeetsPlugin
     without those being loaded as the main plugin class.
@@ -469,6 +475,13 @@ def _get_plugin(name: str) -> BeetsPlugin | None:
     try:
         try:
             namespace = import_module(f"{PLUGIN_NAMESPACE}.{name}")
+        except (
+            RecursionError,
+            MemoryError,
+            KeyboardInterrupt,
+            SystemExit,
+        ) as exc:
+            raise PluginImportError(name) from exc
         except Exception as exc:
             raise PluginImportError(name) from exc
 
@@ -478,14 +491,20 @@ def _get_plugin(name: str) -> BeetsPlugin | None:
                 and issubclass(obj, BeetsPlugin)
                 and obj != BeetsPlugin
                 and not inspect.isabstract(obj)
-                # Only consider this plugin's module or submodules to avoid
-                # conflicts when plugins import other BeetsPlugin classes
                 and (
                     obj.__module__ == namespace.__name__
                     or obj.__module__.startswith(f"{namespace.__name__}.")
                 )
             ):
-                return obj()
+                try:
+                    return obj()
+                except (
+                    RecursionError,
+                    MemoryError,
+                    KeyboardInterrupt,
+                    SystemExit,
+                ) as exc:
+                    raise PluginImportError(name) from exc
 
     except Exception as exc:
         log.warning("** error loading plugin {}", name, exc_info=True)

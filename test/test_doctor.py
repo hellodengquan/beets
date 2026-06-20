@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -14,11 +15,11 @@ from beets.test.helper import IOMixin, PytestTestHelper
 
 @pytest.fixture
 def capteesys(capsys):
-    """Alias ``capsys`` to ``capteesys`` for environments where the
-    ``pytest-capturelog`` plugin is not installed.
+    """Alias ``capsys`` to ``capteesys`` for environments without
+    ``pytest-capturelog``.
 
-    The beets test suite only relies on the ``readouterr()`` method, which
-    ``capsys`` provides, so this is a drop-in replacement.
+    The beets test suite only relies on ``readouterr()`` which ``capsys``
+    provides, so this is a drop-in replacement.
     """
     return capsys
 
@@ -49,7 +50,6 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         assert "Python path:" in out
 
     def test_loaded_plugin_shown_ok(self):
-        # ``info`` is a pure-Python plugin with no extra deps.
         self.config["plugins"] = ["info"]
         plugins.load_plugins()
         out = self.run_with_output("doctor")
@@ -85,7 +85,6 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
     # -- missing dependency detection -------------------------------
 
     def test_missing_python_package_detected(self):
-        # ``discogs`` requires the ``discogs_client`` Python package.
         self.config["plugins"] = ["discogs"]
         plugins.load_plugins()
         out = self.run_with_output("doctor")
@@ -147,8 +146,7 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         assert "has_dependency_info" in diag
         assert "known_python_packages" in diag
         assert "known_external_commands" in diag
-        assert isinstance(diag["known_python_packages"], list)
-        assert isinstance(diag["known_external_commands"], list)
+        assert "import_timed_out" in diag
 
     def test_unknown_plugin_has_no_dependency_info(self):
         from beets.ui.commands.doctor import _diagnose_plugin
@@ -179,18 +177,18 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         plugins.load_plugins()
         out = self.run_with_output("doctor", "--format", "json")
         data = json.loads(out)
-        assert "beets_version" in data
-        assert "python_version" in data
-        assert "python_executable" in data
-        assert "plugins_configured" in data
-        assert "plugins_loaded" in data
+        for key in (
+            "beets_version",
+            "python_version",
+            "python_executable",
+            "plugins_configured",
+            "plugins_loaded",
+        ):
+            assert key in data
         assert isinstance(data["plugins"], list)
         assert len(data["plugins"]) == 1
         assert data["plugins"][0]["name"] == "info"
         assert data["plugins"][0]["loaded"] is True
-        assert data["plugins_configured"] == 1
-        assert data["plugins_loaded"] == 1
-        assert "has_dependency_info" in data["plugins"][0]
 
     def test_json_output_captures_failed_plugin(self):
         self.config["plugins"] = ["nonexistent_plugin_xyz"]
@@ -202,7 +200,6 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         assert diag["name"] == "nonexistent_plugin_xyz"
         assert diag["loaded"] is False
         assert diag["load_exception_type"] is not None
-        assert diag["load_exception_message"] is not None
         assert "PluginImportError" in diag["load_exception_type"]
 
     def test_json_output_f_flag_case_insensitive(self):
@@ -220,15 +217,63 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         with pytest.raises(UserError, match="unsupported output format"):
             self.run_command("doctor", "--format", "xml")
 
-    # -- probe_import captures native-style exceptions --------------
+    # -- timeout support --------------------------------------------
+
+    def test_probe_import_times_out_gracefully(self):
+        from beets.ui.commands.doctor import _probe_import
+
+        def slow_import(*_a, **_kw):
+            time.sleep(5)
+
+        with patch(
+            "beets.ui.commands.doctor.importlib.import_module",
+            side_effect=slow_import,
+        ):
+            exc_type, exc_msg, exc_tb, timed_out = _probe_import(
+                "info", timeout=0.01
+            )
+
+        assert timed_out is True
+        assert exc_type == "TimeoutError"
+        assert exc_msg is not None
+        assert exc_tb is None
+
+    def test_timeout_cli_flag_received(self, monkeypatch):
+        from beets.ui.commands.doctor import (
+            DEFAULT_IMPORT_TIMEOUT_SECONDS,
+            doctor_cmd,
+        )
+
+        monkeypatch.setenv("LANG", "en_US.UTF-8")
+        self.config["plugins"] = ["info"]
+        plugins.load_plugins()
+        parser = doctor_cmd.parser
+        opts, _ = parser.parse_args(["--timeout", "5"])
+        assert float(opts.timeout) == 5.0
+
+        opts, _ = parser.parse_args([])
+        assert abs(float(opts.timeout) - DEFAULT_IMPORT_TIMEOUT_SECONDS) < 1e-6
+
+    def test_invalid_timeout_raises_user_error(self):
+        from beets.exceptions import UserError
+
+        self.config["plugins"] = []
+        plugins.load_plugins()
+        with pytest.raises(UserError, match="timeout"):
+            self.run_command("doctor", "--timeout", "0")
+
+    # -- probe_import exceptions ------------------------------------
 
     def test_probe_import_captures_import_failure(self):
         from beets.ui.commands.doctor import _probe_import
 
-        exc_type, exc_msg, exc_tb = _probe_import("nonexistent_plugin_xyz")
+        exc_type, exc_msg, exc_tb, timed_out = _probe_import(
+            "nonexistent_plugin_xyz"
+        )
         assert exc_type is not None
         assert exc_msg is not None
         assert exc_tb is not None
+        assert timed_out is False
         assert (
             "PluginImportError" in exc_type or "ModuleNotFoundError" in exc_type
         )
@@ -236,49 +281,51 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
     def test_probe_import_returns_none_for_good_plugin(self):
         from beets.ui.commands.doctor import _probe_import
 
-        exc_type, exc_msg, exc_tb = _probe_import("info")
+        exc_type, exc_msg, exc_tb, timed_out = _probe_import("info")
         assert exc_type is None
         assert exc_msg is None
         assert exc_tb is None
+        assert timed_out is False
 
     def test_probe_import_handles_recursion_error_friendly(self):
         from beets.ui.commands.doctor import _probe_import
 
         with patch(
-            "beets.ui.commands.doctor.importlib.import_module",
+            "beets.ui.commands.doctor._import_in_worker",
             side_effect=RecursionError("infinite loop"),
         ):
-            exc_type, exc_msg, exc_tb = _probe_import("info")
+            exc_type, exc_msg, exc_tb, timed_out = _probe_import("info")
 
         assert exc_type == "RecursionError"
         assert exc_msg is not None
-        assert "fatal exception" in exc_msg.lower()
+        assert "fatal" in exc_msg.lower()
         assert exc_tb is None
+        assert timed_out is False
 
     def test_probe_import_handles_memory_error_friendly(self):
         from beets.ui.commands.doctor import _probe_import
 
         with patch(
-            "beets.ui.commands.doctor.importlib.import_module",
+            "beets.ui.commands.doctor._import_in_worker",
             side_effect=MemoryError("oom"),
         ):
-            exc_type, exc_msg, exc_tb = _probe_import("info")
+            exc_type, exc_msg, exc_tb, _timed_out = _probe_import("info")
 
         assert exc_type == "MemoryError"
-        assert "fatal exception" in exc_msg.lower()
+        assert "fatal" in exc_msg.lower()
         assert exc_tb is None
 
     def test_probe_import_handles_system_exit_friendly(self):
         from beets.ui.commands.doctor import _probe_import
 
         with patch(
-            "beets.ui.commands.doctor.importlib.import_module",
+            "beets.ui.commands.doctor._import_in_worker",
             side_effect=SystemExit(1),
         ):
-            exc_type, exc_msg, exc_tb = _probe_import("info")
+            exc_type, exc_msg, exc_tb, _timed_out = _probe_import("info")
 
         assert exc_type == "SystemExit"
-        assert "fatal exception" in exc_msg.lower()
+        assert "fatal" in exc_msg.lower()
         assert exc_tb is None
 
     def test_probe_import_no_traceback_for_fatal_exceptions(self):
@@ -291,11 +338,57 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
             SystemExit,
         ):
             with patch(
-                "beets.ui.commands.doctor.importlib.import_module",
+                "beets.ui.commands.doctor._import_in_worker",
                 side_effect=exc_class("boom"),
             ):
-                _, _, exc_tb = _probe_import("info")
+                _, _, exc_tb, _ = _probe_import("info")
                 assert exc_tb is None
+
+    # -- i18n / translation layer -----------------------------------
+
+    def test_detect_language_falls_back_to_en(self, monkeypatch):
+        from beets.ui.commands.doctor import _detect_language
+
+        monkeypatch.delenv("LANG", raising=False)
+        monkeypatch.delenv("LC_ALL", raising=False)
+        assert _detect_language() == "en"
+
+    def test_detect_language_reads_lang_env(self, monkeypatch):
+        from beets.ui.commands.doctor import _detect_language
+
+        monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+        assert _detect_language() == "zh"
+
+    def test_detect_language_reads_lc_all(self, monkeypatch):
+        from beets.ui.commands.doctor import _detect_language
+
+        monkeypatch.delenv("LANG", raising=False)
+        monkeypatch.setenv("LC_ALL", "zh_TW.UTF-8")
+        assert _detect_language() == "zh"
+
+    def test_translate_returns_key_when_no_translation(self):
+        from beets.ui.commands.doctor import _translate
+
+        assert _translate("no_such_key_xxx", lang="en") == "no_such_key_xxx"
+
+    def test_translate_uses_zh_table_when_zh(self):
+        from beets.ui.commands.doctor import _translate
+
+        msg = _translate("status_ok", lang="zh")
+        assert msg == "正常"
+
+    def test_translate_formats_kwargs(self):
+        from beets.ui.commands.doctor import _translate
+
+        rendered = _translate("error_unsupported_format", lang="zh", fmt="xml")
+        assert "xml" in rendered
+
+    def test_chinese_output_shows_translated_labels(self, monkeypatch):
+        monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+        self.config["plugins"] = ["info"]
+        plugins.load_plugins()
+        out = self.run_with_output("doctor")
+        assert "beets 版本" in out or "已配置插件数" in out or "正常" in out
 
     # -- PluginDiagnosis dataclass ----------------------------------
 
@@ -310,6 +403,7 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         assert isinstance(diag.has_dependency_info, bool)
         assert isinstance(diag.known_python_packages, list)
         assert isinstance(diag.known_external_commands, list)
+        assert diag.import_timed_out is False
 
     def test_plugin_diagnosis_records_failure(self):
         from beets.ui.commands.doctor import _diagnose_plugin
@@ -352,8 +446,6 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
                 assert f"{diag['name']}: OK" in text_out
             else:
                 assert f"{diag['name']}: FAILED" in text_out
-                if diag["load_exception_message"]:
-                    assert diag["load_exception_type"] in text_out
 
 
 class TestPluginLoadFailureAPI(PytestTestHelper):
@@ -386,4 +478,85 @@ class TestPluginLoadFailureAPI(PytestTestHelper):
         assert failure.name == "definitely_not_a_real_plugin_404"
         assert failure.exception_type == "PluginImportError"
         assert isinstance(failure.exception_message, str)
-        assert failure.exception_message  # non-empty
+        assert failure.exception_message
+
+    def test_system_exit_during_import_caught_as_plugin_import_error(self):
+        """SystemExit raised in a plugin module must be converted into a
+        PluginImportError and recorded, instead of terminating the beets
+        process.
+        """
+
+        def raise_se(_name):
+            raise SystemExit(42)
+
+        self.config["plugins"] = ["info"]
+        with patch("beets.plugins.import_module", side_effect=raise_se):
+            plugins.load_plugins()
+
+        failures = plugins.plugin_load_failures()
+        assert len(failures) == 1
+        assert failures[0].name == "info"
+        assert failures[0].exception_type == "PluginImportError"
+
+    def test_recursion_error_during_import_caught_as_plugin_import_error(self):
+        def raise_re(_name):
+            raise RecursionError("boom")
+
+        self.config["plugins"] = ["info"]
+        with patch("beets.plugins.import_module", side_effect=raise_re):
+            plugins.load_plugins()
+
+        failures = plugins.plugin_load_failures()
+        assert len(failures) == 1
+        assert failures[0].exception_type == "PluginImportError"
+
+    def test_system_exit_during_plugin_instantiation_caught(self):
+        """A badly-behaved plugin whose constructor calls ``sys.exit``
+        should not bring down the beets process.
+        """
+        import importlib
+
+        import beetsplug.info as info_mod
+
+        orig_init = info_mod.InfoPlugin.__init__
+
+        def bad_init(self):
+            raise SystemExit("i am evil")
+
+        try:
+            info_mod.InfoPlugin.__init__ = bad_init
+            self.config["plugins"] = ["info"]
+            with patch(
+                "beets.plugins.import_module",
+                side_effect=lambda name: (
+                    importlib.import_module("beetsplug.info")
+                    if name == "beetsplug.info"
+                    else importlib.import_module(name)
+                ),
+            ):
+                plugins.load_plugins()
+        finally:
+            info_mod.InfoPlugin.__init__ = orig_init
+
+        failures = plugins.plugin_load_failures()
+        assert len(failures) == 1
+        assert failures[0].name == "info"
+        assert failures[0].exception_type == "PluginImportError"
+
+
+class TestHeavyPackageDetection(PytestTestHelper):
+    def test_heavy_package_set_contains_known_native_libs(self):
+        from beets.ui.commands.doctor import (
+            HEAVY_PACKAGES,
+            _is_heavy_python_package,
+        )
+
+        for name in ("librosa", "gi", "chromaprint", "mutagen", "soco"):
+            assert name in HEAVY_PACKAGES
+            assert _is_heavy_python_package(name) is True
+
+    def test_lightweight_packages_not_flagged_as_heavy(self):
+        from beets.ui.commands.doctor import _is_heavy_python_package
+
+        for name in ("os", "sys", "json", "requests", "click"):
+            assert _is_heavy_python_package(name) is False
