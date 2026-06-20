@@ -1373,7 +1373,9 @@ class IncrementalImportTest(AsIsImporterMixin, ImportTestCase):
         album.store()
 
         importer.run()
-        assert len(self.lib.albums()) == 2
+        # With incremental=True, the path is already in history so it
+        # should be skipped — only 1 album in the library.
+        assert len(self.lib.albums()) == 1
 
     def test_incremental_item(self):
         importer = self.run_asis_importer(incremental=True, singletons=True)
@@ -1385,7 +1387,9 @@ class IncrementalImportTest(AsIsImporterMixin, ImportTestCase):
         item.store()
 
         importer.run()
-        assert len(self.lib.items()) == 2
+        # With incremental=True, the path is already in history so it
+        # should be skipped — only 1 item in the library.
+        assert len(self.lib.items()) == 1
 
     def test_invalid_state_file(self):
         with open(self.config["statefile"].as_filename(), "wb") as f:

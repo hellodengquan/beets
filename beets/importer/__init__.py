@@ -18,10 +18,12 @@ autotagging music files.
 
 from .session import ImportAbortError, ImportSession
 from .state import (
+    DowngradedSnapshotWarning,
     FactorySnapshot,
     ImportState,
     SessionSnapshot,
     SnapshotMigrationError,
+    STATE_FILE_PERMISSIONS,
     TaskSnapshot,
     TaskStage,
 )
@@ -38,6 +40,7 @@ from .tasks import (
 __all__ = [
     "Action",
     "ArchiveImportTask",
+    "DowngradedSnapshotWarning",
     "FactorySnapshot",
     "ImportAbortError",
     "ImportSession",
@@ -47,6 +50,7 @@ __all__ = [
     "SessionSnapshot",
     "SingletonImportTask",
     "SnapshotMigrationError",
+    "STATE_FILE_PERMISSIONS",
     "TaskSnapshot",
     "TaskStage",
 ]

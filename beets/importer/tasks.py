@@ -1020,6 +1020,11 @@ class ArchiveImportTask(SentinelImportTask):
         if not self.extracted:
             return
 
+        # Flush any pending async state writes that might be writing state
+        # files into the extraction directory — otherwise the rmtree below
+        # will fail with "Directory not empty".
+        ImportState.flush_pending_writes(timeout=10.0)
+
         all_files_imported = move and not any(
             files for _, _, files in os.walk(util.syspath(self.toppath))
         )

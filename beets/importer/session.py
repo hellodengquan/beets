@@ -308,6 +308,10 @@ class ImportSession:
         finally:
             # Always persist the final session state.
             self._persist_session_snapshot()
+            # Flush all pending async writes so state is durable before
+            # returning to the caller (and before any teardown / tempdir
+            # cleanup runs in tests).
+            ImportState.flush_pending_writes(timeout=30.0)
 
     # Incremental and resumed imports
 

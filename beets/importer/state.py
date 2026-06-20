@@ -14,10 +14,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import pickle
+import queue
+import stat
+import threading
 import time
 import uuid
 from bisect import bisect_left, insort
@@ -51,6 +55,339 @@ class SnapshotMigrationError(Exception):
     """Raised when a snapshot cannot be migrated from an old schema version."""
 
     pass
+
+
+class DowngradedSnapshotWarning(Warning):
+    """Warning emitted when a snapshot from a newer schema version has been
+    partially deserialized in "best effort" downgrade mode.
+
+    When this warning is emitted, the snapshot will contain only the fields
+    that are still understood by the current code version; any fields
+    introduced in a later schema version are silently dropped. The
+    snapshot is marked with ``downgraded_from_version`` so callers can
+    decide whether to trust it.
+    """
+
+    pass
+
+
+# -----------------------------------------------------------------------------
+# File permissions: 0o600 = owner read/write only.
+# -----------------------------------------------------------------------------
+STATE_FILE_PERMISSIONS = 0o600
+
+# -----------------------------------------------------------------------------
+# Asynchronous checkpoint writer.
+# -----------------------------------------------------------------------------
+# To avoid blocking the main import thread on IO for very large libraries
+# (50k+ tracks), state saves are written out on a background worker. Writes
+# are coalesced: if a new save request arrives while the previous one is
+# still on the queue, only the latest is performed. Flush/await is provided
+# for call sites that need a guarantee (e.g., after a DB commit).
+# -----------------------------------------------------------------------------
+
+class _AsyncStateWriter:
+    """Background thread that persists ImportState snapshots to disk.
+
+    Usage
+    -----
+    ``submit(state_instance)`` schedules a save. The instance's in-memory
+    data is captured at submission time, so later mutations don't affect
+    the pending write.
+
+    ``flush()`` blocks until all queued work is done (used for shutdown
+    and for callers that need durability guarantees, e.g. right after a
+    database commit).
+    """
+
+    _instance: "_AsyncStateWriter | None" = None
+    _instance_lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls) -> "_AsyncStateWriter":
+        """Return the process-wide singleton, starting the worker if needed."""
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    @classmethod
+    def reset_for_testing(cls):
+        """Destroy the singleton (tests only)."""
+        with cls._instance_lock:
+            if cls._instance is not None:
+                cls._instance.shutdown()
+                cls._instance = None
+
+    def __init__(self):
+        # Sentinel used to tell the worker to stop.
+        self._STOP = object()
+
+        self._queue: "queue.Queue[Any]" = queue.Queue()
+        # Track the "latest" submission keyed by state file path, so we can
+        # skip stale items when draining the queue.
+        self._generation: dict[bytes, int] = {}
+        self._generation_lock = threading.Lock()
+
+        self._worker = threading.Thread(
+            target=self._run,
+            name="beets-import-state-writer",
+            daemon=True,
+        )
+        self._worker.start()
+
+        # Ensure graceful shutdown at interpreter exit.
+        atexit.register(self.shutdown)
+
+    # ---- public API ----------------------------------------------------------
+
+    def submit(self, state: "ImportState"):
+        """Queue a state for asynchronous persistence.
+
+        The call returns immediately. Multiple calls for the same state
+        file before the worker runs are coalesced.
+        """
+        json_path = state._json_path()
+        pickle_path = state.path
+
+        # Bump the generation counter for this file.
+        with self._generation_lock:
+            gen = self._generation.get(pickle_path, 0) + 1
+            self._generation[pickle_path] = gen
+
+        # Capture the current in-memory state so future mutations don't
+        # leak into the pending save.
+        payload = (
+            pickle_path,
+            json_path,
+            gen,
+            # tagprogress / taghistory are plain containers; shallow copy is
+            # enough because we never mutate their entries in-place.
+            dict(state.tagprogress),
+            set(state.taghistory),
+            # Snapshots are immutable by convention (callers replace, don't
+            # mutate in place), so a shallow copy of the container is fine.
+            dict(state.task_snapshots),
+            state.session_snapshot,
+            dict(state.factory_snapshots),
+        )
+        self._queue.put(payload)
+
+    def flush(self, timeout: float | None = 10.0) -> bool:
+        """Wait until the queue is drained. Returns True on success, False on timeout."""
+        # Push a sentinel "barrier" item and wait for the worker to echo it back.
+        done: "queue.Queue[None]" = queue.Queue(maxsize=1)
+        self._queue.put(("__flush_barrier__", done))
+        try:
+            done.get(timeout=timeout)
+            return True
+        except queue.Empty:
+            return False
+
+    def shutdown(self):
+        """Stop the worker thread, flushing pending work first."""
+        self.flush(timeout=30.0)
+        try:
+            self._queue.put_nowait(self._STOP)
+        except queue.Full:
+            pass
+        self._worker.join(timeout=5.0)
+
+    # ---- internals -----------------------------------------------------------
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._STOP:
+                    return
+
+                if isinstance(item, tuple) and item and item[0] == "__flush_barrier__":
+                    _, done_q = item
+                    try:
+                        done_q.put_nowait(None)
+                    except queue.Full:
+                        pass
+                    continue
+
+                (
+                    pickle_path,
+                    json_path,
+                    gen,
+                    tagprogress,
+                    taghistory,
+                    task_snapshots,
+                    session_snapshot,
+                    factory_snapshots,
+                ) = item
+
+                # Skip this payload if a newer generation was submitted for
+                # the same file while we were sitting on the queue.
+                with self._generation_lock:
+                    latest = self._generation.get(pickle_path, 0)
+                    if gen < latest:
+                        log.debug(
+                            "Skipping stale state save for {} (gen {} < {})",
+                            os.fsdecode(pickle_path),
+                            gen,
+                            latest,
+                        )
+                        continue
+
+                # Perform the actual disk writes.
+                self._do_save(
+                    pickle_path=pickle_path,
+                    json_path=json_path,
+                    tagprogress=tagprogress,
+                    taghistory=taghistory,
+                    task_snapshots=task_snapshots,
+                    session_snapshot=session_snapshot,
+                    factory_snapshots=factory_snapshots,
+                )
+            except Exception as exc:
+                # Never let the worker die — log and keep going.
+                log.error("Unhandled error in async state writer: {}", exc)
+            finally:
+                self._queue.task_done()
+
+    @staticmethod
+    def _do_save(
+        pickle_path: bytes,
+        json_path: bytes,
+        tagprogress: dict,
+        taghistory: set,
+        task_snapshots: dict,
+        session_snapshot: SessionSnapshot | None,
+        factory_snapshots: dict,
+    ):
+        """Write both the JSON and pickle files to disk with 0o600 permissions.
+
+        Gracefully handles the case where the target directory has been
+        removed (common in tests, or when interrupted imports are aborted
+        and their temp dirs cleaned up elsewhere).
+        """
+        pickle_path_str = os.fsdecode(pickle_path)
+        json_path_str = os.fsdecode(json_path)
+
+        # Quick pre-flight check: if the parent dir is gone, don't even try.
+        # This avoids noisy log errors in common teardown scenarios.
+        pickle_dir = os.path.dirname(pickle_path_str)
+        if not os.path.isdir(pickle_dir):
+            log.debug(
+                "Skipping state save: target directory {} no longer exists",
+                pickle_dir,
+            )
+            return
+
+        # --- JSON (primary format) -------------------------------------------
+        try:
+            tagprogress_json = {
+                os.fsdecode(k): [os.fsdecode(p) for p in v]
+                for k, v in tagprogress.items()
+            }
+            taghistory_json = [
+                [os.fsdecode(p) for p in paths]
+                for paths in taghistory
+            ]
+            task_snapshots_json = {
+                tid: snap.to_dict() for tid, snap in task_snapshots.items()
+            }
+            factory_snapshots_json = {
+                os.fsdecode(toppath): snap.to_dict()
+                for toppath, snap in factory_snapshots.items()
+            }
+            state_dict = {
+                "schema_version": 1,
+                "tagprogress": tagprogress_json,
+                "taghistory": taghistory_json,
+                "task_snapshots": task_snapshots_json,
+                "session_snapshot": (
+                    session_snapshot.to_dict() if session_snapshot else None
+                ),
+                "factory_snapshots": factory_snapshots_json,
+                "saved_at": time.time(),
+            }
+            _write_with_perms(json_path, "w", STATE_FILE_PERMISSIONS, lambda f:
+                json.dump(state_dict, f, indent=2, sort_keys=True)
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            log.debug(
+                "Target directory vanished while writing JSON state to {}",
+                json_path_str,
+            )
+        except Exception as exc:
+            log.error("JSON state file could not be written: {}", exc)
+
+        # --- pickle (backward compat) ----------------------------------------
+        try:
+            _write_with_perms(pickle_path, "wb", STATE_FILE_PERMISSIONS, lambda f:
+                pickle.dump(
+                    {
+                        "tagprogress": tagprogress,
+                        "taghistory": taghistory,
+                        "task_snapshots": task_snapshots,
+                        "session_snapshot": session_snapshot,
+                        "factory_snapshots": factory_snapshots,
+                    },
+                    f,
+                )
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            log.debug(
+                "Target directory vanished while writing pickle state to {}",
+                pickle_path_str,
+            )
+        except Exception as exc:
+            log.error("pickle state file could not be written: {}", exc)
+
+
+def _write_with_perms(
+    path: bytes,
+    mode: str,
+    perms: int,
+    writer,
+):
+    """Write ``path`` using ``writer(fh)``, ensuring the file ends up with ``perms``.
+
+    Uses ``os.open`` + ``os.fdopen`` so that the permissions are set
+    atomically on creation (no TOCTOU race). If the file already exists,
+    permissions are updated via ``os.chmod`` after the write.
+    """
+    path_str = os.fsdecode(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if "b" not in mode:
+        flags |= getattr(os, "O_NOFOLLOW", 0)  # Best-effort: no symlink traps.
+
+    fd = -1
+    try:
+        fd = os.open(path_str, flags, perms)
+    except OSError as exc:
+        log.error("Could not open state file {} for writing: {}", path_str, exc)
+        return
+
+    write_ok = False
+    try:
+        with os.fdopen(fd, mode) as f:
+            writer(f)
+            fd = -1  # fd now owned by fp
+        write_ok = True
+    except OSError as exc:
+        log.error("Could not write state file {}: {}", path_str, exc)
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd = -1
+
+    # os.open with mode *ignores* perms when the file already exists on most
+    # Unix platforms, so always chmod after writing — but only if the file
+    # was actually created successfully.
+    if write_ok and os.path.exists(path_str):
+        try:
+            os.chmod(path_str, perms)
+        except OSError as exc:
+            log.warning("Could not set permissions on state file {}: {}", path_str, exc)
 
 
 class TaskStage(Enum):
@@ -96,6 +433,7 @@ class TaskSnapshot:
     """
 
     schema_version: int = TASK_SNAPSHOT_SCHEMA_VERSION
+    downgraded_from_version: int | None = None
 
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     toppath: PathBytes | None = None
@@ -163,7 +501,7 @@ class TaskSnapshot:
 
         All bytes are decoded to strings, and enums to their values.
         """
-        return {
+        d = {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "toppath": os.fsdecode(self.toppath) if self.toppath else None,
@@ -195,6 +533,9 @@ class TaskSnapshot:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.downgraded_from_version is not None:
+            d["downgraded_from_version"] = self.downgraded_from_version
+        return d
 
     def to_json(self) -> str:
         """Serialize the snapshot to a JSON string."""
@@ -217,59 +558,159 @@ class TaskSnapshot:
         migrated.setdefault("archive_path", None)
         migrated.setdefault("last_tx_id", None)
         migrated.setdefault("tx_committed", False)
+        migrated.setdefault("downgraded_from_version", None)
         return migrated
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TaskSnapshot":
-        """Deserialize a snapshot from a dictionary, handling schema migration.
+    def _downgrade_from_newer_version(
+        cls, data: dict[str, Any], newer_version: int
+    ) -> dict[str, Any]:
+        """Best-effort downgrade: extract fields we understand from a
+        snapshot written by a newer schema version.
 
-        Raises :class:`SnapshotMigrationError` if the schema version is
-        too new to be handled.
+        Any fields introduced after ``TASK_SNAPSHOT_SCHEMA_VERSION`` are
+        silently dropped. The returned dict is compatible with the
+        current code version, and carries a
+        ``downgraded_from_version`` marker so callers know it may be
+        incomplete.
+        """
+        import warnings
+
+        warnings.warn(
+            f"TaskSnapshot schema version {newer_version} is newer than the "
+            f"current build's supported version {TASK_SNAPSHOT_SCHEMA_VERSION}. "
+            "Deserializing in best-effort downgrade mode; fields introduced in "
+            "later schema versions will be lost.",
+            DowngradedSnapshotWarning,
+            stacklevel=3,
+        )
+        log.warning(
+            "TaskSnapshot schema {} > current {}. Downgrading with best effort.",
+            newer_version,
+            TASK_SNAPSHOT_SCHEMA_VERSION,
+        )
+
+        # Build the data dict as if it were written at the current schema
+        # version, keeping only fields we know about.
+        downgraded = {
+            "schema_version": TASK_SNAPSHOT_SCHEMA_VERSION,
+            "downgraded_from_version": newer_version,
+        }
+        # All fields understood by the current version. We enumerate them
+        # explicitly rather than copying everything, so unknown fields
+        # from newer versions are dropped safely.
+        known_fields = {
+            "task_id",
+            "toppath",
+            "paths",
+            "is_album",
+            "is_singleton",
+            "is_sentinel",
+            "is_archive",
+            "stage",
+            "error_message",
+            "error_traceback",
+            "choice_flag",
+            "cur_artist",
+            "cur_album",
+            "rec",
+            "candidates_count",
+            "should_remove_duplicates",
+            "should_merge_duplicates",
+            "replaced_items_count",
+            "replaced_albums_count",
+            "old_paths",
+            "items_count",
+            "imported_items_count",
+            "album_id",
+            "archive_extracted",
+            "archive_path",
+            "last_tx_id",
+            "tx_committed",
+            "created_at",
+            "updated_at",
+        }
+        for f in known_fields:
+            if f in data:
+                downgraded[f] = data[f]
+        return downgraded
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskSnapshot":
+        """Deserialize a snapshot from a dictionary, handling schema migration
+        AND downgrade.
+
+        Migration path
+        --------------
+        * Old snapshot (version < current): run ``_migrate_vX_to_vY``.
+        * Current version: direct construction.
+        * Newer version: run ``_downgrade_from_newer_version`` to extract
+          fields we understand. The snapshot is tagged with
+          ``downgraded_from_version`` so callers can handle it
+          appropriately.
+
+        Only raises :class:`SnapshotMigrationError` for data that is so
+        corrupted that not even best-effort parsing is possible.
         """
         data = dict(data)
         version = data.get("schema_version", 0)
 
-        if version > TASK_SNAPSHOT_SCHEMA_VERSION:
-            raise SnapshotMigrationError(
-                f"Cannot deserialize TaskSnapshot with schema version {version}; "
-                f"this build only supports up to {TASK_SNAPSHOT_SCHEMA_VERSION}."
+        try:
+            if version > TASK_SNAPSHOT_SCHEMA_VERSION:
+                data = cls._downgrade_from_newer_version(data, version)
+            elif version == 0:
+                data = cls._migrate_v0_to_v1(data)
+
+            # If "stage" is missing or malformed (e.g., corrupted file),
+            # fall back to CREATED rather than throwing.
+            raw_stage = data.get("stage", TaskStage.CREATED.value)
+            try:
+                stage = TaskStage(raw_stage)
+            except ValueError:
+                log.warning(
+                    "Unknown TaskStage value '{}' in snapshot {}, falling back to CREATED.",
+                    raw_stage,
+                    data.get("task_id", "<unknown>"),
+                )
+                stage = TaskStage.CREATED
+
+            return cls(
+                schema_version=data.get("schema_version", TASK_SNAPSHOT_SCHEMA_VERSION),
+                downgraded_from_version=data.get("downgraded_from_version"),
+                task_id=data["task_id"],
+                toppath=os.fsencode(data["toppath"]) if data.get("toppath") else None,
+                paths=[os.fsencode(p) for p in data.get("paths", [])],
+                is_album=data.get("is_album", True),
+                is_singleton=data.get("is_singleton", False),
+                is_sentinel=data.get("is_sentinel", False),
+                is_archive=data.get("is_archive", False),
+                stage=stage,
+                error_message=data.get("error_message"),
+                error_traceback=data.get("error_traceback"),
+                choice_flag=data.get("choice_flag"),
+                cur_artist=data.get("cur_artist"),
+                cur_album=data.get("cur_album"),
+                rec=data.get("rec"),
+                candidates_count=data.get("candidates_count", 0),
+                should_remove_duplicates=data.get("should_remove_duplicates", False),
+                should_merge_duplicates=data.get("should_merge_duplicates", False),
+                replaced_items_count=data.get("replaced_items_count", 0),
+                replaced_albums_count=data.get("replaced_albums_count", 0),
+                old_paths=[os.fsencode(p) for p in data.get("old_paths", [])],
+                items_count=data.get("items_count", 0),
+                imported_items_count=data.get("imported_items_count", 0),
+                album_id=data.get("album_id"),
+                archive_extracted=data.get("archive_extracted", False),
+                archive_path=os.fsencode(data["archive_path"]) if data.get("archive_path") else None,
+                last_tx_id=data.get("last_tx_id"),
+                tx_committed=data.get("tx_committed", False),
+                created_at=data.get("created_at", time.time()),
+                updated_at=data.get("updated_at", time.time()),
             )
-
-        if version == 0:
-            data = cls._migrate_v0_to_v1(data)
-
-        return cls(
-            schema_version=data["schema_version"],
-            task_id=data["task_id"],
-            toppath=os.fsencode(data["toppath"]) if data.get("toppath") else None,
-            paths=[os.fsencode(p) for p in data.get("paths", [])],
-            is_album=data.get("is_album", True),
-            is_singleton=data.get("is_singleton", False),
-            is_sentinel=data.get("is_sentinel", False),
-            is_archive=data.get("is_archive", False),
-            stage=TaskStage(data["stage"]),
-            error_message=data.get("error_message"),
-            error_traceback=data.get("error_traceback"),
-            choice_flag=data.get("choice_flag"),
-            cur_artist=data.get("cur_artist"),
-            cur_album=data.get("cur_album"),
-            rec=data.get("rec"),
-            candidates_count=data.get("candidates_count", 0),
-            should_remove_duplicates=data.get("should_remove_duplicates", False),
-            should_merge_duplicates=data.get("should_merge_duplicates", False),
-            replaced_items_count=data.get("replaced_items_count", 0),
-            replaced_albums_count=data.get("replaced_albums_count", 0),
-            old_paths=[os.fsencode(p) for p in data.get("old_paths", [])],
-            items_count=data.get("items_count", 0),
-            imported_items_count=data.get("imported_items_count", 0),
-            album_id=data.get("album_id"),
-            archive_extracted=data.get("archive_extracted", False),
-            archive_path=os.fsencode(data["archive_path"]) if data.get("archive_path") else None,
-            last_tx_id=data.get("last_tx_id"),
-            tx_committed=data.get("tx_committed", False),
-            created_at=data.get("created_at", time.time()),
-            updated_at=data.get("updated_at", time.time()),
-        )
+        except KeyError as e:
+            raise SnapshotMigrationError(
+                f"TaskSnapshot missing required field: {e}"
+            ) from e
 
     @classmethod
     def from_json(cls, json_str: str) -> "TaskSnapshot":
@@ -330,6 +771,7 @@ class SessionSnapshot:
     """
 
     schema_version: int = SESSION_SNAPSHOT_SCHEMA_VERSION
+    downgraded_from_version: int | None = None
 
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     start_time: float = field(default_factory=time.time)
@@ -428,7 +870,7 @@ class SessionSnapshot:
     def to_dict(self) -> dict[str, Any]:
         """Serialize the session snapshot to a JSON-compatible dictionary."""
         self._sync_collections()
-        return {
+        d = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "start_time": self.start_time,
@@ -447,6 +889,9 @@ class SessionSnapshot:
             "errored_tasks": self.errored_tasks,
             "config_snapshot": self.config_snapshot,
         }
+        if self.downgraded_from_version is not None:
+            d["downgraded_from_version"] = self.downgraded_from_version
+        return d
 
     def to_json(self) -> str:
         """Serialize the session snapshot to a JSON string."""
@@ -459,22 +904,77 @@ class SessionSnapshot:
         migrated.setdefault("schema_version", 1)
         migrated.setdefault("query", None)
         migrated.setdefault("config_snapshot", {})
+        migrated.setdefault("downgraded_from_version", None)
         return migrated
 
     @classmethod
+    def _downgrade_from_newer_version(
+        cls, data: dict[str, Any], newer_version: int
+    ) -> dict[str, Any]:
+        """Best-effort downgrade: keep only fields we understand."""
+        import warnings
+
+        warnings.warn(
+            f"SessionSnapshot schema version {newer_version} is newer than the "
+            f"current build's supported version {SESSION_SNAPSHOT_SCHEMA_VERSION}. "
+            "Deserializing in best-effort downgrade mode.",
+            DowngradedSnapshotWarning,
+            stacklevel=3,
+        )
+        log.warning(
+            "SessionSnapshot schema {} > current {}. Downgrading with best effort.",
+            newer_version,
+            SESSION_SNAPSHOT_SCHEMA_VERSION,
+        )
+        downgraded = {
+            "schema_version": SESSION_SNAPSHOT_SCHEMA_VERSION,
+            "downgraded_from_version": newer_version,
+        }
+        known_fields = {
+            "session_id",
+            "start_time",
+            "end_time",
+            "paths",
+            "query",
+            "is_resuming",
+            "merged_items",
+            "merged_dirs",
+            "task_snapshots",
+            "total_tasks",
+            "completed_tasks",
+            "skipped_tasks",
+            "errored_tasks",
+            "config_snapshot",
+        }
+        for f in known_fields:
+            if f in data:
+                downgraded[f] = data[f]
+        return downgraded
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionSnapshot":
-        """Deserialize a session snapshot, handling schema migration."""
+        """Deserialize a session snapshot, handling schema migration AND downgrade.
+
+        Like :meth:`TaskSnapshot.from_dict`, this never raises for schema
+        version mismatches. It either migrates (old data) or downgrades
+        (new data) in best-effort fashion.
+        """
         data = dict(data)
         version = data.get("schema_version", 0)
 
         if version > SESSION_SNAPSHOT_SCHEMA_VERSION:
-            raise SnapshotMigrationError(
-                f"Cannot deserialize SessionSnapshot with schema version {version}; "
-                f"this build only supports up to {SESSION_SNAPSHOT_SCHEMA_VERSION}."
-            )
-
-        if version == 0:
+            data = cls._downgrade_from_newer_version(data, version)
+        elif version == 0:
             data = cls._migrate_v0_to_v1(data)
+
+        # Session IDs may be missing in very old/corrupted data;
+        # generate a fresh one rather than throwing.
+        if "session_id" not in data:
+            data["session_id"] = str(uuid.uuid4())
+            log.warning(
+                "SessionSnapshot missing session_id, generated fresh: {}",
+                data["session_id"],
+            )
 
         task_snapshots = {}
         for tid, task_data in data.get("task_snapshots", {}).items():
@@ -484,7 +984,8 @@ class SessionSnapshot:
                 log.warning("Skipping corrupted task snapshot {}: {}", tid, e)
 
         return cls(
-            schema_version=data["schema_version"],
+            schema_version=data.get("schema_version", SESSION_SNAPSHOT_SCHEMA_VERSION),
+            downgraded_from_version=data.get("downgraded_from_version"),
             session_id=data["session_id"],
             start_time=data.get("start_time", time.time()),
             end_time=data.get("end_time"),
@@ -534,6 +1035,7 @@ class FactorySnapshot:
     """
 
     schema_version: int = FACTORY_SNAPSHOT_SCHEMA_VERSION
+    downgraded_from_version: int | None = None
 
     toppath: PathBytes | None = None
     is_archive: bool = False
@@ -543,7 +1045,7 @@ class FactorySnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
-        return {
+        d = {
             "schema_version": self.schema_version,
             "toppath": os.fsdecode(self.toppath) if self.toppath else None,
             "is_archive": self.is_archive,
@@ -551,6 +1053,9 @@ class FactorySnapshot:
             "imported": self.imported,
             "created_at": self.created_at,
         }
+        if self.downgraded_from_version is not None:
+            d["downgraded_from_version"] = self.downgraded_from_version
+        return d
 
     def to_json(self) -> str:
         """Serialize to a JSON string."""
@@ -561,31 +1066,73 @@ class FactorySnapshot:
         """Migrate from version 0 to version 1."""
         migrated = dict(data)
         migrated.setdefault("schema_version", 1)
+        migrated.setdefault("downgraded_from_version", None)
         return migrated
 
     @classmethod
+    def _downgrade_from_newer_version(
+        cls, data: dict[str, Any], newer_version: int
+    ) -> dict[str, Any]:
+        """Best-effort downgrade: keep only fields we understand."""
+        import warnings
+
+        warnings.warn(
+            f"FactorySnapshot schema version {newer_version} is newer than the "
+            f"current build's supported version {FACTORY_SNAPSHOT_SCHEMA_VERSION}. "
+            "Deserializing in best-effort downgrade mode.",
+            DowngradedSnapshotWarning,
+            stacklevel=3,
+        )
+        log.warning(
+            "FactorySnapshot schema {} > current {}. Downgrading with best effort.",
+            newer_version,
+            FACTORY_SNAPSHOT_SCHEMA_VERSION,
+        )
+        downgraded = {
+            "schema_version": FACTORY_SNAPSHOT_SCHEMA_VERSION,
+            "downgraded_from_version": newer_version,
+        }
+        known_fields = {
+            "toppath",
+            "is_archive",
+            "skipped",
+            "imported",
+            "created_at",
+        }
+        for f in known_fields:
+            if f in data:
+                downgraded[f] = data[f]
+        return downgraded
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FactorySnapshot":
-        """Deserialize from a dictionary, handling schema migration."""
+        """Deserialize from a dictionary, handling schema migration AND downgrade.
+
+        Never raises for schema-version mismatches — only raises when data is
+        so corrupted that even best-effort parsing fails.
+        """
         data = dict(data)
         version = data.get("schema_version", 0)
 
         if version > FACTORY_SNAPSHOT_SCHEMA_VERSION:
-            raise SnapshotMigrationError(
-                f"Cannot deserialize FactorySnapshot with schema version {version}; "
-                f"this build only supports up to {FACTORY_SNAPSHOT_SCHEMA_VERSION}."
-            )
-
-        if version == 0:
+            data = cls._downgrade_from_newer_version(data, version)
+        elif version == 0:
             data = cls._migrate_v0_to_v1(data)
 
-        return cls(
-            schema_version=data["schema_version"],
-            toppath=os.fsencode(data["toppath"]) if data.get("toppath") else None,
-            is_archive=data.get("is_archive", False),
-            skipped=data.get("skipped", 0),
-            imported=data.get("imported", 0),
-            created_at=data.get("created_at", time.time()),
-        )
+        try:
+            return cls(
+                schema_version=data.get("schema_version", FACTORY_SNAPSHOT_SCHEMA_VERSION),
+                downgraded_from_version=data.get("downgraded_from_version"),
+                toppath=os.fsencode(data["toppath"]) if data.get("toppath") else None,
+                is_archive=data.get("is_archive", False),
+                skipped=data.get("skipped", 0),
+                imported=data.get("imported", 0),
+                created_at=data.get("created_at", time.time()),
+            )
+        except KeyError as e:
+            raise SnapshotMigrationError(
+                f"FactorySnapshot missing required field: {e}"
+            ) from e
 
     @classmethod
     def from_json(cls, json_str: str) -> "FactorySnapshot":
@@ -624,6 +1171,19 @@ class ImportState:
     with ImportState() as state:
         state["key"] = "value"
     ```
+
+    Singleton behaviour
+    -------------------
+    ``ImportState`` is a process-wide **singleton**: repeated calls with
+    the same ``path`` return the same in-memory object. This is essential
+    for correctness when persistence runs asynchronously — otherwise a
+    fresh ``ImportState()`` instantiated mid-import would re-read the
+    on-disk file from before the pending async write, and end up with
+    stale (or empty) data that then overwrites the real progress on the
+    next flush.
+
+    Tests that need a clean slate should call
+    :meth:`ImportState.reset_for_testing`.
     """
 
     tagprogress: dict[PathBytes, list[PathBytes]]
@@ -633,14 +1193,48 @@ class ImportState:
     factory_snapshots: dict[bytes, FactorySnapshot]
     path: PathBytes
 
+    _instance: "ImportState | None" = None
+    _instance_path: bytes | None = None
+    _instance_lock: threading.Lock = threading.Lock()
+
+    def __new__(
+        cls,
+        readonly=False,
+        path: PathBytes | None = None,
+    ):
+        requested_path = path or os.fsencode(config["statefile"].as_filename())
+        with cls._instance_lock:
+            if cls._instance is None or cls._instance_path != requested_path:
+                # Create a fresh instance (first time, or different path).
+                instance = super().__new__(cls)
+                instance.path = requested_path
+                instance.tagprogress = {}
+                instance.taghistory = set()
+                instance.task_snapshots = {}
+                instance.session_snapshot = None
+                instance.factory_snapshots = {}
+                instance._open()
+                cls._instance = instance
+                cls._instance_path = requested_path
+            return cls._instance
+
     def __init__(self, readonly=False, path: PathBytes | None = None):
-        self.path = path or os.fsencode(config["statefile"].as_filename())
-        self.tagprogress = {}
-        self.taghistory = set()
-        self.task_snapshots = {}
-        self.session_snapshot = None
-        self.factory_snapshots = {}
-        self._open()
+        # NOTE: Actual initialisation happens in __new__ (singleton).
+        # __init__ is intentionally a no-op here so that repeated calls
+        # with the same path don't wipe out in-memory state.
+        pass
+
+    @classmethod
+    def reset_for_testing(cls):
+        """Discard the singleton instance (used between unit tests).
+
+        Also tears down the async writer so the next instantiation
+        starts with a truly blank slate.
+        """
+        with cls._instance_lock:
+            cls._instance = None
+            cls._instance_path = None
+        _AsyncStateWriter.reset_for_testing()
 
     def __enter__(self):
         return self
@@ -745,18 +1339,36 @@ class ImportState:
                 log.warning("Skipping corrupted factory snapshot: {}", e)
 
     def _save(self):
+        """Schedule an asynchronous state write.
+
+        The call returns immediately; the write is coalesced and performed on
+        a background worker. Callers that need durability guarantees
+        (e.g. right after a DB commit) should call
+        :meth:`flush_pending_writes` afterwards.
+        """
+        writer = _AsyncStateWriter.get_instance()
+        writer.submit(self)
+
+    def _save_sync(self):
+        """Perform a **synchronous** write to disk, using the same 0o600
+        permissions and dual-format logic.
+
+        This is used by :meth:`flush_pending_writes` and by callers
+        that cannot afford to wait for the worker.
+        """
         # Save JSON format (primary).
         json_path = self._json_path()
         state_dict = self._serialize_to_dict()
         try:
-            with open(json_path, "w", encoding="utf-8") as f:
+            _write_with_perms(json_path, "w", STATE_FILE_PERMISSIONS, lambda f:
                 json.dump(state_dict, f, indent=2, sort_keys=True)
-        except OSError as exc:
+            )
+        except Exception as exc:
             log.error("JSON state file could not be written: {}", exc)
 
         # Also save pickle format for backward compatibility.
         try:
-            with open(self.path, "wb") as f:
+            _write_with_perms(self.path, "wb", STATE_FILE_PERMISSIONS, lambda f:
                 pickle.dump(
                     {
                         "tagprogress": self.tagprogress,
@@ -767,8 +1379,29 @@ class ImportState:
                     },
                     f,
                 )
-        except OSError as exc:
+            )
+        except Exception as exc:
             log.error("pickle state file could not be written: {}", exc)
+
+    @staticmethod
+    def flush_pending_writes(timeout: float | None = 10.0) -> bool:
+        """Block until all pending asynchronous writes are complete.
+
+        Returns ``True`` on success, ``False`` if the wait timed out.
+
+        Call this after critical operations (e.g. right after committing a
+        database transaction) when you need a guarantee that the state
+        has reached durable storage before proceeding.
+        """
+        writer = _AsyncStateWriter.get_instance()
+        return writer.flush(timeout=timeout)
+
+    @staticmethod
+    def use_sync_writes():
+        """Tear down the async writer and ensure the next ``_save`` triggers
+        a synchronous write. (Used by tests and shutdown hooks.)
+        """
+        _AsyncStateWriter.reset_for_testing()
 
     def _serialize_to_dict(self) -> dict[str, Any]:
         """Serialize the full state to a JSON-compatible dictionary."""
@@ -811,6 +1444,11 @@ class ImportState:
         modifications. It marks the transaction boundary on the snapshot and
         only persists the snapshot if the transaction was committed.
 
+        On commit, this method schedules an async write and then *flushes* it
+        so that the state reaches durable storage before returning. This
+        ensures the snapshot ↔ DB consistency contract: if the DB has
+        committed, the snapshot describing that commit is safely on disk.
+
         Parameters
         ----------
         snapshot:
@@ -823,13 +1461,12 @@ class ImportState:
             (for debugging) but marked as uncommitted.
         """
         snapshot.mark_tx_boundary(tx_id, committed)
-        # Only persist after the transaction has committed. If it was
-        # rolled back, we still record the boundary for diagnostics but
-        # don't persist to disk yet — the next transaction will
-        # overwrite it.
         if committed:
+            # Persist via the normal context-manager path (async), then
+            # flush so we don't return until the snapshot is on disk.
             with self as state:
                 state.task_snapshots[snapshot.task_id] = snapshot
+            ImportState.flush_pending_writes(timeout=30.0)
         else:
             # Still update in-memory in case someone wants to inspect it.
             self.task_snapshots[snapshot.task_id] = snapshot

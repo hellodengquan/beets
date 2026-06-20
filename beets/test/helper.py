@@ -374,6 +374,15 @@ class TestHelper(RunMixin, ConfigMixin):
 
     def remove_temp_dir(self):
         """Delete the temporary directory created by `create_temp_dir`."""
+        # Ensure any pending async state writes are flushed before we
+        # try to remove the directory — otherwise we'd race with the
+        # background writer thread and fail with "Directory not empty".
+        try:
+            from beets.importer.state import ImportState
+
+            ImportState.flush_pending_writes(timeout=5.0)
+        except Exception:
+            pass
         shutil.rmtree(self.temp_dir_path)
 
     def touch(self, path, dir=None, content=""):
