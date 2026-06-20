@@ -21,6 +21,7 @@ import inspect
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import cached_property, wraps
 from importlib import import_module
 from pathlib import Path
@@ -122,6 +123,22 @@ class PluginImportError(ImportError):
 
     def __init__(self, name: str):
         super().__init__(f"Could not import plugin {name}")
+
+
+@dataclass
+class PluginLoadFailure:
+    """Records details about a plugin that failed to load."""
+
+    name: str
+    exception: BaseException
+
+    @property
+    def exception_type(self) -> str:
+        return type(self.exception).__name__
+
+    @property
+    def exception_message(self) -> str:
+        return str(self.exception)
 
 
 class PluginLogFilter(logging.Filter):
@@ -470,13 +487,15 @@ def _get_plugin(name: str) -> BeetsPlugin | None:
             ):
                 return obj()
 
-    except Exception:
+    except Exception as exc:
         log.warning("** error loading plugin {}", name, exc_info=True)
+        _load_failures.append(PluginLoadFailure(name=name, exception=exc))
 
     return None
 
 
 _instances: list[BeetsPlugin] = []
+_load_failures: list[PluginLoadFailure] = []
 
 
 def load_plugins() -> None:
@@ -496,6 +515,19 @@ def load_plugins() -> None:
 
 def find_plugins() -> Iterable[BeetsPlugin]:
     return _instances
+
+
+def plugin_load_failures() -> list[PluginLoadFailure]:
+    """Return a list of plugins that failed to load, with error details."""
+    return list(_load_failures)
+
+
+def clear_plugin_state() -> None:
+    """Reset plugin instances and failure records. Primarily for testing."""
+    _instances.clear()
+    _load_failures.clear()
+    BeetsPlugin.listeners.clear()
+    BeetsPlugin._raw_listeners.clear()
 
 
 # Communication with plugins.
