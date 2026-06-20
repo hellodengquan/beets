@@ -240,26 +240,63 @@ if move:
 - 移动后调用 `util.prune_dirs()` 清理空目录
 - 同时触发专辑封面的移动
 
-**撤销路径**（部分可逆）：
+**底层文件移动的完整实现**（`beets/util/__init__.py:492-550`）：
 
-1. **数据库回退**：无内置回滚机制，需手动操作
-   - 操作前建议备份数据库：`cp ~/.config/beets/library.db ~/.config/beets/library.bak`
-   - 出问题可直接恢复备份文件
+```python
+def move(path: bytes, dest: bytes, replace: bool = False):
+    # 先尝试 os.replace() 原子重命名（同分区）
+    try:
+        os.replace(syspath(path), syspath(dest))
+    except OSError:
+        # 跨分区时：先复制到临时文件 .beets，再替换目标，最后删源文件
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".beets",
+            prefix=f".{basename}.",
+            dir=syspath(dirname),
+            delete=False,
+        )
+        with open(syspath(path), "rb") as f:
+            shutil.copyfileobj(f, tmp)
+        shutil.copystat(syspath(path), tmp.name)   # 复制权限与时间戳
+        os.replace(tmp_filename, syspath(dest))    # 原子替换目标
+        os.remove(syspath(path))                    # 最后才删源文件
+```
 
-2. **文件回移**：
-   - 移动操作会保留完整文件，只是换了位置
-   - 可手动将文件移回，然后重新导入：
+> **关键观察**：
+> - 同分区下是纯 `os.replace()` 原子操作，不产生副本
+> - 跨分区时**先复制再删源**，源文件在最后一步才被 `os.remove()` 硬删
+> - 全程没有任何"复制到回收站/trash bin"的中间层——要么留在原位，要么彻底移走
+> - 临时文件命名为 `.原始文件名.xxxx.beets`，放在目标目录下，若中途中断可手动恢复
+
+**撤销路径（代码级分析）**：
+
+1. **数据库层撤销**：移动后立即调用 `item.store()`（`duplicates.py:234`）将新路径写回 DB，整个过程在事务外执行，**无内置回滚机制**。
+   - 唯一保护手段：操作前备份 SQLite 文件
      ```bash
-     beet import /path/to/trash/
+     cp ~/.config/beets/library.db ~/.config/beets/library-predup-$(date +%Y%m%d%H%M%S).db
      ```
+   - 若误操作，关闭 beets 相关进程后直接用备份覆盖即可还原所有路径引用
 
-3. **路径格式注意**：
-   - 移动后的路径会根据 `path_formats` 重新生成
-   - 如果目标目录结构与原库不同，回移时路径可能变化
+2. **文件层撤销**：
+   - **同分区场景**：源路径 → 目标路径是纯 rename，inode 不变。只需在 shell 执行反向 `mv` 即可物理还原：
+     ```bash
+     # 将隔离区里的文件移回原库目录，然后重新扫描
+     mv ~/music/.dup_quarantine/* ~/music/library/
+     beet import ~/music/library/
+     ```
+   - **跨分区场景**：复制阶段生成的 `.xxx.beets` 临时文件仅在 `OSError` 分支存在，正常移动完成后已被 `os.remove(tmp_filename)` 清理（`util/__init__.py:549-550`），**移动成功后无残留临时副本可供恢复**
+   - 如果移动后文件在新目录里没被修改过，文件本身完整无损，反向移动即可
 
-> **重要**：移动操作会触发 `prune_dirs`（`models.py:1138-1143`），空目录会被自动删除，但文件本身不会丢失，只是目录结构变了。
+3. **路径重生成的副作用**：
+   - 目标路径由 `item.destination(basedir=move)` 生成（`models.py:1118`），会套用当前全局 `path_formats` 配置
+   - 如果 `--move` 指定的 basedir 与原库目录不同，路径模板会重新计算，文件名可能变化（如艺术家名修正后）
+   - 撤销时需要先 `beet list dup_status:pending -f '$path'` 导出新路径，再逐条 mv 回去
 
-**风险等级**：中，文件仍在，只是位置变了
+4. **空目录清理的影响**：移动成功后 `prune_dirs()` 会向上递归清理空目录（`models.py:1138-1143`），直到遇到 `library.directory` 根目录才停止。这意味着：
+   - 撤销时若原目录已被清理，需要 `mkdir -p` 重建目录树
+   - 专辑封面文件会随 `Album.move_art()` 同步移动（`models.py:1130-1135`），撤销时封面也需要一起移回
+
+**风险等级**：中，文件完整保留但路径 + 数据库记录均已改变，无一键回滚
 
 ---
 
@@ -354,19 +391,67 @@ if delete:
 - 同时删除专辑封面文件
 - 所有操作都是 `delete=True` 模式
 
-**撤销路径**：**无内置撤销机制**
+**硬删不经回收站的代码证据**（`beets/util/__init__.py:457-469`）：
 
-1. **仅有的恢复方式**：
-   - 从回收站/废纸篓恢复（如果系统支持）
-   - 从备份恢复
-   - 使用文件恢复工具（成功率随时间降低）
+```python
+def remove(path: PathLike, soft: bool = True):
+    """Remove the file. If `soft`, then no error will be raised if the
+    file does not exist.
+    """
+    str_path = syspath(path)
+    if not str_path or (soft and not os.path.exists(str_path)):
+        return
+    try:
+        os.remove(str_path)          # ← 直接调用 POSIX unlink
+    except OSError as exc:
+        raise FilesystemError(
+            exc, "delete", (str_path,), traceback.format_exc()
+        )
+```
 
-2. **操作前必须做的防护**：
-   - 数据库备份：`cp library.db library.db.bak`
-   - 先用 `--tag` 或 `--move` 试运行一轮
-   - 用 `--full` 模式确认所有重复项
+> **重要结论**：
+> - 底层使用的是 `os.remove()`，即系统调用 `unlink(2)`
+> - **没有任何 trash bin / Recycle Bin / freedesktop Trash 中间层**
+> - 不存在"删除后可以在系统回收站找回"的假设——一旦执行，inode 被释放
+> - macOS 上不会走 Finder 的 "Put Back"，Linux 上不会走 `~/.local/share/Trash`，Windows 上不会走 `$Recycle.Bin`
+> - 唯一条件分支是 `soft=True`（默认）时，文件不存在不报异常，不影响硬删本身
 
-**风险等级**：极高，文件永久删除
+**专辑删除的连锁硬删**（`library/models.py:360-384`）：
+
+```python
+def remove(self, delete=False, with_items=True):
+    super().remove()                     # 删数据库专辑记录
+    if delete:
+        artpath = self.artpath
+        if artpath:
+            util.remove(artpath)         # ← 封面文件硬删
+    if with_items:
+        for item in self.items():
+            item.remove(delete, False)   # ← 所有曲目级联硬删
+```
+
+每个曲目又会触发自身的 `util.remove(item.path)` + `prune_dirs()` 清理空目录。**整个专辑删除流程产生的所有文件删除操作，全部绕过任何回收站机制。**
+
+**撤销路径：无内置撤销机制**
+
+1. **数据库层恢复**：
+   - 从备份恢复 SQLite 文件即可还原条目 + 元数据 + flexattr
+   - 但文件 inode 已释放，数据库恢复后路径指向的文件可能已不存在
+
+2. **文件层恢复**（唯一实际手段）：
+   - **不存在系统回收站兜底**，别指望 macOS Trash / Linux Trash / Windows Recycle Bin
+   - 如果有文件级备份（Time Machine、rsync 快照、git-annex 等），从备份还原
+   - 如果没有备份，只能使用底层数据恢复工具（如 `testdisk`、` photorec`），且成功率取决于磁盘未被覆写的程度——**越早操作越好**
+
+3. **操作前必须做的防护**：
+   - 数据库备份：`cp library.db library-pre-del-$(date +%Y%m%d%H%M%S).db`
+   - 先用 `--tag` 标记，人工 `beet list dup:1` 复核
+   - 再用 `--move ~/music/.dup_quarantine/` 隔离，正常使用一周确认无丢失
+   - 最后才 `--delete`（或直接手动 `rm` 隔离区，可更小心控制）
+
+4. **关于 import 命令内的删除**：`beet import --delete` 同样走 `util.remove()`（`importer/tasks.py:356`），也不经回收站。同理 `beet convert --keep-new --delete-originals` 也是 `util.remove(source_path)`（`convert.py:692-698`），**整个 beets 生态中不存在任何"安全删除"抽象层**。
+
+**风险等级**：极高，文件永久释放，无任何兜底
 
 ---
 
@@ -482,7 +567,140 @@ beet dup -k title -k albumartist -k album -c
 
 ---
 
-## 七、代码速查索引
+## 七、与 import / convert 等主线命令的交互关系
+
+### 7.1 duplicates 插件不会监听 import 流程
+
+`duplicates` 插件本身只注册了一个子命令 `duplicates`/`dup`，**没有注册任何 import 相关的事件监听器或 import_stage**。
+
+代码验证（`beetsplug/duplicates.py:34-60`）：
+```python
+class DuplicatesPlugin(BeetsPlugin):
+    def __init__(self):
+        super().__init__()
+        self.config.add({...})
+        self._command = Subcommand("duplicates", ...)
+        # 没有 self.import_stages = [...]
+        # 没有 self.register_listener("import_task_xxx", ...)
+        # 没有 self.early_import_stages = [...]
+```
+
+> **结论**：执行 `beet import` 时，`duplicates` 插件完全不介入。它是一个独立的、手动触发的后处理命令。
+
+### 7.2 import 命令有自己独立的重复检测分组规则
+
+import 流程内部自带重复检测机制，其分组键与 `duplicates` 插件**完全独立、互不覆盖**。
+
+**import 侧的分组键**（`config_default.yaml:50-52`）：
+
+```yaml
+import:
+  duplicate_keys:
+    album: albumartist album      # import 专辑匹配键
+    item: artist title            # import 单曲匹配键
+  duplicate_action: ask           # 遇到重复时的处理策略
+```
+
+**import 侧的匹配实现**（`importer/tasks.py:391-422`）：
+
+```python
+def find_duplicates(self, lib):
+    info = self.chosen_info()
+    tmp_album = library.Album(lib, **info)
+    keys = config["import"]["duplicate_keys"]["album"].as_str_seq()
+    dup_query = tmp_album.duplicates_query(keys)   # AndQuery 精确匹配
+    # 遍历库中相同 artist+album 的专辑，排除同路径完全重导入
+```
+
+**import 侧的删除行为**（`importer/tasks.py:272-292`）：
+
+```python
+def remove_duplicates(self, lib):
+    duplicate_albums = self.find_duplicates(lib)
+    for album in duplicate_albums:
+        for item in album.items():
+            item.remove(with_album=False)
+            if lib.directory in util.ancestry(item.path):
+                util.remove(item.path)    # ← 同样走硬删
+                util.prune_dirs(...)
+```
+
+### 7.3 两套分组规则对比
+
+| 维度 | `beet dup`（duplicates 插件） | `beet import`（内置重复检测） |
+|------|-------------------------------|------------------------------|
+| **默认分组键** | 单曲：`mb_trackid, mb_albumid`<br>专辑：`mb_albumid` | 单曲：`artist, title`<br>专辑：`albumartist, album` |
+| **匹配精度** | MusicBrainz GUID，全局唯一 | 文本字段，可能误匹配 |
+| **可配置性** | `-k` 任意字段组合，支持多键 | `import.duplicate_keys` 配置项 |
+| **严格模式** | `--strict` 要求所有键非空 | 无严格模式，artist 为 None 时直接跳过 |
+| **触发时机** | 手动后处理，对已入库数据 | 导入过程中自动触发 |
+| **结果处理** | tag / copy / move / remove / delete / merge | 交互 ask / 自动 remove + delete |
+| **排序/保留项** | `tiebreak` 或完整性优先 | 保留库中原条目，删除新导入的重复 |
+
+> **核心区别**：import 侧用的是**弱文本键**（artist+title），只在导入时用来拦截重复入库；duplicates 插件默认用的是**强 GUID 键**（MBID），用来事后精准清理已入库的重复。两套规则独立运行，互不覆盖——**import 的 duplicate_keys 配置不会影响 `beet dup` 的分组，反之亦然。**
+
+### 7.4 convert 命令对重复检测的影响
+
+`convert` 插件（`beetsplug/convert.py`）有两种工作模式，对 duplicates 分组规则的影响不同：
+
+#### 模式 A：手动 `beet convert`（不影响分组键）
+
+- 转换后的文件路径被更新（`convert.py:502-504`）：
+  ```python
+  item.path = converted
+  item.read()       # 重新读取音频属性（比特率、时长等可能变化）
+  item.store()
+  ```
+- 如果 duplicates 分组键中包含了 `bitrate`、`length`、`path` 等会变的字段，**转换前后相同内容的文件可能不再被分到一组**
+- 如果分组键是 `mb_trackid` 等 GUID，则不受转换影响
+
+#### 模式 B：import 时自动转换（可能引入新重复）
+
+`convert` 注册了 `early_import_stages`（`convert.py:126`）：
+```python
+self.early_import_stages = [self.auto_convert, self.auto_convert_keep]
+```
+
+`auto_convert` 的副作用（`convert.py:662-698`）：
+```python
+def convert_on_import(self, _, item):
+    if self.should_transcode(item):
+        # 创建临时转码文件
+        fd, dest = tempfile.mkstemp(b"." + ext, dir=tmpdir)
+        self.encode(command, item.path, dest)
+        
+        # 用转码后的临时文件替换库中条目路径
+        source_path = item.path
+        item.path = dest
+        item.write()
+        item.read()
+        item.store()
+        
+        if self.config["delete_originals"]:
+            util.remove(source_path, False)   # ← 原文件被硬删
+```
+
+**对 duplicates 分组的影响链**：
+1. 转码后 `bitrate`、`length`、`path` 等字段变化
+2. 若分组键包含这些字段，**原文件的同组条目会"脱钩"，不再被识别为重复**
+3. 若开启 `delete_originals`，原文件被删，库中只剩转码条目，后续 `beet dup` 看不到重复
+4. 若未开启 `delete_originals`，原文件还在磁盘但不在库中，下次 `beet import` 可能再次引入（变成"转码版 + 原版"并存，需要用自定义键 `-k title -k albumartist` 才能识别）
+
+### 7.5 典型组合使用场景的分组规则
+
+| 场景 | 实际生效的分组规则 | 注意事项 |
+|------|-------------------|---------|
+| 先 `beet import`，后 `beet dup` | import 用 `artist+title`（防重）<br>dup 用 `mb_trackid+mb_albumid`（清理） | 两套独立，互不干扰 |
+| `beet import --delete` 后跑 dup | 旧重复已被 import 侧硬删，dup 可能查不到 | import 侧也走 `util.remove()` 硬删 |
+| `beet convert --keep-new` 后跑 dup | 新文件替换了旧路径，若分组键含 `bitrate` 可能漏检 | 建议用 MBID 分组，不受转码影响 |
+| import 时开启 convert auto_convert | 转码在入库早期执行，后续入库的是转码后路径 | 原版文件若未被删，可能成为"未入库的幽灵文件" |
+| `beet dup -k bitrate -k length` + convert | 相同内容转码前后比特率不同，不会被归为重复 | 内容级重复检测应使用 `--checksum` |
+
+> **最佳实践**：清理重复与格式转换分两步进行——先用 `beet dup` 基于 MBID 或 checksum 清理干净，再执行 `convert`。顺序反过来可能导致分组键值变化，漏检可清理的重复。
+
+---
+
+## 八、代码速查索引
 
 | 功能 | 文件位置 | 方法/行号 |
 |------|---------|----------|
@@ -497,3 +715,10 @@ beet dup -k title -k albumartist -k album -c
 | 校验和计算 | `beetsplug/duplicates.py` | `_checksum()` L247-278 |
 | 单曲合并 | `beetsplug/duplicates.py` | `_merge_items()` L347-369 |
 | 专辑合并 | `beetsplug/duplicates.py` | `_merge_albums()` L371-392 |
+| **硬删核心（无trash）** | `beets/util/__init__.py` | `remove()` L457-469 |
+| **文件移动实现** | `beets/util/__init__.py` | `move()` L492-550 |
+| **空目录清理** | `beets/util/__init__.py` | `prune_dirs()` L309-343 |
+| **import 侧重复键** | `beets/config_default.yaml` | `import.duplicate_keys` L50-52 |
+| **import 侧重复检测** | `beets/importer/tasks.py` | `find_duplicates()` L391-422 / L711-730 |
+| **import 侧删重复** | `beets/importer/tasks.py` | `remove_duplicates()` L272-292 / L734-746 |
+| **convert 导入时转码** | `beetsplug/convert.py` | `auto_convert()` / `convert_on_import()` L662-698 |
