@@ -165,10 +165,28 @@ class Info(AttrDict[Any]):
     MEDIA_FIELD_MAP: ClassVar[dict[str, str]] = {}
     LEGACY_TO_LIST_FIELD: ClassVar[dict[str, str]]
 
+    _cached_properties: ClassVar[tuple[str, ...]] = (
+        "name",
+        "raw_data",
+        "item_data",
+    )
+
     @cached_classproperty
     def nullable_fields(cls) -> set[str]:
         """Return fields that may be cleared when new metadata is applied."""
         return set(config["overwrite_null"][cls.type.lower()].as_str_seq())
+
+    def _clear_cached_properties(self) -> None:
+        """Invalidate all cached_property values so they are recomputed.
+
+        When plugins modify fields on an Info object (e.g., album, artist,
+        disc number), cached properties like ``raw_data``, ``item_data``,
+        and ``name`` must be cleared so they reflect the new values.
+        Otherwise, path previews, metadata application, and actual file
+        moves could end up using stale data.
+        """
+        for attr in self._cached_properties:
+            self.__dict__.pop(attr, None)
 
     def __setitem__(self, key: str, value: Any) -> None:
         # handle legacy info.str_field = "abc" and info["str_field"] = "abc"
@@ -178,6 +196,42 @@ class Info(AttrDict[Any]):
             )
         else:
             super().__setitem__(key, value)
+        self._clear_cached_properties()
+
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key)
+        self._clear_cached_properties()
+
+    def __delattr__(self, key: str) -> None:
+        try:
+            self.__delitem__(key)
+        except KeyError:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{key}'"
+            )
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        super().update(*args, **kwargs)
+        self._clear_cached_properties()
+
+    def clear(self) -> None:
+        super().clear()
+        self._clear_cached_properties()
+
+    def pop(self, key: str, *args: Any) -> Any:
+        result = super().pop(key, *args)
+        self._clear_cached_properties()
+        return result
+
+    def popitem(self) -> tuple[str, Any]:
+        result = super().popitem()
+        self._clear_cached_properties()
+        return result
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        result = super().setdefault(key, default)
+        self._clear_cached_properties()
+        return result
 
     @property
     def id(self) -> str | None:
