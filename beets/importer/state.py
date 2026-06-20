@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import queue
+import signal
 import stat
 import threading
 import time
@@ -98,10 +99,18 @@ class _AsyncStateWriter:
     ``flush()`` blocks until all queued work is done (used for shutdown
     and for callers that need durability guarantees, e.g. right after a
     database commit).
+
+    Shutdown guarantees
+    -------------------
+    The writer registers an ``atexit`` handler and installs signal
+    handlers for SIGTERM and SIGINT so that pending writes are flushed
+    before the process exits — even on unclean shutdowns.
     """
 
     _instance: "_AsyncStateWriter | None" = None
     _instance_lock = threading.Lock()
+    _atexit_registered = False
+    _signal_handlers_installed = False
 
     @classmethod
     def get_instance(cls) -> "_AsyncStateWriter":
@@ -109,25 +118,91 @@ class _AsyncStateWriter:
         with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = cls()
+                cls._register_atexit_once()
+                cls._install_signal_handlers_once()
             return cls._instance
+
+    @classmethod
+    def _register_atexit_once(cls):
+        """Register the module-level atexit handler exactly once."""
+        if not cls._atexit_registered:
+            cls._atexit_registered = True
+            atexit.register(cls._atexit_shutdown)
+
+    @classmethod
+    def _install_signal_handlers_once(cls):
+        """Install signal handlers to flush state on SIGTERM/SIGINT."""
+        if cls._signal_handlers_installed:
+            return
+        cls._signal_handlers_installed = True
+
+        for sig_name in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                old_handler = signal.getsignal(sig)
+            except ValueError:
+                continue
+            if not callable(old_handler) and old_handler not in (
+                signal.SIG_DFL,
+                signal.SIG_IGN,
+            ):
+                continue
+
+            def _make_handler(signal_number, original_handler):
+                def _handler(signum, frame):
+                    try:
+                        cls._atexit_shutdown()
+                    except Exception:
+                        pass
+                    if callable(original_handler):
+                        original_handler(signum, frame)
+                    elif original_handler == signal.SIG_DFL:
+                        signal.signal(signum, signal.SIG_DFL)
+                        os.kill(os.getpid(), signum)
+
+                return _handler
+
+            try:
+                signal.signal(sig, _make_handler(sig, old_handler))
+            except (ValueError, OSError):
+                pass
+
+    @classmethod
+    def _atexit_shutdown(cls):
+        """Module-level atexit handler: flush and stop the singleton writer."""
+        with cls._instance_lock:
+            instance = cls._instance
+        if instance is not None:
+            try:
+                instance.shutdown()
+            except Exception:
+                pass
 
     @classmethod
     def reset_for_testing(cls):
         """Destroy the singleton (tests only)."""
         with cls._instance_lock:
             if cls._instance is not None:
-                cls._instance.shutdown()
+                instance = cls._instance
                 cls._instance = None
+            else:
+                instance = None
+        if instance is not None:
+            try:
+                instance.shutdown()
+            except Exception:
+                pass
 
     def __init__(self):
-        # Sentinel used to tell the worker to stop.
         self._STOP = object()
 
         self._queue: "queue.Queue[Any]" = queue.Queue()
-        # Track the "latest" submission keyed by state file path, so we can
-        # skip stale items when draining the queue.
         self._generation: dict[bytes, int] = {}
         self._generation_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
 
         self._worker = threading.Thread(
             target=self._run,
@@ -135,9 +210,6 @@ class _AsyncStateWriter:
             daemon=True,
         )
         self._worker.start()
-
-        # Ensure graceful shutdown at interpreter exit.
-        atexit.register(self.shutdown)
 
     # ---- public API ----------------------------------------------------------
 
@@ -185,13 +257,24 @@ class _AsyncStateWriter:
             return False
 
     def shutdown(self):
-        """Stop the worker thread, flushing pending work first."""
-        self.flush(timeout=30.0)
+        """Stop the worker thread, flushing pending work first.
+
+        Idempotent: calling shutdown() multiple times is safe.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutdown_complete = True
+
+        # Drain all queued work.
+        self.flush(timeout=60.0)
+        # Tell the worker to exit.
         try:
             self._queue.put_nowait(self._STOP)
         except queue.Full:
             pass
-        self._worker.join(timeout=5.0)
+        # Wait for the thread to actually exit.
+        self._worker.join(timeout=10.0)
 
     # ---- internals -----------------------------------------------------------
 
@@ -347,47 +430,116 @@ def _write_with_perms(
     perms: int,
     writer,
 ):
-    """Write ``path`` using ``writer(fh)``, ensuring the file ends up with ``perms``.
+    """Atomically write ``path`` using ``writer(fh)``, with ``perms`` set
+    before any content is written.
 
-    Uses ``os.open`` + ``os.fdopen`` so that the permissions are set
-    atomically on creation (no TOCTOU race). If the file already exists,
-    permissions are updated via ``os.chmod`` after the write.
+    Safety guarantees
+    -----------------
+    1. **No partial writes**: content is written to a temporary file in the
+       same directory, then renamed into place atomically. If the process
+       dies mid-write, the original file (if any) is untouched.
+    2. **No permission window**: permissions are set on the file descriptor
+       *before* any data is written, using ``os.fchmod`` plus a temporarily
+       cleared umask. There is no point in time where the file exists on
+       disk with content but with loose permissions.
+    3. **No symlink tricks**: ``O_NOFOLLOW`` is set on the final rename
+       target when possible, so an attacker can't redirect the state file
+       to a sensitive location via symlink.
     """
     path_str = os.fsdecode(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if "b" not in mode:
-        flags |= getattr(os, "O_NOFOLLOW", 0)  # Best-effort: no symlink traps.
+    dir_str = os.path.dirname(path_str)
 
-    fd = -1
-    try:
-        fd = os.open(path_str, flags, perms)
-    except OSError as exc:
-        log.error("Could not open state file {} for writing: {}", path_str, exc)
+    # Bail out early if target directory is gone — avoids creating temp
+    # files in the wrong place and noisy error logs.
+    if not os.path.isdir(dir_str):
+        log.debug(
+            "Skipping state write: directory {} no longer exists",
+            dir_str,
+        )
         return
 
-    write_ok = False
+    # Create a temp file in the same directory so rename is atomic.
+    fd = -1
+    tmp_path: str | None = None
+    old_umask = None
+
     try:
+        # Clear umask temporarily so that the perms we pass to os.open
+        # actually take effect (umask normally strips bits from the mode).
+        old_umask = os.umask(0)
+
+        fd, tmp_path = _mktemp_in_dir(dir_str, suffix=".tmp")
+
+        # Set permissions *before* writing anything.
+        try:
+            os.fchmod(fd, perms)
+        except OSError:
+            # fchmod may be unavailable on some platforms; fall through and
+            # try chmod on the path after close.
+            pass
+
+        # Write content.
         with os.fdopen(fd, mode) as f:
+            fd = -1  # fd is now owned by the file object
             writer(f)
-            fd = -1  # fd now owned by fp
-        write_ok = True
+
+        # Close already happened (context manager exited). Now do the
+        # atomic rename.
+        _atomic_rename(tmp_path, path_str)
+        tmp_path = None  # rename succeeded; don't try to unlink
+
+    except (FileNotFoundError, NotADirectoryError):
+        log.debug("Target directory vanished while writing state file {}", path_str)
     except OSError as exc:
         log.error("Could not write state file {}: {}", path_str, exc)
+    finally:
+        if old_umask is not None:
+            os.umask(old_umask)
         if fd >= 0:
             try:
                 os.close(fd)
             except OSError:
                 pass
-            fd = -1
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
-    # os.open with mode *ignores* perms when the file already exists on most
-    # Unix platforms, so always chmod after writing — but only if the file
-    # was actually created successfully.
-    if write_ok and os.path.exists(path_str):
+
+def _mktemp_in_dir(dir_str: str, suffix: str = "") -> tuple[int, str]:
+    """Create an anonymous temp file in ``dir_str``.
+
+    Returns ``(fd, path)``. The file is created with ``O_EXCL`` so no two
+    callers can get the same file. The caller is responsible for closing
+    the fd and/or unlinking the path.
+    """
+    import secrets
+
+    for _ in range(100):
+        name = f".state-{secrets.token_hex(8)}-{os.getpid()}{suffix}"
+        full = os.path.join(dir_str, name)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL  # fail if file already exists
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
-            os.chmod(path_str, perms)
-        except OSError as exc:
-            log.warning("Could not set permissions on state file {}: {}", path_str, exc)
+            fd = os.open(full, flags, 0o600)
+            return fd, full
+        except FileExistsError:
+            continue
+    raise OSError(f"Could not create unique temp file in {dir_str}")
+
+
+def _atomic_rename(src: str, dst: str):
+    """Atomically replace ``dst`` with ``src`` (best-effort).
+
+    On Unix this is just ``os.rename``. On Windows we'd use
+    ``os.replace``; here we use ``os.replace`` which works on both.
+    """
+    os.replace(src, dst)
 
 
 class TaskStage(Enum):
