@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -89,8 +90,6 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         plugins.load_plugins()
         out = self.run_with_output("doctor")
         assert "discogs:" in out
-        # We don't assert the specific package because the test env might
-        # have it installed; instead, just check that we get valid output.
         assert "Plugins configured: 1" in out
 
     def test_missing_external_command_detected(self):
@@ -98,17 +97,66 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         plugins.load_plugins()
         out = self.run_with_output("doctor")
         assert "keyfinder:" in out
-        # Either "External commands (missing)" if KeyFinder isn't installed,
-        # or "FAILED" if the plugin load itself fails for another reason.
-        assert "keyfinder:" in out
 
     def test_missing_dep_appears_in_suggestions(self):
         self.config["plugins"] = ["discogs"]
         plugins.load_plugins()
         out = self.run_with_output("doctor")
-        # Suggestions section exists regardless of load result.
         if "discogs_client" in out:
             assert "Suggestions:" in out
+
+    # -- extended native dependency metadata ------------------------
+
+    def test_chroma_includes_chromaprint_native_and_python(self):
+        from beets.ui.commands.doctor import (
+            PLUGIN_DEPENDENCIES,
+            _diagnose_plugin,
+        )
+
+        dep = PLUGIN_DEPENDENCIES["chroma"]
+        assert "chromaprint" in dep.python_packages
+        assert "chromaprint" in dep.external_commands
+        assert "fpcalc" in dep.external_commands
+        assert "acoustid" in dep.python_packages
+
+        self.config["plugins"] = ["chroma"]
+        plugins.load_plugins()
+        diag = _diagnose_plugin("chroma", set())
+        assert diag.has_dependency_info is True
+        assert "chromaprint" in diag.known_python_packages
+        assert "chromaprint" in diag.known_external_commands
+
+    def test_scrub_includes_mutagen_native_dep(self):
+        from beets.ui.commands.doctor import (
+            PLUGIN_DEPENDENCIES,
+            _diagnose_plugin,
+        )
+
+        dep = PLUGIN_DEPENDENCIES["scrub"]
+        assert "mutagen" in dep.python_packages
+
+        diag = _diagnose_plugin("scrub", set())
+        assert "mutagen" in diag.known_python_packages
+
+    def test_dependency_info_populated_in_json(self):
+        self.config["plugins"] = ["info"]
+        plugins.load_plugins()
+        out = self.run_with_output("doctor", "-f", "json")
+        data = json.loads(out)
+        diag = data["plugins"][0]
+        assert "has_dependency_info" in diag
+        assert "known_python_packages" in diag
+        assert "known_external_commands" in diag
+        assert isinstance(diag["known_python_packages"], list)
+        assert isinstance(diag["known_external_commands"], list)
+
+    def test_unknown_plugin_has_no_dependency_info(self):
+        from beets.ui.commands.doctor import _diagnose_plugin
+
+        diag = _diagnose_plugin("completely_unknown_plugin_42", set())
+        assert diag.has_dependency_info is False
+        assert diag.known_python_packages == []
+        assert diag.known_external_commands == []
 
     # -- --details flag ---------------------------------------------
 
@@ -116,11 +164,9 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         self.config["plugins"] = ["info"]
         plugins.load_plugins()
         out = self.run_with_output("doctor", "--details")
-        # info plugin has no dep info, should still be visible
         assert "info: OK" in out
 
     def test_details_includes_dependency_status_for_loaded_plugins(self):
-        # ``fetchart`` has known Python deps.
         self.config["plugins"] = ["fetchart"]
         plugins.load_plugins()
         out = self.run_with_output("doctor", "--details")
@@ -144,6 +190,7 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         assert data["plugins"][0]["loaded"] is True
         assert data["plugins_configured"] == 1
         assert data["plugins_loaded"] == 1
+        assert "has_dependency_info" in data["plugins"][0]
 
     def test_json_output_captures_failed_plugin(self):
         self.config["plugins"] = ["nonexistent_plugin_xyz"]
@@ -190,10 +237,65 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         from beets.ui.commands.doctor import _probe_import
 
         exc_type, exc_msg, exc_tb = _probe_import("info")
-        # info plugin has no deps and should always import cleanly.
         assert exc_type is None
         assert exc_msg is None
         assert exc_tb is None
+
+    def test_probe_import_handles_recursion_error_friendly(self):
+        from beets.ui.commands.doctor import _probe_import
+
+        with patch(
+            "beets.ui.commands.doctor.importlib.import_module",
+            side_effect=RecursionError("infinite loop"),
+        ):
+            exc_type, exc_msg, exc_tb = _probe_import("info")
+
+        assert exc_type == "RecursionError"
+        assert exc_msg is not None
+        assert "fatal exception" in exc_msg.lower()
+        assert exc_tb is None
+
+    def test_probe_import_handles_memory_error_friendly(self):
+        from beets.ui.commands.doctor import _probe_import
+
+        with patch(
+            "beets.ui.commands.doctor.importlib.import_module",
+            side_effect=MemoryError("oom"),
+        ):
+            exc_type, exc_msg, exc_tb = _probe_import("info")
+
+        assert exc_type == "MemoryError"
+        assert "fatal exception" in exc_msg.lower()
+        assert exc_tb is None
+
+    def test_probe_import_handles_system_exit_friendly(self):
+        from beets.ui.commands.doctor import _probe_import
+
+        with patch(
+            "beets.ui.commands.doctor.importlib.import_module",
+            side_effect=SystemExit(1),
+        ):
+            exc_type, exc_msg, exc_tb = _probe_import("info")
+
+        assert exc_type == "SystemExit"
+        assert "fatal exception" in exc_msg.lower()
+        assert exc_tb is None
+
+    def test_probe_import_no_traceback_for_fatal_exceptions(self):
+        from beets.ui.commands.doctor import _probe_import
+
+        for exc_class in (
+            RecursionError,
+            MemoryError,
+            KeyboardInterrupt,
+            SystemExit,
+        ):
+            with patch(
+                "beets.ui.commands.doctor.importlib.import_module",
+                side_effect=exc_class("boom"),
+            ):
+                _, _, exc_tb = _probe_import("info")
+                assert exc_tb is None
 
     # -- PluginDiagnosis dataclass ----------------------------------
 
@@ -205,6 +307,9 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         assert diag.loaded is True
         assert isinstance(diag.missing_python_packages, list)
         assert isinstance(diag.missing_external_commands, list)
+        assert isinstance(diag.has_dependency_info, bool)
+        assert isinstance(diag.known_python_packages, list)
+        assert isinstance(diag.known_external_commands, list)
 
     def test_plugin_diagnosis_records_failure(self):
         from beets.ui.commands.doctor import _diagnose_plugin
@@ -214,6 +319,41 @@ class TestDoctorCommand(IOMixin, PytestTestHelper):
         diag = _diagnose_plugin("nonexistent_plugin_xyz", set())
         assert diag.loaded is False
         assert diag.load_exception_type is not None
+
+    def test_plugin_diagnosis_includes_known_deps(self):
+        from beets.ui.commands.doctor import _diagnose_plugin
+
+        diag = _diagnose_plugin("chroma", set())
+        assert "acoustid" in diag.known_python_packages
+        assert "chromaprint" in diag.known_python_packages
+        assert "fpcalc" in diag.known_external_commands
+        assert "chromaprint" in diag.known_external_commands
+        assert diag.has_dependency_info is True
+
+    # -- unified rendering ------------------------------------------
+
+    def test_text_and_json_output_share_same_diagnosis_data(self):
+        self.config["plugins"] = ["discogs", "info", "nonexistent_plugin_xyz"]
+        plugins.load_plugins()
+
+        text_out = self.run_with_output("doctor")
+        json_out = self.run_with_output("doctor", "-f", "json")
+        data = json.loads(json_out)
+
+        assert data["plugins_configured"] == 3
+        assert f"Plugins configured: {data['plugins_configured']}" in text_out
+        assert f"Plugins loaded: {data['plugins_loaded']}" in text_out
+
+        plugin_names = {d["name"] for d in data["plugins"]}
+        assert plugin_names == {"discogs", "info", "nonexistent_plugin_xyz"}
+
+        for diag in data["plugins"]:
+            if diag["loaded"]:
+                assert f"{diag['name']}: OK" in text_out
+            else:
+                assert f"{diag['name']}: FAILED" in text_out
+                if diag["load_exception_message"]:
+                    assert diag["load_exception_type"] in text_out
 
 
 class TestPluginLoadFailureAPI(PytestTestHelper):
@@ -229,7 +369,6 @@ class TestPluginLoadFailureAPI(PytestTestHelper):
         assert plugins.plugin_load_failures() == []
 
     def test_clear_plugin_state_resets_everything(self):
-        # load a known-good plugin
         self.config["plugins"] = ["info"]
         plugins.load_plugins()
         assert len(list(plugins.find_plugins())) >= 1

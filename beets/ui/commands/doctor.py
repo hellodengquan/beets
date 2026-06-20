@@ -32,6 +32,9 @@ class PluginDiagnosis:
     load_exception_type: str | None = None
     load_exception_message: str | None = None
     load_exception_traceback: str | None = None
+    has_dependency_info: bool = False
+    known_python_packages: list[str] = field(default_factory=list)
+    known_external_commands: list[str] = field(default_factory=list)
 
 
 PLUGIN_DEPENDENCIES: dict[str, DependencyInfo] = {
@@ -47,25 +50,47 @@ PLUGIN_DEPENDENCIES: dict[str, DependencyInfo] = {
     "badfiles": DependencyInfo(
         python_packages=[], external_commands=["mp3val", "flac"]
     ),
+    "beatport": DependencyInfo(
+        python_packages=["requests_oauthlib"], external_commands=[]
+    ),
     "bpd": DependencyInfo(python_packages=["gi"], external_commands=[]),
     "chroma": DependencyInfo(
-        python_packages=["acoustid", "pyacoustid"],
+        python_packages=["acoustid", "chromaprint"],
         external_commands=["fpcalc", "chromaprint"],
     ),
     "convert": DependencyInfo(python_packages=[], external_commands=["ffmpeg"]),
     "discogs": DependencyInfo(
         python_packages=["discogs_client"], external_commands=[]
     ),
+    "duplicates": DependencyInfo(python_packages=[], external_commands=[]),
+    "edit": DependencyInfo(python_packages=[], external_commands=[]),
     "embedart": DependencyInfo(python_packages=["PIL"], external_commands=[]),
+    "embyupdate": DependencyInfo(
+        python_packages=["requests"], external_commands=[]
+    ),
+    "export": DependencyInfo(python_packages=[], external_commands=[]),
     "fetchart": DependencyInfo(
         python_packages=["bs4", "langdetect", "PIL", "requests"],
         external_commands=[],
     ),
+    "filefilter": DependencyInfo(python_packages=[], external_commands=[]),
+    "freedesktop": DependencyInfo(
+        python_packages=["pyxdg", "dbus"], external_commands=[]
+    ),
+    "fromfilename": DependencyInfo(python_packages=[], external_commands=[]),
+    "ftintitle": DependencyInfo(python_packages=[], external_commands=[]),
+    "hook": DependencyInfo(python_packages=[], external_commands=[]),
     "import": DependencyInfo(
         python_packages=["py7zr", "rarfile"], external_commands=[]
     ),
+    "importfeeds": DependencyInfo(python_packages=[], external_commands=[]),
+    "info": DependencyInfo(python_packages=[], external_commands=[]),
+    "inline": DependencyInfo(python_packages=[], external_commands=[]),
     "keyfinder": DependencyInfo(
         python_packages=[], external_commands=["KeyFinder"]
+    ),
+    "kodiupdate": DependencyInfo(
+        python_packages=["requests"], external_commands=[]
     ),
     "lastgenre": DependencyInfo(
         python_packages=["pylast"], external_commands=[]
@@ -73,29 +98,45 @@ PLUGIN_DEPENDENCIES: dict[str, DependencyInfo] = {
     "lastimport": DependencyInfo(
         python_packages=["pylast"], external_commands=[]
     ),
+    "limit": DependencyInfo(python_packages=[], external_commands=[]),
+    "loadext": DependencyInfo(python_packages=[], external_commands=[]),
     "lyrics": DependencyInfo(
         python_packages=["bs4", "langdetect", "requests"], external_commands=[]
     ),
-    "metasync": DependencyInfo(python_packages=["dbus"], external_commands=[]),
-    "mpdstats": DependencyInfo(python_packages=["mpd"], external_commands=[]),
+    "mbcollection": DependencyInfo(python_packages=[], external_commands=[]),
     "mbsubmit": DependencyInfo(
         python_packages=[], external_commands=["picard"]
     ),
+    "mbsync": DependencyInfo(python_packages=[], external_commands=[]),
+    "metasync": DependencyInfo(python_packages=["dbus"], external_commands=[]),
+    "missing": DependencyInfo(python_packages=[], external_commands=[]),
+    "mpdstats": DependencyInfo(python_packages=["mpd"], external_commands=[]),
+    "mpdupdate": DependencyInfo(python_packages=["mpd"], external_commands=[]),
+    "musicbrainz": DependencyInfo(python_packages=[], external_commands=[]),
+    "parentwork": DependencyInfo(python_packages=[], external_commands=[]),
+    "permissions": DependencyInfo(python_packages=[], external_commands=[]),
+    "play": DependencyInfo(python_packages=[], external_commands=[]),
     "plexupdate": DependencyInfo(
         python_packages=["requests"], external_commands=[]
+    ),
+    "playlist": DependencyInfo(python_packages=[], external_commands=[]),
+    "random": DependencyInfo(python_packages=[], external_commands=[]),
+    "reflink": DependencyInfo(
+        python_packages=["reflink"], external_commands=[]
     ),
     "replaygain": DependencyInfo(
         python_packages=["gi"],
         external_commands=["ffmpeg", "mp3gain", "aacgain"],
     ),
     "scrub": DependencyInfo(python_packages=["mutagen"], external_commands=[]),
+    "smartplaylist": DependencyInfo(python_packages=[], external_commands=[]),
     "sonosupdate": DependencyInfo(
         python_packages=["soco"], external_commands=[]
     ),
-    "tidal": DependencyInfo(
-        python_packages=["requests_oauthlib"], external_commands=[]
+    "spotify": DependencyInfo(
+        python_packages=["requests", "requests_oauthlib"], external_commands=[]
     ),
-    "beatport": DependencyInfo(
+    "tidal": DependencyInfo(
         python_packages=["requests_oauthlib"], external_commands=[]
     ),
     "thumbnails": DependencyInfo(
@@ -104,20 +145,14 @@ PLUGIN_DEPENDENCIES: dict[str, DependencyInfo] = {
     "titlecase": DependencyInfo(
         python_packages=["titlecase"], external_commands=[]
     ),
+    "type": DependencyInfo(python_packages=[], external_commands=[]),
+    "unimported": DependencyInfo(python_packages=[], external_commands=[]),
+    "update": DependencyInfo(python_packages=[], external_commands=[]),
     "web": DependencyInfo(
         python_packages=["flask", "flask_cors"], external_commands=[]
     ),
-    "embyupdate": DependencyInfo(
-        python_packages=["requests"], external_commands=[]
-    ),
-    "kodiupdate": DependencyInfo(
-        python_packages=["requests"], external_commands=[]
-    ),
     "aura": DependencyInfo(
         python_packages=["flask", "flask_cors", "PIL"], external_commands=[]
-    ),
-    "reflink": DependencyInfo(
-        python_packages=["reflink"], external_commands=[]
     ),
 }
 
@@ -155,6 +190,10 @@ def _probe_import(name: str) -> tuple[str | None, str | None, str | None]:
     exceptions beyond what a simple top-level ``importlib.import_module``
     would surface for the plugin's transitive dependencies (e.g. librosa
     failing because its native C extension is missing).
+
+    Fatal exceptions such as RecursionError, MemoryError, and
+    KeyboardInterrupt are caught and returned as a friendly error message
+    rather than propagated.
     """
     module_path = f"{plugins.PLUGIN_NAMESPACE}.{name}"
     try:
@@ -162,6 +201,12 @@ def _probe_import(name: str) -> tuple[str | None, str | None, str | None]:
             importlib.reload(sys.modules[module_path])
         else:
             importlib.import_module(module_path)
+    except (RecursionError, MemoryError, KeyboardInterrupt, SystemExit) as exc:
+        return (
+            type(exc).__name__,
+            f"plugin module raised fatal exception {type(exc).__name__}: {exc}",
+            None,
+        )
     except Exception as exc:
         tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
         return (type(exc).__name__, str(exc), "".join(tb))
@@ -174,7 +219,13 @@ def _diagnose_plugin(name: str, loaded: set[str]) -> PluginDiagnosis:
 
     missing_pkgs: list[str] = []
     missing_cmds: list[str] = []
+    known_pkgs: list[str] = []
+    known_cmds: list[str] = []
+    has_info = dep_info is not None
+
     if dep_info:
+        known_pkgs = list(dep_info.python_packages)
+        known_cmds = list(dep_info.external_commands)
         for pkg in dep_info.python_packages:
             available, _ = _check_python_package(pkg)
             if not available:
@@ -213,7 +264,84 @@ def _diagnose_plugin(name: str, loaded: set[str]) -> PluginDiagnosis:
         load_exception_type=exc_type,
         load_exception_message=exc_msg,
         load_exception_traceback=exc_tb,
+        has_dependency_info=has_info,
+        known_python_packages=known_pkgs,
+        known_external_commands=known_cmds,
     )
+
+
+def _render_plugin_text(diag: PluginDiagnosis, details: bool) -> list[str]:
+    if diag.loaded:
+        status = colorize("text_success", "OK")
+    else:
+        status = colorize("text_error", "FAILED")
+
+    lines = [f"  {diag.name}: {status}"]
+    should_show = details or not diag.loaded
+
+    if not should_show:
+        return lines
+
+    if diag.missing_python_packages:
+        pkg_status = colorize("text_error", "missing")
+        lines.append(
+            f"    Python packages ({pkg_status}): "
+            f"{', '.join(diag.missing_python_packages)}"
+        )
+    elif diag.known_python_packages and details:
+        pkg_status = colorize("text_success", "all installed")
+        lines.append(f"    Python packages ({pkg_status})")
+
+    if diag.missing_external_commands:
+        cmd_status = colorize("text_error", "missing")
+        lines.append(
+            f"    External commands ({cmd_status}): "
+            f"{', '.join(diag.missing_external_commands)}"
+        )
+    elif diag.known_external_commands and details:
+        cmd_status = colorize("text_success", "all found")
+        lines.append(f"    External commands ({cmd_status})")
+
+    if diag.load_exception_type and not diag.loaded:
+        lines.append(
+            f"    Load error ({diag.load_exception_type}): "
+            f"{diag.load_exception_message}"
+        )
+
+    if not diag.has_dependency_info and details:
+        lines.append("    (no dependency info recorded)")
+
+    return lines
+
+
+def _render_suggestions_text(failed: list[PluginDiagnosis]) -> list[str]:
+    lines = []
+    for diag in sorted(failed, key=lambda d: d.name):
+        if diag.has_dependency_info:
+            if diag.missing_python_packages:
+                lines.append(
+                    f"  {diag.name}: Install missing Python packages: "
+                    f"{', '.join(diag.missing_python_packages)}"
+                )
+            if diag.missing_external_commands:
+                lines.append(
+                    f"  {diag.name}: Install missing external commands: "
+                    f"{', '.join(diag.missing_external_commands)}"
+                )
+            if (
+                not diag.missing_python_packages
+                and not diag.missing_external_commands
+            ):
+                lines.append(
+                    f"  {diag.name}: All known dependencies are present. "
+                    f"Use 'beet -vv' to diagnose further."
+                )
+        else:
+            lines.append(
+                f"  {diag.name}: No dependency info available. "
+                f"Use 'beet -vv' to diagnose further."
+            )
+    return lines
 
 
 def _format_text(diagnoses: list[PluginDiagnosis], details: bool) -> None:
@@ -236,57 +364,10 @@ def _format_text(diagnoses: list[PluginDiagnosis], details: bool) -> None:
     ui.print_("Plugin Status:")
     failed: list[PluginDiagnosis] = []
     for diag in diagnoses:
-        if diag.loaded:
-            status = colorize("text_success", "OK")
-        else:
-            status = colorize("text_error", "FAILED")
+        if not diag.loaded:
             failed.append(diag)
-
-        ui.print_(f"  {diag.name}: {status}")
-
-        should_show = details or not diag.loaded
-
-        if should_show:
-            if diag.missing_python_packages:
-                pkg_status = colorize("text_error", "missing")
-                ui.print_(
-                    f"    Python packages ({pkg_status}): "
-                    f"{', '.join(diag.missing_python_packages)}"
-                )
-            elif (
-                PLUGIN_DEPENDENCIES.get(diag.name)
-                and PLUGIN_DEPENDENCIES[diag.name].python_packages
-                and details
-            ):
-                pkg_status = colorize("text_success", "all installed")
-                ui.print_(f"    Python packages ({pkg_status})")
-
-            if diag.missing_external_commands:
-                cmd_status = colorize("text_error", "missing")
-                ui.print_(
-                    f"    External commands ({cmd_status}): "
-                    f"{', '.join(diag.missing_external_commands)}"
-                )
-            elif (
-                PLUGIN_DEPENDENCIES.get(diag.name)
-                and PLUGIN_DEPENDENCIES[diag.name].external_commands
-                and details
-            ):
-                cmd_status = colorize("text_success", "all found")
-                ui.print_(f"    External commands ({cmd_status})")
-
-            if diag.load_exception_type and not diag.loaded:
-                ui.print_(
-                    f"    Load error ({diag.load_exception_type}): "
-                    f"{diag.load_exception_message}"
-                )
-
-            if (
-                diag.name not in PLUGIN_DEPENDENCIES
-                and diag.name not in {d.name for d in failed}
-                and details
-            ):
-                ui.print_("    (no dependency info recorded)")
+        for line in _render_plugin_text(diag, details=details):
+            ui.print_(line)
 
     if failed:
         ui.print_("")
@@ -296,32 +377,8 @@ def _format_text(diagnoses: list[PluginDiagnosis], details: bool) -> None:
         )
         ui.print_("")
         ui.print_("Suggestions:")
-        for diag in sorted(failed, key=lambda d: d.name):
-            dep_info = PLUGIN_DEPENDENCIES.get(diag.name)
-            if dep_info:
-                if diag.missing_python_packages:
-                    ui.print_(
-                        f"  {diag.name}: Install missing Python packages: "
-                        f"{', '.join(diag.missing_python_packages)}"
-                    )
-                if diag.missing_external_commands:
-                    ui.print_(
-                        f"  {diag.name}: Install missing external commands: "
-                        f"{', '.join(diag.missing_external_commands)}"
-                    )
-                if (
-                    not diag.missing_python_packages
-                    and not diag.missing_external_commands
-                ):
-                    ui.print_(
-                        f"  {diag.name}: All known dependencies are present. "
-                        f"Use 'beet -vv' to diagnose further."
-                    )
-            else:
-                ui.print_(
-                    f"  {diag.name}: No dependency info available. "
-                    f"Use 'beet -vv' to diagnose further."
-                )
+        for line in _render_suggestions_text(failed):
+            ui.print_(line)
 
 
 def _format_json(diagnoses: list[PluginDiagnosis]) -> None:
