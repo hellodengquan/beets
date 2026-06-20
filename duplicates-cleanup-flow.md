@@ -64,6 +64,67 @@ beet dup -C 'md5sum {file}'
 
 > **代码依据**：`_checksum()` 方法（`duplicates.py:247-278`）
 
+### 1.6 移动/复制时路径格式的优先级关系
+
+duplicates 插件自身**没有 path_format 配置项**（grep `duplicates.py` 无 `path_format`/`path_formats`/`paths` 匹配）。当执行 `--move` 或 `--copy` 时，目标路径的计算完全委托给 `item.move(basedir=move)` 和 `item.destination(basedir=move)`。
+
+**路径生成调用链**：
+
+```
+duplicates._process_item()
+  └─ item.move(basedir=move)          # duplicates.py:233
+       └─ dest = self.destination(basedir=move)   # models.py:1118
+            └─ path_formats = path_formats or self.db.path_formats  # models.py:1159
+                 └─ self.db.path_formats → get_path_formats(config["paths"])  # library.py:43-44
+```
+
+**关键代码**（`library/models.py:1147-1159`）：
+
+```python
+def destination(self, relative_to_libdir=False, basedir=None, path_formats=None):
+    basedir = basedir or self.db.directory
+    path_formats = path_formats or self.db.path_formats  # ← 始终走全局配置
+```
+
+- `basedir` 参数：由 `--move`/`--copy` 传入的目标目录，覆盖 `self.db.directory`
+- `path_formats` 参数：**始终为 `None`**（`item.move()` 不传此参数），回退到 `self.db.path_formats`
+- `self.db.path_formats` 由全局 `config["paths"]` 生成（`library.py:43-44`），即 beets 的 `paths:` 配置段
+
+**`paths` 配置的查询匹配机制**（`library/models.py:1161-1176`）：
+
+```python
+for query, path_format in path_formats:
+    if query == PF_KEY_DEFAULT:
+        continue
+    query, _ = parse_query_string(query, type(self))
+    if query.match(self):     # 条目匹配查询 → 使用对应 path_format
+        break
+else:
+    for query, path_format in path_formats:  # 无匹配 → 使用 default
+        if query == PF_KEY_DEFAULT:
+            break
+```
+
+**优先级结论**：
+
+| 来源 | 是否影响 duplicates 的路径 | 说明 |
+|------|---------------------------|------|
+| `config["paths"]` 全局配置 | ✓ **决定性影响** | `destination()` 直接读取此配置生成子路径 |
+| `config["paths"]["default"]` | ✓ 默认回退 | 无查询匹配时使用 |
+| `config["paths"]["comp:true"]` | ✓ 条件覆盖 | 合辑专辑走此路径模板 |
+| `config["paths"]["singleton:true"]` | ✓ 条件覆盖 | 单曲走此路径模板 |
+| `--move DEST` 参数 | ✓ 仅影响 basedir | 只改变根目录，子路径仍由 paths 配置决定 |
+| `--copy DEST` 参数 | ✓ 仅影响 basedir | 同上 |
+| duplicates 插件自身 | ✗ **无路径配置** | 完全依赖全局 paths |
+
+**实际影响**：执行 `beet dup --move ~/trash/` 时，文件的目标路径为 `~/trash/<paths配置生成的子路径>`，而非 `~/trash/<原文件名>`。如果全局 `paths` 配置了复杂的目录结构（如 `$albumartist/$album%aunique{}/$track $title`），移入隔离区的文件会按同样结构组织，而非扁平放置。
+
+**如何绕过全局 paths 获取扁平路径**：使用 `--path` 输出原路径，自行用 shell 脚本移动：
+
+```bash
+beet dup --path -f '$path' | while read f; do mv "$f" ~/trash/; done
+```
+
 ---
 
 ## 二、优先级排序机制
@@ -522,6 +583,116 @@ def remove(self):
         tx.mutate(f"DELETE FROM {self._flex_table} WHERE entity_id=?", (self.id,))
 ```
 
+**SQLite3 事务回滚边界的完整代码分析**：
+
+`Transaction` 类（`dbcore/db.py:962-1073`）的回滚行为分为三层：
+
+**第一层：`Transaction.__enter__`**（L975-986）— 入口保护
+
+```python
+def __enter__(self):
+    with self.db._tx_stack() as stack:
+        first = not stack
+        stack.append(self)
+    if first:
+        # 首个事务获取 DB 锁
+        self.db._db_lock.acquire()
+    return self
+```
+
+- 只有"根事务"（stack 为空时）才获取 `_db_lock`，对应 SQLite 的 `BEGIN`
+- 嵌套事务共享外层锁，不产生新的 SQLite 事务
+- **关键**：Python 的 `sqlite3` 模块在首次执行 SQL 时隐式开启事务（`BEGIN DEFERRED`），而非 `__enter__` 显式开启
+
+**第二层：`Transaction.__exit__`**（L988-1015）— 提交/回滚决策
+
+```python
+def __exit__(self, exc_type, exc_value, traceback):
+    self.db.revision += self._mutated
+    with self.db._tx_stack() as stack:
+        assert stack.pop() is self
+        empty = not stack
+    if empty:
+        # 根事务退出 → commit
+        self.db._connection().commit()
+        self._mutated = False
+        self.db._db_lock.release()
+    # ...
+    return None   # ← 不 suppress 任何异常
+```
+
+**核心问题**：`__exit__` 返回 `None`，**不会 suppress 异常**。这意味着：
+
+| 异常来源 | 数据库行为 | 文件系统行为 |
+|---------|-----------|------------|
+| `tx.mutate()` 内 SQLite 操作失败 | Python `sqlite3` 自动回滚当前语句，事务继续 | 无影响 |
+| `tx.mutate()` 抛出 `OperationalError` | `_handle_mutate` 转为 `DBAccessError` 向上传播 | 无影响 |
+| `with self.db.transaction()` 块内异常 | `__exit__` 不 commit，Python `sqlite3` 在连接关闭时自动 rollback | 无影响 |
+| `with self.db.transaction()` 块正常退出 | `__exit__` 调用 `connection().commit()` | 无影响 |
+
+**第三层：`_handle_mutate`**（L1026-1052）— SQL 变异错误处理
+
+```python
+@contextmanager
+def _handle_mutate(self):
+    try:
+        yield
+    except sqlite3.OperationalError as e:
+        if e.args[0] == "unable to open database file":
+            raise DBAccessError(...)
+        elif e.args[0] == "attempt to write a readonly database":
+            raise DBAccessError(...)
+        raise   # 其他 OperationalError 直接向上传播
+    else:
+        self._mutated = True   # 成功才标记为已变异
+```
+
+- SQLite 的单条语句失败会自动回滚该语句，不影响事务内其他已执行的语句
+- 但 `_mutated` 标志仅在 `else` 分支（成功时）设置，**如果某条 mutate 失败，后续 commit 时事务内的其他成功语句仍会被提交**
+
+**`store()` 的具体回滚场景**（`dbcore/db.py:645-689`）：
+
+```python
+def store(self, fields=None):
+    # ... 构建 assignments, subvars, flex attrs ...
+    with self.db.transaction() as tx:
+        if assignments:
+            tx.mutate(f"UPDATE {self._table} SET ...")        # 1. 更新主表
+        for key, value in self._values_flex.items():
+            if key in self._dirty:
+                tx.mutate(f"INSERT INTO {self._flex_table} "  # 2. 写入 flex
+                           "(entity_id, key, value) VALUES ...")
+        for key in self._dirty:
+            tx.mutate(f"DELETE FROM {self._flex_table} ...")   # 3. 删除 flex
+    self.clear_dirty()   # ← 事务外！即使事务回滚，dirty 标志也被清除
+```
+
+**回滚边界总结**：
+
+| 场景 | 主表 UPDATE | flex INSERT | flex DELETE | dirty 标志 | 文件系统 |
+|------|------------|-------------|-------------|-----------|---------|
+| 全部成功 | ✓ committed | ✓ committed | ✓ committed | ✓ 清除 | 视动作 |
+| 主表成功，flex INSERT 失败 | ✓ committed* | ✗ 回滚 | ✗ 未执行 | ✓ 清除（bug!） | 视动作 |
+| 事务正常但 `util.remove()` 失败 | ✓ committed | ✓ committed | ✓ committed | ✓ 清除 | ✗ 文件仍在 |
+
+> *注意：SQLite 的隐式事务模型下，如果单条 INSERT 失败（如唯一约束冲突），`_handle_mutate` 会重新 raise 异常，导致 `__exit__` 不执行 commit。此时整个 `store()` 事务块内的所有变更**都不会被 commit**，Python `sqlite3` 会在下次 `commit()` 或连接关闭时回滚。但如果异常发生在 `store()` 之外的文件操作阶段，数据库变更**已经 commit**，无法回滚。*
+
+**`clear_dirty()` 的隐患**：`self.clear_dirty()` 在 `with self.db.transaction()` 块**之外**执行（L689）。如果事务因异常未 commit，dirty 标志已被清除，下次 `store()` 不会重试写入这些字段——**数据丢失而无声无息**。
+
+**duplicates 批处理中的实际风险**：
+
+对于 `beet dup --delete`，每个 item 的处理流程是：
+
+```
+item.remove(delete=True)
+  ├─ super().remove()          # 数据库事务：DELETE → commit → 不可逆
+  ├─ plugins.send("item_removed")  # 事件广播，同步执行
+  ├─ util.remove(self.path)    # 文件硬删，可能失败
+  └─ prune_dirs(...)           # 目录清理，可能失败
+```
+
+如果 `util.remove()` 失败（权限不足），数据库记录**已经 commit 删除**，但文件仍在磁盘上——产生"孤儿文件"（磁盘上有文件但库中无记录）。这与前面分析的"半删除"不一致状态是同一问题的不同表现。
+
 **文件系统操作在事务外**。`Transaction.__exit__` 方法（`dbcore/db.py:988-1015`）仅处理数据库回滚：
 - 异常发生时，SQLite 事务会回滚（`return None` 不 suppress 异常）
 - 但 `util.remove()` 已经执行过的文件删除**不会回滚**
@@ -874,6 +1045,96 @@ def send(event, **arguments):
 - 监听者列表固定，duplicates 不注册任何监听
 - 因此不存在"多个插件同时修改同一个 item"的并发问题
 
+#### 7.6.5 与 lyrics、scrub 等元数据型插件的钩子冲突分析
+
+**lyrics 插件的钩子注册**（`lyrics.py:1014`）：
+
+```python
+self.import_stages = [self.imported]
+```
+
+- 注册为 `import_stages`（非 `early_import_stages`），在导入流水线中作为 `plugin_stage` 执行
+- `imported()` 方法（`lyrics.py:1073-1082`）遍历 `task.imported_items()`，调用 `add_item_lyrics()`
+- 最终通过 `item.lyrics = lyrics_text` + `item.store()` 写入数据库，`item.try_write()` 写入文件标签
+
+**scrub 插件的钩子注册**（`scrub.py:51-52`）：
+
+```python
+if self.config["auto"]:
+    self.register_listener("import_task_files", self.import_task_files)
+```
+
+- 监听 `import_task_files` 事件，在导入文件操作完成后触发
+- `import_task_files()` 方法（`scrub.py:143-147`）对每个导入的 item 执行 `_scrub_item(item, ui.should_write())`
+- `_scrub_item()` 先**删除所有标签**（`_scrub(item.path)`），再**写回数据库中的标签**（`item.try_write()`）
+
+**import 流水线中的执行顺序**（`importer/stages.py:277-306`）：
+
+```
+1. early_import_stages    ← convert.auto_convert 等
+2. _apply_choice()        ← apply_metadata + plugins.send("import_task_apply")
+3. task.add()             ← 入库
+4. import_stages          ← lyrics.imported, lastgenre.imported 等
+5. manipulate_files()     ← 移动/复制/写入文件
+6. task.finalize()
+   └─ plugins.send("import_task_files", ...)  ← scrub.import_task_files
+                                                   fetchart.assign_art
+                                                   embedart.import_task_files
+```
+
+**duplicates 与 lyrics 的潜在冲突**：
+
+| 场景 | lyrics 行为 | duplicates 行为 | 冲突分析 |
+|------|-----------|----------------|---------|
+| `beet dup --delete` 删除有歌词的条目 | 不介入 | `item.remove(delete=True)` 删库+删文件 | 歌词随文件一起被硬删，无特殊处理 |
+| `beet dup --tag dup=1` 标记有歌词的条目 | 不介入 | 仅修改 flexattr | 歌词不受影响 |
+| `beet dup --merge` 合并重复项 | 不介入 | 从后续条目填充保留项的空字段 | 如果保留项缺少 `lyrics` 字段，可能从重复项中取值填充 |
+| `beet lyrics` 手动抓歌词期间跑 `beet dup --delete` | 正在写入文件标签 | 可能删除同一文件 | `OSError` 导致批处理中断 |
+| `beet dup --remove` 移除库引用但保留文件 | 不介入 | 文件保留在磁盘 | 歌词仍在文件标签中，但库中无记录 |
+
+**duplicates 与 scrub 的潜在冲突**：
+
+| 场景 | scrub 行为 | duplicates 行为 | 冲突分析 |
+|------|-----------|----------------|---------|
+| scrub 在 import 时自动清洗标签 | 删所有标签后重写 | 不介入 import | 无冲突 |
+| `beet scrub` 手动清洗后跑 `beet dup` | 标签已清洗重写 | 基于 MBID 分组不受影响 | 无冲突 |
+| `beet dup --merge` 合并后 scrub | 不介入 | merge 修改了保留项字段 | 合并后的字段可能被 scrub 清洗掉（如果 scrub 执行了手动 `beet scrub`） |
+| `beet dup --delete` 与 `beet scrub` 同时运行 | scrub 读写文件 | 删除同一文件 | `OSError` 竞态 |
+
+**关键代码路径：`item_removed` 事件是否被 lyrics/scrub 接收**：
+
+```python
+# library/models.py:1077
+plugins.send("item_removed", item=self)
+```
+
+搜索 lyrics.py 和 scrub.py 中对 `item_removed` 的监听——**均无匹配**。这意味着：
+
+- 删除条目时 lyrics 不会清理其歌词缓存
+- 删除条目时 scrub 不会清洗即将被删的文件标签
+- **不存在钩子级别的冲突**
+
+但存在**数据层面的副作用**：
+
+1. **lyrics 的 flexattr 残留**：lyrics 将歌词存为 `item.lyrics` flexattr，条目被 `item.remove()` 删除时，flexattr 随主记录一起从 `item_attributes` 表删除（`dbcore/db.py:708-709`）。但如果用 `--remove`（仅删库），文件标签中的歌词仍然存在，下次 `beet import` 可能重新读取并创建新条目。
+
+2. **scrub 的 `auto` 模式与 `--merge` 的时序**：scrub 在 `import_task_files` 阶段执行，duplicates 的 `--merge` 在 `beet dup` 命令中执行。两者永远不会同时作用于同一个导入流程，但如果先 `import`（触发 scrub），再 `beet dup --merge`，merge 从 scrub 后的干净标签中取值是安全的。
+
+3. **`database_change` 事件的无害广播**：duplicates 的 `item.store()` 会广播 `database_change`，lyrics 和 scrub 都不监听此事件，**零副作用**。
+
+**完整的事件交互矩阵**：
+
+| 事件 | 触发者 | lyrics | scrub | duplicates |
+|------|--------|--------|-------|------------|
+| `import_task_apply` | import 流程 | - | - | - |
+| `import_stages` | import 流程 | ✓ 抓歌词 | - | - |
+| `import_task_files` | import finalize | - | ✓ 清洗标签 | - |
+| `item_removed` | `item.remove()` | - | - | - |
+| `database_change` | `item.store()/remove()` | - | - | - |
+| `album_imported` | import finalize | - | - | - |
+
+> **结论**：duplicates 与 lyrics/scrub 之间**不存在钩子冲突**，仅存在数据层面的间接影响。最安全的操作顺序是：import（lyrics/scrub/fetchart 自动运行）→ `beet dup` 清理重复。
+
 ---
 
 ## 八、代码速查索引
@@ -901,3 +1162,11 @@ def send(event, **arguments):
 | **事务回滚机制** | `beets/dbcore/db.py` | `Transaction.__exit__()` L988-1015 |
 | **事件广播机制** | `beets/plugins.py` | `send()` L642-655 |
 | **fetchart 注册监听** | `beetsplug/fetchart.py` | `__init__` L1403-1404 |
+| **lyrics 注册 import_stages** | `beetsplug/lyrics.py` | `__init__` L1014, `imported()` L1073 |
+| **scrub 注册 listener** | `beetsplug/scrub.py` | `__init__` L51-52, `import_task_files()` L143 |
+| **路径格式全局配置** | `beets/library/library.py` | `path_formats` L43-44 |
+| **路径格式查询匹配** | `beets/library/models.py` | `destination()` L1161-1176 |
+| **路径格式加载** | `beets/util/pathformats.py` | `get_path_formats()` L20-31 |
+| **store() 事务与 dirty 标志** | `beets/dbcore/db.py` | `store()` L645-689 |
+| **_handle_mutate 错误处理** | `beets/dbcore/db.py` | `_handle_mutate()` L1026-1052 |
+| **import 流水线阶段** | `beets/importer/stages.py` | `manipulate_files()` L277-306 |
