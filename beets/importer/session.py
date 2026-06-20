@@ -22,7 +22,7 @@ from beets.importer.tasks import Action
 from beets.util import displayable_path, normpath, pipeline, syspath
 
 from . import stages as stagefuncs
-from .state import ImportState
+from .state import ImportState, SessionSnapshot, TaskSnapshot, TaskStage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -48,11 +48,18 @@ class ImportAbortError(Exception):
 class ImportSession:
     """Controls an import action. Subclasses should implement methods to
     communicate with the user or otherwise make decisions.
+
+    The session carries a ``session_snapshot`` (:class:`SessionSnapshot`)
+    that unifies previously scattered session-level state (resumption
+    flags, merged paths, task progress) into a single serialisable
+    object. This enables crash recovery, diagnostics, and progress
+    reporting across the entire import run.
     """
 
     logger: logging.Logger
     paths: list[PathBytes]
     lib: library.Library
+    session_snapshot: SessionSnapshot
 
     _is_resuming: dict[bytes, bool]
     _merged_items: set[PathBytes]
@@ -89,6 +96,25 @@ class ImportSession:
         # Normalize the paths.
         self.paths = list(map(normpath, paths or []))
 
+        # Initialise the unified session snapshot.
+        self.session_snapshot = SessionSnapshot(
+            paths=list(self.paths),
+            query=str(query) if query is not None else None,
+        )
+        self._persist_session_snapshot()
+
+    def _persist_session_snapshot(self):
+        """Write the current session snapshot to the state file."""
+        self.session_snapshot.is_resuming = dict(self._is_resuming)
+        self.session_snapshot.merged_items = set(self._merged_items)
+        self.session_snapshot.merged_dirs = set(self._merged_dirs)
+        ImportState().save_session_snapshot(self.session_snapshot)
+
+    def record_task_snapshot(self, task_snapshot: TaskSnapshot):
+        """Record a task snapshot on the session and persist both."""
+        self.session_snapshot.record_task(task_snapshot)
+        self._persist_session_snapshot()
+
     def _setup_logging(self, loghandler: logging.Handler | None):
         logger = logging.getLogger(__name__)
         logger.propagate = False
@@ -105,6 +131,13 @@ class ImportSession:
         # provide "decision wrappers" like "should_resume()", etc.
         iconfig = dict(config)
         self.config = iconfig
+
+        # Serialize a simplified config snapshot for diagnostics/recovery.
+        self.session_snapshot.config_snapshot = {
+            k: (v if isinstance(v, (str, int, float, bool, list, dict)) else str(v))
+            for k, v in iconfig.items()
+        }
+        self._persist_session_snapshot()
 
         # Incremental and progress are mutually exclusive.
         if iconfig["incremental"]:
@@ -237,9 +270,36 @@ class ImportSession:
                 pl.run_parallel(QUEUE_SIZE)
             else:
                 pl.run_sequential()
+            # Mark session as successfully completed.
+            self.session_snapshot.mark_complete()
+            # Clear session-level snapshots on clean completion.
+            ImportState().clear_session_snapshot()
         except ImportAbortError:
-            # User aborted operation. Silently stop.
+            # User aborted operation. Silently stop but keep snapshots
+            # so the user can resume later.
             pass
+        except Exception as exc:
+            # On unexpected exceptions, persist everything we have so
+            # the user can diagnose and recover.
+            import traceback
+
+            log.error(
+                "import failed with unexpected exception: {}. "
+                "State snapshots have been preserved for recovery.",
+                exc,
+            )
+            self.session_snapshot.mark_complete()
+            self._persist_session_snapshot()
+            # Also dump diagnostics for debugging.
+            try:
+                dump = ImportState().diagnostic_dump()
+                log.debug("import state diagnostic dump: {}", dump)
+            except Exception:
+                pass
+            raise
+        finally:
+            # Always persist the final session state.
+            self._persist_session_snapshot()
 
     # Incremental and resumed imports
 
@@ -282,6 +342,7 @@ class ImportSession:
             for path in paths
         }
         self._merged_dirs.update(dirs)
+        self._persist_session_snapshot()
 
     def is_resuming(self, toppath: PathBytes):
         """Return `True` if user wants to resume import of this path.
@@ -307,3 +368,7 @@ class ImportSession:
             else:
                 # Clear progress; we're starting from the top.
                 ImportState().progress_reset(toppath)
+                # Also clear any stale task snapshots for this path.
+                ImportState().clear_task_snapshots(toppath)
+                ImportState().clear_factory_snapshots(toppath)
+        self._persist_session_snapshot()

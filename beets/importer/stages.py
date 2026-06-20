@@ -161,6 +161,8 @@ def user_query(session: ImportSession, task: ImportTask):
     access to the choice via the ``task.choice_flag`` property and may
     choose to change it.
     """
+    from .state import TaskStage
+
     if task.skip:
         return task
 
@@ -168,8 +170,14 @@ def user_query(session: ImportSession, task: ImportTask):
         return pipeline.BUBBLE
 
     # Ask the user for a choice.
+    task._enter_stage(TaskStage.CHOICE)
     task.choose_match(session)
     plugins.send("import_task_choice", session=session, task=task)
+    # After the plugin event, the choice may have changed, so sync.
+    task.snapshot.choice_flag = (
+        task.choice_flag.value if task.choice_flag else None
+    )
+    task._persist_snapshot()
 
     # As-tracks: transition to singleton workflow.
     if task.choice_flag is Action.TRACKS:
@@ -338,6 +346,9 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
     and ask the session to resolve this.
     """
     if task.choice_flag in (Action.ASIS, Action.APPLY, Action.RETAG):
+        from .state import TaskStage
+
+        task._enter_stage(TaskStage.DUPLICATE_RESOLUTION)
         found_duplicates = task.find_duplicates(session.lib)
         if found_duplicates:
             log.debug("found duplicates: {}", [o.id for o in found_duplicates])
@@ -363,12 +374,19 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
             elif duplicate_action == "r":
                 # Remove old.
                 task.should_remove_duplicates = True
+                task.snapshot.should_remove_duplicates = True
+                task._persist_snapshot()
             elif duplicate_action == "m":
                 # Merge duplicates together
                 task.should_merge_duplicates = True
+                task.snapshot.should_merge_duplicates = True
+                task._persist_snapshot()
             else:
                 # No default action set; ask the session.
                 session.resolve_duplicate(task, found_duplicates)
+                task.snapshot.should_remove_duplicates = task.should_remove_duplicates
+                task.snapshot.should_merge_duplicates = task.should_merge_duplicates
+                task._persist_snapshot()
 
             session.log_choice(task, True)
 

@@ -34,7 +34,7 @@ from beets.dbcore.query import PathQuery
 from beets.util import extension
 from beets.util.extension import remux_mpeglayer3_wav
 
-from .state import ImportState
+from .state import FactorySnapshot, ImportState, TaskSnapshot, TaskStage
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -98,11 +98,18 @@ class BaseImportTask:
     """An abstract base class for importer tasks.
 
     Tasks flow through the importer pipeline. Each stage can update
-    them."""
+    them.
+
+    Each task carries a ``snapshot`` (:class:`TaskSnapshot`) that
+    consolidates the task's progress and intermediate state. This
+    unified model replaces the previously scattered ad-hoc attributes
+    and enables crash recovery and diagnostics.
+    """
 
     toppath: util.PathBytes | None
     paths: list[util.PathBytes]
     items: list[library.Item]
+    snapshot: TaskSnapshot
 
     def __init__(
         self,
@@ -129,6 +136,27 @@ class BaseImportTask:
         self.toppath = toppath
         self.paths = list(paths) if paths is not None else []
         self.items = list(items) if items is not None else []
+        self.snapshot = TaskSnapshot(
+            toppath=toppath,
+            paths=self.paths,
+            items_count=len(self.items),
+        )
+        self._persist_snapshot()
+
+    def _persist_snapshot(self):
+        """Write the current task snapshot to disk.
+
+        Called automatically whenever the task's state changes in a
+        way that should survive a crash. Subclasses may override to
+        add additional fields before saving.
+        """
+        self.snapshot.updated_at = time.time()
+        ImportState().save_task_snapshot(self.snapshot)
+
+    def _enter_stage(self, stage: TaskStage):
+        """Transition the task into a new pipeline stage and persist."""
+        self.snapshot.mark_stage(stage)
+        self._persist_snapshot()
 
 
 class ImportTask(BaseImportTask):
@@ -182,6 +210,8 @@ class ImportTask(BaseImportTask):
         self.should_remove_duplicates = False
         self.should_merge_duplicates = False
         self.is_album = True
+        self.snapshot.is_album = True
+        self._persist_snapshot()
 
     def set_choice(self, choice: Action | AlbumMatch | TrackMatch):
         """Given an AlbumMatch or TrackMatch object or an action constant,
@@ -203,9 +233,14 @@ class ImportTask(BaseImportTask):
             # TODO: redesign to stricten the type
             self.choice_flag = choice  # type: ignore[assignment]
             self.match = None
+            self.snapshot.choice_flag = choice.value
+            if choice == Action.SKIP:
+                self.snapshot.mark_stage(TaskStage.SKIPPED)
         else:
             self.choice_flag = Action.APPLY  # Implicit choice.
             self.match = choice  # type: ignore[assignment]
+            self.snapshot.choice_flag = Action.APPLY.value
+        self._persist_snapshot()
 
     def save_progress(self):
         """Updates the progress state to indicate that this album has
@@ -260,6 +295,7 @@ class ImportTask(BaseImportTask):
 
     def apply_metadata(self) -> None:
         """Copy metadata from match info to the items."""
+        self._enter_stage(TaskStage.METADATA_APPLY)
         if self.match:  # TODO: redesign to remove the conditional
             self.match.apply_metadata()
 
@@ -321,6 +357,7 @@ class ImportTask(BaseImportTask):
 
     def finalize(self, session: ImportSession):
         """Save progress, clean up files, and emit plugin event."""
+        self._enter_stage(TaskStage.FINALIZE)
         # Update progress.
         if session.want_resume:
             self.save_progress()
@@ -338,6 +375,8 @@ class ImportTask(BaseImportTask):
 
         if not self.skip:
             self._emit_imported(session.lib)
+        self.snapshot.mark_stage(TaskStage.COMPLETED)
+        self._persist_snapshot()
 
     def cleanup(self, copy=False, delete=False, move=False):
         """Remove and prune imported paths."""
@@ -384,9 +423,15 @@ class ImportTask(BaseImportTask):
         If User-specified ``search_ids`` list is not empty, the lookup is
         restricted to only those IDs.
         """
+        self._enter_stage(TaskStage.LOOKUP)
         self.cur_artist, self.cur_album, (self.candidates, self.rec) = (
             tag_album(self.items, search_ids=search_ids)
         )
+        self.snapshot.cur_artist = self.cur_artist
+        self.snapshot.cur_album = self.cur_album
+        self.snapshot.candidates_count = len(self.candidates) if self.candidates else 0
+        self.snapshot.rec = self.rec.value if self.rec else None
+        self._persist_snapshot()
 
     def find_duplicates(self, lib: library.Library) -> list[library.Album]:
         """Return a list of albums from `lib` with the same artist and
@@ -479,11 +524,13 @@ class ImportTask(BaseImportTask):
         If `write` is `True` metadata is written to the files.
         # TODO: Introduce a MoveOperation.NONE or SKIP
         """
+        self._enter_stage(TaskStage.MANIPULATE_FILES)
 
         items = self.imported_items()
         # Save the original paths of all items for deletion and pruning
         # in the next step (finalization).
         self.old_paths: list[util.PathBytes] = [item.path for item in items]
+        self.snapshot.old_paths = list(self.old_paths)
         for item in items:
             if operation is not None:
                 # In copy and link modes, treat re-imports specially:
@@ -515,12 +562,15 @@ class ImportTask(BaseImportTask):
 
     def add(self, lib: library.Library):
         """Add the items as an album to the library and remove replaced items."""
+        self._enter_stage(TaskStage.ADD)
         self.align_album_level_fields()
         with lib.transaction():
             self.record_replaced(lib)
             self.remove_replaced(lib)
 
             self.album = lib.add_album(self.imported_items())
+            self.snapshot.album_id = self.album.id
+            self.snapshot.imported_items_count = len(self.imported_items())
             if self.choice_flag == Action.APPLY and isinstance(
                 self.match, AlbumMatch
             ):
@@ -532,6 +582,7 @@ class ImportTask(BaseImportTask):
                 self.album.store()
 
             self.reimport_metadata(lib)
+        self._persist_snapshot()
 
     def record_replaced(self, lib: library.Library):
         """Records the replaced items and albums in the `replaced_items`
@@ -555,6 +606,10 @@ class ImportTask(BaseImportTask):
                 if replaced_album:
                     replaced_album_ids.add(dup_item.album_id)
                     self.replaced_albums[replaced_album.path] = replaced_album
+        self.snapshot.replaced_items_count = sum(
+            len(v) for v in self.replaced_items.values()
+        )
+        self.snapshot.replaced_albums_count = len(self.replaced_albums)
 
     def reimport_metadata(self, lib: library.Library):
         """For reimports, preserves metadata for reimported items and
@@ -685,6 +740,9 @@ class SingletonImportTask(ImportTask):
         self.item = item
         self.is_album = False
         self.paths = [item.path]
+        self.snapshot.is_album = False
+        self.snapshot.is_singleton = True
+        self._persist_snapshot()
 
     def chosen_info(self):
         """Return a dictionary of metadata about the current choice.
@@ -706,7 +764,11 @@ class SingletonImportTask(ImportTask):
             plugins.send("item_imported", lib=lib, item=item)
 
     def lookup_candidates(self, search_ids: list[str]) -> None:
+        self._enter_stage(TaskStage.LOOKUP)
         self.candidates, self.rec = tag_item(self.item, search_ids=search_ids)
+        self.snapshot.candidates_count = len(self.candidates) if self.candidates else 0
+        self.snapshot.rec = self.rec.value if self.rec else None
+        self._persist_snapshot()
 
     def find_duplicates(self, lib: library.Library) -> list[library.Item]:  # type: ignore[override] # Need splitting Singleton and Album tasks into separate classes
         """Return a list of items from `lib` that have the same artist
@@ -746,11 +808,14 @@ class SingletonImportTask(ImportTask):
                 )
 
     def add(self, lib):
+        self._enter_stage(TaskStage.ADD)
         with lib.transaction():
             self.record_replaced(lib)
             self.remove_replaced(lib)
             lib.add(self.item)
+            self.snapshot.imported_items_count = 1
             self.reimport_metadata(lib)
+        self._persist_snapshot()
 
     def infer_album_fields(self):
         raise NotImplementedError
@@ -798,6 +863,9 @@ class SentinelImportTask(ImportTask):
         self.should_remove_duplicates = False
         self.is_album = True
         self.choice_flag = None
+        self.snapshot.is_sentinel = True
+        self.snapshot.mark_stage(TaskStage.COMPLETED)
+        self._persist_snapshot()
 
     def save_history(self):
         pass
@@ -853,6 +921,9 @@ class ArchiveImportTask(SentinelImportTask):
         # directory; here we track the original archive location so
         # ``cleanup()`` can remove it when the import mode demands.
         self.archive_path = toppath
+        self.snapshot.is_archive = True
+        self.snapshot.archive_path = toppath
+        self._persist_snapshot()
 
     @classmethod
     def is_archive(cls, path):
@@ -963,12 +1034,21 @@ class ArchiveImportTask(SentinelImportTask):
             archive.close()
         self.extracted = True
         self.toppath = extract_to
+        self.snapshot.toppath = self.toppath
+        self.snapshot.archive_extracted = True
+        self._persist_snapshot()
 
 
 class ImportTaskFactory:
     """Generate album and singleton import tasks for all media files
     indicated by a path.
+
+    Each factory carries a ``factory_snapshot`` (:class:`FactorySnapshot`)
+    that consolidates the counters (`skipped`, `imported`) and archive
+    flag so they are persisted alongside all other import state.
     """
+
+    factory_snapshot: FactorySnapshot
 
     def __init__(self, toppath: util.PathBytes, session: ImportSession):
         """Create a new task factory.
@@ -982,6 +1062,19 @@ class ImportTaskFactory:
         self.skipped = 0  # Skipped due to incremental/resume.
         self.imported = 0  # "Real" tasks created.
         self.is_archive = ArchiveImportTask.is_archive(util.syspath(toppath))
+        self.factory_snapshot = FactorySnapshot(
+            toppath=toppath,
+            is_archive=self.is_archive,
+            skipped=0,
+            imported=0,
+        )
+        self._persist_factory_snapshot()
+
+    def _persist_factory_snapshot(self):
+        """Sync the counters into the snapshot and persist it."""
+        self.factory_snapshot.skipped = self.skipped
+        self.factory_snapshot.imported = self.imported
+        ImportState().save_factory_snapshot(self.toppath, self.factory_snapshot)
 
     def tasks(self) -> Iterable[ImportTask]:
         """Yield all import tasks for music found in the user-specified
@@ -1031,6 +1124,10 @@ class ImportTaskFactory:
         if task:
             tasks = task.handle_created(self.session)
             self.imported += len(tasks)
+            self._persist_factory_snapshot()
+            # Record each new task in the session snapshot.
+            for t in tasks:
+                self.session.record_task_snapshot(t.snapshot)
             return tasks
         return []
 
@@ -1062,6 +1159,7 @@ class ImportTaskFactory:
                 util.displayable_path(path),
             )
             self.skipped += 1
+            self._persist_factory_snapshot()
             return None
 
         item = self.read_item(path)
@@ -1086,6 +1184,7 @@ class ImportTaskFactory:
                 util.displayable_path(dirs),
             )
             self.skipped += 1
+            self._persist_factory_snapshot()
             return None
 
         items: list[library.Item] = [
