@@ -33,16 +33,62 @@ The plugin collects play history from multiple sources:
 1. **Automatic tracking**: Monitors database changes to play_count fields and
    automatically records each play event with device context.
 
-2. **Device identification**:
-   - Configured via `playcountanomaly.device_id` and `device_name` config options
-   - Auto-detection falls back to `username@hostname` pattern
-   - Supports cross-device scenarios in shared/multi-device libraries
+2. **Device identification** (4-tier fallback):
+   - Explicit ``playcountanomaly.device_id`` / ``device_name`` config
+   - ``BEETS_DEVICE_ID`` / ``BEETS_DEVICE_NAME`` environment variables
+   - Auto-generated ``username@hostname`` from system introspection
+   - Ultimate fallback: ``unknown-<pid>`` / ``Unknown Device`` when all
+     system calls fail (e.g. containerized environments with no hostname)
 
 3. **Programmatic API**: Other plugins can use ``record_play(item, delta, **kwargs)``
    to report plays from external sources with device and timestamp information.
 
 4. **History table**: All play events are stored in the ``play_count_history``
    database table for anomaly analysis and audit trails.
+
+Verification Checklist
+----------------------
+The following items should be verified after any change to this plugin:
+
+V1. Plugin discovery: ``beet anomalies`` command is available after adding
+    ``playcountanomaly`` to the ``plugins`` config list.
+    (Mechanism: beets imports ``beetsplug.playcountanomaly`` as an implicit
+    namespace package per PEP 420, finds the ``PlayCountAnomalyPlugin`` class
+    via ``BeetsPlugin`` subclass check in ``plugins._get_plugin()``.)
+
+V2. Helper math: ``_median([]) == 0.0``, ``_median([1,3,2]) == 2.0``,
+    ``_stddev([5.0], 5.0) == 0.0``.
+
+V3. Z-score deviation: ``play_count=25`` with ``mean=10, stddev=5,
+    threshold=2`` triggers ``zscore_deviation``; ``play_count=12`` does not.
+
+V4. Impossible count: ``play_count=10`` with ``length=30s, added=100s ago``
+    triggers ``impossible_count``; reasonable values do not.
+
+V5. New song burst: ``play_count=10`` added within ``new_song_days=7``
+    with high ``median_per_day`` triggers ``new_song_burst``; old songs do not.
+
+V6. Sudden zero: ``play_count=0`` with ``last_played < sudden_zero_days``
+    triggers ``sudden_zero``; old ``last_played`` does not.
+
+V7. Daily spike: history with one day at ``>= threshold * daily_mean`` plays
+    triggers ``daily_spike``; uniform daily counts do not.
+
+V8. Concurrent play: history showing ``>= concurrent_min_plays`` from
+    ``>= concurrent_device_count`` devices within ``concurrent_window_seconds``
+    triggers ``concurrent_play``; single-device plays do not.
+
+V9. Device anomaly: history where one device's share ``>= threshold``
+    triggers ``device_anomaly``; balanced multi-device plays do not.
+
+V10. Device ID fallback: ``_get_device_id()`` returns a non-empty string
+     even when ``socket.gethostname()`` raises ``OSError`` or env vars
+     are missing (falls back to ``unknown-<pid>``).
+     ``_get_device_name()`` falls back to ``"Unknown Device"``.
+
+V11. record_play API: ``plugin.record_play(item, delta=1, source="test",
+     device_id="d1")`` returns ``True``; ``delta=0`` or ``delta=-1`` returns
+     ``False``; ``enable_history_tracking=False`` returns ``False``.
 """
 
 from __future__ import annotations
@@ -302,16 +348,40 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
         1. Explicit ``device_id`` config value
         2. ``BEETS_DEVICE_ID`` environment variable
         3. Auto-generated ``username@hostname`` pattern
+        4. Fallback: ``unknown-<process_id>`` when hostname/username unavailable
         """
-        device_id = self.config["device_id"].as_str()
-        if device_id:
-            return device_id
-        env_device_id = os.environ.get("BEETS_DEVICE_ID", "")
-        if env_device_id:
-            return env_device_id
-        hostname = socket.gethostname()
-        username = os.environ.get("USER", "unknown")
-        return f"{username}@{hostname}"
+        try:
+            device_id = self.config["device_id"].as_str()
+            if device_id:
+                return device_id
+        except Exception:
+            pass
+
+        try:
+            env_device_id = os.environ.get("BEETS_DEVICE_ID", "")
+            if env_device_id:
+                return env_device_id
+        except Exception:
+            pass
+
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            hostname = None
+
+        try:
+            username = os.environ.get("USER", "") or os.environ.get("LOGNAME", "")
+        except Exception:
+            username = None
+
+        if hostname and username:
+            return f"{username}@{hostname}"
+        if hostname:
+            return hostname
+        if username:
+            return f"{username}@unknown"
+
+        return f"unknown-{os.getpid()}"
 
     def _get_device_name(self) -> str:
         """Get the display name for the current device.
@@ -320,14 +390,26 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
         1. Explicit ``device_name`` config value
         2. ``BEETS_DEVICE_NAME`` environment variable
         3. System hostname
+        4. Fallback: ``Unknown Device`` when nothing is available
         """
-        device_name = self.config["device_name"].as_str()
-        if device_name:
-            return device_name
-        env_device_name = os.environ.get("BEETS_DEVICE_NAME", "")
-        if env_device_name:
-            return env_device_name
-        return socket.gethostname()
+        try:
+            device_name = self.config["device_name"].as_str()
+            if device_name:
+                return device_name
+        except Exception:
+            pass
+
+        try:
+            env_device_name = os.environ.get("BEETS_DEVICE_NAME", "")
+            if env_device_name:
+                return env_device_name
+        except Exception:
+            pass
+
+        try:
+            return socket.gethostname()
+        except Exception:
+            return "Unknown Device"
 
     def _on_library_opened(self, lib: Library) -> None:
         """Handle library opened event: create history table and load state."""

@@ -19,6 +19,7 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 # USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+import os
 import time
 
 import pytest
@@ -323,9 +324,68 @@ class TestPlayCountAnomalyPlugin(PluginMixin, TestHelper, IOMixin):
 
         assert isinstance(device_id, str)
         assert len(device_id) > 0
-        assert "@" in device_id
         assert isinstance(device_name, str)
         assert len(device_name) > 0
+
+    def test_device_id_fallback_no_hostname(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_id"] = ""
+        plugin.config["device_name"] = ""
+
+        import unittest.mock
+
+        with unittest.mock.patch("socket.gethostname", side_effect=OSError):
+            device_id = plugin._get_device_id()
+            device_name = plugin._get_device_name()
+
+            assert isinstance(device_id, str)
+            assert len(device_id) > 0
+            assert isinstance(device_name, str)
+            assert device_name == "Unknown Device"
+
+    def test_device_id_fallback_no_user(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_id"] = ""
+        plugin.config["device_name"] = ""
+
+        import unittest.mock
+
+        env_patcher = unittest.mock.patch.dict(
+            os.environ, {}, clear=True
+        )
+        with env_patcher:
+            device_id = plugin._get_device_id()
+
+            assert isinstance(device_id, str)
+            assert len(device_id) > 0
+
+    def test_device_id_env_variable(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_id"] = ""
+        plugin.config["device_name"] = ""
+
+        import unittest.mock
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"BEETS_DEVICE_ID": "env-device-xyz", "BEETS_DEVICE_NAME": "Env Device"},
+        ):
+            assert plugin._get_device_id() == "env-device-xyz"
+            assert plugin._get_device_name() == "Env Device"
+
+    def test_device_id_config_overrides_env(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_id"] = "config-device"
+        plugin.config["device_name"] = "Config Device"
+
+        import unittest.mock
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"BEETS_DEVICE_ID": "env-device", "BEETS_DEVICE_NAME": "Env Device"},
+        ):
+            assert plugin._get_device_id() == "config-device"
+            assert plugin._get_device_name() == "Config Device"
 
     def test_record_play_api(self):
         plugin = PlayCountAnomalyPlugin()
