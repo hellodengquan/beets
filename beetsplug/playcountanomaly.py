@@ -40,55 +40,109 @@ The plugin collects play history from multiple sources:
    - Ultimate fallback: ``unknown-<pid>`` / ``Unknown Device`` when all
      system calls fail (e.g. containerized environments with no hostname)
 
+   **Fallback activation scenarios**:
+   - Docker containers with no UTS namespace (``socket.gethostname`` raises
+     ``OSError`` or returns empty)
+   - Minimal chroot / jail environments without user info
+   - CI runners where both ``USER`` and ``LOGNAME`` env vars are unset
+   - Restricted runtime environments (AppArmor, SELinux, sandboxed Python)
+   - Any unhandled exception during device identification (each call is
+     wrapped in try/except for safety)
+
 3. **Programmatic API**: Other plugins can use ``record_play(item, delta, **kwargs)``
    to report plays from external sources with device and timestamp information.
 
 4. **History table**: All play events are stored in the ``play_count_history``
    database table for anomaly analysis and audit trails.
 
+5. **Entry point registration**: Declared in ``pyproject.toml`` under
+   ``[tool.poetry.plugins."beets.plugins"]`` as a standard Python plugin
+   entry point, alongside the primary beetsplug namespace package mechanism.
+
 Verification Checklist
 ----------------------
-The following items should be verified after any change to this plugin:
+The following items should be verified after any change to this plugin.
+Each item includes the source code location and corresponding test reference.
 
 V1. Plugin discovery: ``beet anomalies`` command is available after adding
     ``playcountanomaly`` to the ``plugins`` config list.
     (Mechanism: beets imports ``beetsplug.playcountanomaly`` as an implicit
     namespace package per PEP 420, finds the ``PlayCountAnomalyPlugin`` class
-    via ``BeetsPlugin`` subclass check in ``plugins._get_plugin()``.)
+    via ``BeetsPlugin`` subclass check in ``plugins._get_plugin()``.
+    Alternative: ``pyproject.toml:187`` entry point
+    ``beets.plugins`` group.)
+    *Code*: ``playcountanomaly.py:236`` -- ``PlayCountAnomalyPlugin.commands()``
+    *Test*: ``test/plugins/test_playcountanomaly.py`` -- plugin loading fixtures
 
 V2. Helper math: ``_median([]) == 0.0``, ``_median([1,3,2]) == 2.0``,
     ``_stddev([5.0], 5.0) == 0.0``.
+    *Code*: ``playcountanomaly.py:130`` -- ``_median()``
+    *Code*: ``playcountanomaly.py:153`` -- ``_stddev()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:49`` -- ``test_median()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:59`` -- ``test_stddev()``
 
 V3. Z-score deviation: ``play_count=25`` with ``mean=10, stddev=5,
     threshold=2`` triggers ``zscore_deviation``; ``play_count=12`` does not.
+    *Code*: ``playcountanomaly.py:508`` -- ``_check_zscore_deviation()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:87``
+    -- ``test_zscore_deviation_high()`` / ``test_zscore_deviation_normal()``
 
 V4. Impossible count: ``play_count=10`` with ``length=30s, added=100s ago``
     triggers ``impossible_count``; reasonable values do not.
+    *Code*: ``playcountanomaly.py:584`` -- ``_check_impossible_count()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:123``
+    -- ``test_impossible_count_true()`` / ``test_impossible_count_false()``
 
 V5. New song burst: ``play_count=10`` added within ``new_song_days=7``
     with high ``median_per_day`` triggers ``new_song_burst``; old songs do not.
+    *Code*: ``playcountanomaly.py:541`` -- ``_check_new_song_burst()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:113``
+    -- ``test_new_song_burst()``
 
 V6. Sudden zero: ``play_count=0`` with ``last_played < sudden_zero_days``
     triggers ``sudden_zero``; old ``last_played`` does not.
+    *Code*: ``playcountanomaly.py:628`` -- ``_check_sudden_zero()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:139``
+    -- ``test_sudden_zero()``
 
 V7. Daily spike: history with one day at ``>= threshold * daily_mean`` plays
     triggers ``daily_spike``; uniform daily counts do not.
+    *Code*: ``playcountanomaly.py:654`` -- ``_check_daily_spike()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:361``
+    -- ``test_daily_spike_detection()`` / ``test_no_daily_spike_normal()``
 
 V8. Concurrent play: history showing ``>= concurrent_min_plays`` from
     ``>= concurrent_device_count`` devices within ``concurrent_window_seconds``
     triggers ``concurrent_play``; single-device plays do not.
+    *Code*: ``playcountanomaly.py:699`` -- ``_check_concurrent_play()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:401``
+    -- ``test_concurrent_play_detection()``
+    -- ``test_no_concurrent_play_single_device()``
 
 V9. Device anomaly: history where one device's share ``>= threshold``
     triggers ``device_anomaly``; balanced multi-device plays do not.
+    *Code*: ``playcountanomaly.py:741`` -- ``_check_device_anomaly()``
+    *Test*: ``test/plugins/test_playcountanomaly.py:440``
+    -- ``test_device_anomaly_detection()`` / ``test_no_device_anomaly_balanced()``
 
 V10. Device ID fallback: ``_get_device_id()`` returns a non-empty string
      even when ``socket.gethostname()`` raises ``OSError`` or env vars
      are missing (falls back to ``unknown-<pid>``).
      ``_get_device_name()`` falls back to ``"Unknown Device"``.
+     *Code*: ``playcountanomaly.py:302`` -- ``_get_device_id()``
+     *Code*: ``playcountanomaly.py:335`` -- ``_get_device_name()``
+     *Test*: ``test/plugins/test_playcountanomaly.py:316``
+     -- ``test_device_id_fallback_no_hostname()``
+     -- ``test_device_id_fallback_no_user()``
+     -- ``test_device_id_env_variable()``
+     -- ``test_device_id_config_overrides_env()``
 
 V11. record_play API: ``plugin.record_play(item, delta=1, source="test",
      device_id="d1")`` returns ``True``; ``delta=0`` or ``delta=-1`` returns
      ``False``; ``enable_history_tracking=False`` returns ``False``.
+     *Code*: ``playcountanomaly.py:436`` -- ``record_play()`` (public API)
+     *Test*: ``test/plugins/test_playcountanomaly.py:361``
+     -- ``test_record_play_api()``
 """
 
 from __future__ import annotations

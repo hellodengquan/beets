@@ -184,6 +184,12 @@ web = ["flask", "flask-cors"]
 [tool.poetry.scripts]
 beet = "beets.ui:main"
 
+[tool.poetry.plugins."beets.plugins"]
+# Built-in plugins are normally discovered via the beetsplug namespace package.
+# These entry points provide an alternative registration path compatible with
+# standard Python plugin discovery mechanisms.
+playcountanomaly = "beetsplug.playcountanomaly:PlayCountAnomalyPlugin"
+
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
