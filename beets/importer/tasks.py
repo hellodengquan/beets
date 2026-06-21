@@ -34,7 +34,7 @@ from beets.dbcore.query import PathQuery
 from beets.util import extension
 from beets.util.extension import remux_mpeglayer3_wav
 
-from .state import ImportState
+from .state import ImportState, _normpath
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -411,7 +411,7 @@ class ImportTask(BaseImportTask):
         # Use case-insensitive path comparison so that re-imports
         # on case-insensitive filesystems are not falsely flagged.
         task_paths = {
-            os.path.normcase(os.fsdecode(i.path))
+            _normpath(i.path)
             for i in self.items
             if i
         }
@@ -419,7 +419,7 @@ class ImportTask(BaseImportTask):
         duplicates = []
         for album in lib.albums(dup_query):
             album_paths = {
-                os.path.normcase(os.fsdecode(i.path))
+                _normpath(i.path)
                 for i in album.items()
             }
             if not (album_paths <= task_paths):
@@ -730,9 +730,7 @@ class SingletonImportTask(ImportTask):
 
         found_items = []
         for other_item in lib.items(dup_query):
-            if os.path.normcase(
-                os.fsdecode(other_item.path)
-            ) != os.path.normcase(os.fsdecode(self.item.path)):
+            if _normpath(other_item.path) != _normpath(self.item.path):
                 found_items.append(other_item)
         return found_items
 

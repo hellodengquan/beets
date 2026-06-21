@@ -31,15 +31,40 @@ if TYPE_CHECKING:
 log = logging.getLogger("beets")
 
 
+def _fs_is_case_insensitive() -> bool:
+    """Detect if the filesystem is case-insensitive.
+
+    On macOS and Windows, filesystems are typically case-insensitive,
+    but only Windows :func:`os.path.normcase` actually lowercases paths.
+    This function provides a reliable detection across platforms by
+    checking the platform and ``os.path.normcase`` behavior.
+    """
+    import sys
+
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return os.path.normcase("A") != "A"
+
+
+_FS_CASE_INSENSITIVE = _fs_is_case_insensitive()
+
+
 def _normpath(path: PathBytes) -> PathBytes:
     """Normalize a path for case-insensitive comparison.
 
-    Uses :func:`os.path.normcase` so that on case-insensitive
-    filesystems (macOS, Windows) paths that differ only in case are
-    treated as identical, while on case-sensitive filesystems (Linux)
-    the original path is returned unchanged.
+    On case-insensitive filesystems (macOS, Windows), paths that differ
+    only in case are treated as identical. On case-sensitive filesystems
+    (Linux), the original path is returned unchanged.
+
+    Unlike :func:`os.path.normcase`, this function reliably lowercases
+    paths on both Windows and macOS, since macOS filesystems are
+    typically case-insensitive but ``os.path.normcase`` is a no-op there.
     """
-    return os.fsencode(os.path.normcase(os.fsdecode(path)))
+    decoded = os.fsdecode(path)
+    normalized = os.path.normcase(decoded)
+    if _FS_CASE_INSENSITIVE:
+        normalized = normalized.lower()
+    return os.fsencode(normalized)
 
 
 @dataclass
