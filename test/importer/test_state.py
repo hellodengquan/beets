@@ -1115,3 +1115,408 @@ class TestTasksDuplicatePathComparison:
         path_lower = b"/music/\xc3\xa4hnlicher titel.mp3"
         if _normpath_is_case_insensitive():
             assert self._normcase_path(path_upper) == self._normcase_path(path_lower)
+
+
+class TestConcurrentWriteRaceConditions:
+    """多实例并发写入同一状态文件的竞态条件测试。
+
+    模拟两个 beets import 实例同时操作同一 state 文件的场景，
+    验证 read-modify-write 模式下的丢失更新、交错写入等问题。
+    """
+
+    def test_lost_update_two_instances_same_toppath(self, state_file):
+        """两个实例向同一 toppath 添加不同路径，可能出现丢失更新。
+
+        场景：
+        - 实例 A 读取 state（空）
+        - 实例 B 读取 state（空）
+        - 实例 A 添加 track01 并写入
+        - 实例 B 添加 track02 并写入
+        - 结果：track01 丢失（B 基于旧状态覆盖写入）
+
+        这是当前实现的已知行为，测试记录实际表现。
+        """
+        toppath = b"/import/album"
+        path_a = b"/import/album/track01.mp3"
+        path_b = b"/import/album/track02.mp3"
+
+        instance_a = ImportState(path=os.fsencode(state_file))
+        instance_b = ImportState(path=os.fsencode(state_file))
+
+        assert not instance_a.progress_has(toppath)
+        assert not instance_b.progress_has(toppath)
+
+        instance_a.progress_add(toppath, path_a)
+
+        state_after_a = ImportState(path=os.fsencode(state_file))
+        assert state_after_a.progress_has_element(toppath, path_a)
+
+        instance_b.progress_add(toppath, path_b)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+
+        assert state_final.progress_has_element(toppath, path_b)
+
+    def test_lost_update_two_instances_different_toppaths(self, state_file):
+        """两个实例向不同 toppath 添加数据，仍可能互相覆盖。
+
+        场景：
+        - 实例 A 读取 state（空）
+        - 实例 B 读取 state（空）
+        - 实例 A 添加 album1/track01 并写入
+        - 实例 B 添加 album2/track01 并写入
+        - 结果：album1 的数据可能丢失
+        """
+        toppath_a = b"/import/album1"
+        toppath_b = b"/import/album2"
+        path_a = b"/import/album1/track01.mp3"
+        path_b = b"/import/album2/track01.mp3"
+
+        instance_a = ImportState(path=os.fsencode(state_file))
+        instance_b = ImportState(path=os.fsencode(state_file))
+
+        instance_a.progress_add(toppath_a, path_a)
+        instance_b.progress_add(toppath_b, path_b)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+
+        has_a = state_final.progress_has(toppath_a)
+        has_b = state_final.progress_has(toppath_b)
+        assert has_b
+
+    def test_interleaved_read_write_read(self, state_file):
+        """交错读-写-读场景：读取后文件被其他实例修改。
+
+        验证：内存中的 state 不会自动反映磁盘上的变化，
+        需要重新打开 ImportState 才能看到新写入的数据。
+        """
+        toppath = b"/import/album"
+        path1 = b"/import/album/track01.mp3"
+        path2 = b"/import/album/track02.mp3"
+
+        state_reader = ImportState(path=os.fsencode(state_file))
+        assert not state_reader.progress_has(toppath)
+
+        state_writer = ImportState(path=os.fsencode(state_file))
+        state_writer.progress_add(toppath, path1)
+
+        assert not state_reader.progress_has(toppath)
+
+        state_reader2 = ImportState(path=os.fsencode(state_file))
+        assert state_reader2.progress_has_element(toppath, path1)
+
+        state_writer2 = ImportState(path=os.fsencode(state_file))
+        state_writer2.progress_add(toppath, path2)
+
+        state_reader3 = ImportState(path=os.fsencode(state_file))
+        assert state_reader3.progress_has_element(toppath, path2)
+
+    def test_progress_add_vs_concurrent_reset(self, state_file):
+        """progress_add 与 progress_reset 并发执行的竞态。
+
+        场景：
+        - 实例 A 读取并准备添加路径
+        - 实例 B reset 该 toppath
+        - 实例 A 写入（包含旧路径数据 + 新路径）
+        """
+        toppath = b"/import/album"
+        path_existing = b"/import/album/track01.mp3"
+        path_new = b"/import/album/track02.mp3"
+
+        init = ImportState(path=os.fsencode(state_file))
+        init.progress_add(toppath, path_existing)
+
+        instance_adder = ImportState(path=os.fsencode(state_file))
+        assert instance_adder.progress_has_element(toppath, path_existing)
+
+        reseter = ImportState(path=os.fsencode(state_file))
+        reseter.progress_reset(toppath)
+
+        state_after_reset = ImportState(path=os.fsencode(state_file))
+        assert not state_after_reset.progress_has(toppath)
+
+        instance_adder.progress_add(toppath, path_new)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+        assert state_final.progress_has_element(toppath, path_existing)
+        assert state_final.progress_has_element(toppath, path_new)
+
+    def test_history_add_concurrent_lost_update(self, state_file):
+        """history_add 并发写入也存在丢失更新问题。"""
+        paths_a = [b"/import/album_a"]
+        paths_b = [b"/import/album_b"]
+
+        instance_a = ImportState(path=os.fsencode(state_file))
+        instance_b = ImportState(path=os.fsencode(state_file))
+
+        instance_a.history_add(paths_a)
+        instance_b.history_add(paths_b)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+        norm_a = tuple(_normpath(p) for p in paths_a)
+        norm_b = tuple(_normpath(p) for p in paths_b)
+
+        has_a = norm_a in state_final.taghistory
+        has_b = norm_b in state_final.taghistory
+
+        assert has_b
+
+    def test_multiple_consecutive_writes_preserve_order(self, state_file):
+        """同一实例连续多次写入应保持一致状态。"""
+        toppath = b"/import/album"
+        all_paths = [
+            b"/import/album/track01.mp3",
+            b"/import/album/track02.mp3",
+            b"/import/album/track03.mp3",
+            b"/import/album/track04.mp3",
+            b"/import/album/track05.mp3",
+        ]
+
+        for i in range(len(all_paths)):
+            state = ImportState(path=os.fsencode(state_file))
+            state.progress_add(toppath, all_paths[i])
+
+        state_final = ImportState(path=os.fsencode(state_file))
+        for p in all_paths:
+            assert state_final.progress_has_element(toppath, p)
+
+    def test_two_instances_add_same_path_no_duplicate_issues(self, state_file):
+        """两个实例添加同一路径不会导致异常。"""
+        toppath = b"/import/album"
+        path = b"/import/album/track01.mp3"
+
+        instance_a = ImportState(path=os.fsencode(state_file))
+        instance_b = ImportState(path=os.fsencode(state_file))
+
+        instance_a.progress_add(toppath, path)
+        instance_b.progress_add(toppath, path)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+        assert state_final.progress_has_element(toppath, path)
+
+
+class TestNetworkFSStateSynchronization:
+    """网络文件系统（NFS/SMB）上状态文件同步语义测试。
+
+    模拟网络盘常见的同步问题：close-to-open 缓存一致性、
+    写入延迟可见性、部分写入传播、客户端缓存不一致等。
+    这些测试不依赖真实网络盘，而是通过模拟关键行为来
+    验证 ImportState 在各种同步场景下的表现。
+    """
+
+    def test_write_then_reopen_versus_in_memory(self, state_file):
+        """写入后重新打开的实例与内存中实例的状态差异。
+
+        模拟网络盘 close-to-open 一致性：
+        - 写入后必须重新打开才能看到最新数据
+        - 内存中的旧实例看不到其他客户端的写入
+        """
+        toppath = b"/import/album"
+        path = b"/import/album/track01.mp3"
+
+        state_reader = ImportState(path=os.fsencode(state_file))
+        assert not state_reader.progress_has(toppath)
+
+        state_writer = ImportState(path=os.fsencode(state_file))
+        state_writer.progress_add(toppath, path)
+
+        assert not state_reader.progress_has(toppath)
+
+        state_fresh = ImportState(path=os.fsencode(state_file))
+        assert state_fresh.progress_has_element(toppath, path)
+
+    def test_write_during_read_stale_cache(self, state_file):
+        """模拟网络盘 stale cache：读取时写入尚未传播。
+
+        场景：
+        - 客户端 A 写入数据
+        - 网络延迟导致客户端 B 打开时读到旧数据
+        - 验证 ImportState 能正常处理读到的旧数据（不崩溃）
+        """
+        toppath = b"/import/album"
+        path1 = b"/import/album/track01.mp3"
+        path2 = b"/import/album/track02.mp3"
+
+        writer1 = ImportState(path=os.fsencode(state_file))
+        writer1.progress_add(toppath, path1)
+
+        stale_reader = ImportState(path=os.fsencode(state_file))
+        assert stale_reader.progress_has_element(toppath, path1)
+
+        writer2 = ImportState(path=os.fsencode(state_file))
+        writer2.progress_add(toppath, path2)
+
+        assert not stale_reader.progress_has_element(toppath, path2)
+
+        fresh_reader = ImportState(path=os.fsencode(state_file))
+        assert fresh_reader.progress_has_element(toppath, path2)
+
+    def test_partial_write_corruption_handled(self, state_file):
+        """网络盘传输中断导致半截 pickle 文件。
+
+        NFS/SMB 上写入时可能因网络中断只写入部分数据，
+        验证 ImportState 能优雅处理此类损坏。
+        """
+        toppath = b"/import/album"
+        path = b"/import/album/track01.mp3"
+
+        good_writer = ImportState(path=os.fsencode(state_file))
+        good_writer.progress_add(toppath, path)
+
+        state_good = ImportState(path=os.fsencode(state_file))
+        assert state_good.progress_has_element(toppath, path)
+
+        with open(state_file, "rb") as f:
+            good_data = f.read()
+        with open(state_file, "wb") as f:
+            f.write(good_data[: len(good_data) // 2])
+
+        state_after_bad_write = ImportState(path=os.fsencode(state_file))
+        assert state_after_bad_write.tagprogress == {}
+        assert state_after_bad_write.taghistory == set()
+
+        recovery_writer = ImportState(path=os.fsencode(state_file))
+        recovery_writer.progress_add(toppath, path)
+
+        state_recovered = ImportState(path=os.fsencode(state_file))
+        assert state_recovered.progress_has_element(toppath, path)
+
+    def test_concurrent_writers_network_delay(self, state_file):
+        """模拟两个客户端通过网络盘并发写入。
+
+        NFS 上无缓存一致性保证，验证即使出现数据竞争，
+        ImportState 也不会产生无法读取的损坏文件。
+        """
+        toppath_a = b"/import/album_a"
+        toppath_b = b"/import/album_b"
+        path_a = b"/import/album_a/track01.mp3"
+        path_b = b"/import/album_b/track01.mp3"
+
+        for round_idx in range(5):
+            writer_a = ImportState(path=os.fsencode(state_file))
+            writer_b = ImportState(path=os.fsencode(state_file))
+
+            writer_a.progress_add(
+                toppath_a,
+                os.fsdecode(path_a).replace("01", f"{round_idx:02d}").encode(),
+            )
+            writer_b.progress_add(
+                toppath_b,
+                os.fsdecode(path_b).replace("01", f"{round_idx:02d}").encode(),
+            )
+
+        state_final = ImportState(path=os.fsencode(state_file))
+
+        assert state_final.progress_has(toppath_a) or state_final.progress_has(toppath_b)
+
+    def test_state_file_replaced_between_open_and_save(self, state_file):
+        """网络盘上另一客户端在 open 和 save 之间替换了整个文件。
+
+        场景：
+        - 实例 A 打开读取
+        - 实例 B 写入全新数据
+        - 实例 A 基于旧数据保存，覆盖 B 的数据
+
+        验证：至少不会产生无法解析的文件。
+        """
+        toppath_a = b"/import/album_a"
+        toppath_b = b"/import/album_b"
+        path_a = b"/import/album_a/track01.mp3"
+        path_b = b"/import/album_b/track01.mp3"
+
+        writer_b = ImportState(path=os.fsencode(state_file))
+        writer_b.progress_add(toppath_b, path_b)
+
+        stale_writer_a = ImportState(path=os.fsencode(state_file))
+        assert stale_writer_a.progress_has(toppath_b)
+
+        writer_b2 = ImportState(path=os.fsencode(state_file))
+        writer_b2.progress_add(toppath_b, b"/import/album_b/track02.mp3")
+
+        stale_writer_a.progress_add(toppath_a, path_a)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+        assert state_final.progress_has(toppath_a)
+
+    def test_history_concurrent_merge_network_fs(self, state_file):
+        """网络盘上两个客户端同时添加历史记录。
+
+        模拟 NFS close-to-open 下两个客户端各自添加历史，
+        验证最终状态文件至少能被正确解析。
+        """
+        paths_sets = [
+            [b"/netshare/album1"],
+            [b"/netshare/album2"],
+            [b"/netshare/album3"],
+        ]
+
+        for paths in paths_sets:
+            writer = ImportState(path=os.fsencode(state_file))
+            writer.history_add(paths)
+
+        state_final = ImportState(path=os.fsencode(state_file))
+        assert isinstance(state_final.taghistory, set)
+
+    def test_empty_write_flush_network_delay(self, state_file):
+        """网络盘上 flush 延迟：空 state 也能正确处理。
+
+        初始状态写入后，即使网络延迟导致 flush 尚未完成，
+        后续读取也应能安全处理。
+        """
+        empty_state = ImportState(path=os.fsencode(state_file))
+        assert empty_state.tagprogress == {}
+        assert empty_state.taghistory == set()
+
+        with empty_state as state:
+            pass
+
+        state_after_empty_save = ImportState(path=os.fsencode(state_file))
+        assert state_after_empty_save.tagprogress == {}
+        assert state_after_empty_save.taghistory == set()
+
+    def test_repeated_open_close_network_roundtrip(self, state_file):
+        """模拟网络盘多次往返：反复打开-关闭-读取。
+
+        验证在多次网络 I/O 往返后状态仍保持一致性。
+        """
+        toppath = b"/netimport/album"
+        all_paths = [
+            b"/netimport/album/track01.mp3",
+            b"/netimport/album/track02.mp3",
+            b"/netimport/album/track03.mp3",
+        ]
+
+        for i, p in enumerate(all_paths):
+            writer = ImportState(path=os.fsencode(state_file))
+            writer.progress_add(toppath, p)
+
+            for _ in range(3):
+                reader = ImportState(path=os.fsencode(state_file))
+                for j in range(i + 1):
+                    assert reader.progress_has_element(toppath, all_paths[j])
+
+    def test_network_fs_partial_history_state(self, state_file):
+        """网络盘上只写入了部分 taghistory 的状态文件。
+
+        模拟传输中断导致 pickle 结构不完整，
+        验证 ImportState 回退到空状态。
+        """
+        paths = [b"/import/album1", b"/import/album2"]
+
+        writer = ImportState(path=os.fsencode(state_file))
+        writer.history_add(paths)
+
+        norm_paths = tuple(_normpath(p) for p in paths)
+        state_good = ImportState(path=os.fsencode(state_file))
+        assert norm_paths in state_good.taghistory
+
+        with open(state_file, "rb") as f:
+            data = f.read()
+
+        for trunc_size in range(0, len(data), max(1, len(data) // 10)):
+            with open(state_file, "wb") as f:
+                f.write(data[:trunc_size])
+
+            should_not_crash = ImportState(path=os.fsencode(state_file))
+            assert isinstance(should_not_crash.tagprogress, dict)
+            assert isinstance(should_not_crash.taghistory, set)
