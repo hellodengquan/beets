@@ -361,3 +361,496 @@ class TestDataSourceDistance:
         dist = track_distance(item, info)
 
         assert dist.distance == expected_distance
+
+
+class TestTrackDistanceSameNameLengthDifferentBitrate:
+    """Edge case: tracks with the same title and length but different
+    sample rates / bitrates should still produce a non-zero distance
+    due to other distinguishing properties (e.g. bitrate), but the
+    track_length penalty should be zero when lengths match.
+    """
+
+    @pytest.fixture(autouse=True)
+    def config(self, config):
+        config["match"]["track_length_grace"] = 10
+        config["match"]["track_length_max"] = 30
+        config["match"]["distance_weights"]["track_length"] = 2.0
+        config["match"]["distance_weights"]["track_title"] = 3.0
+
+    def test_same_length_zero_track_length_penalty(self):
+        item = Item(
+            title="Same Song",
+            artist="Artist",
+            length=200.0,
+            bitrate=320000,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+
+    def test_same_length_different_bitrate_no_length_penalty(self):
+        item = Item(
+            title="Same Song",
+            artist="Artist",
+            length=200.0,
+            bitrate=128000,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+
+    def test_same_length_different_title_has_penalty(self):
+        item = Item(
+            title="Song A",
+            artist="Artist",
+            length=200.0,
+            bitrate=128000,
+        )
+        info = TrackInfo(
+            title="Song B",
+            artist="Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+        assert dist["track_title"] > 0.0
+
+    def test_length_within_grace_no_penalty(self):
+        item = Item(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=205.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+
+    def test_length_beyond_grace_has_penalty(self):
+        item = Item(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=250.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] > 0.0
+
+    def test_same_name_length_different_artist_has_penalty(self):
+        item = Item(
+            title="Same Song",
+            artist="Artist A",
+            length=200.0,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Artist B",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+        assert dist["track_artist"] > 0.0
+
+    def test_zero_length_no_penalty(self):
+        item = Item(
+            title="Song",
+            artist="Artist",
+            length=0,
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert "track_length" not in dist.keys()
+
+    def test_item_no_length_info_no_penalty(self):
+        item = Item(
+            title="Song",
+            artist="Artist",
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=None,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert "track_length" not in dist.keys()
+
+
+class TestTrackDistanceSameNameLengthDifferentSampleRate:
+    """Edge case: tracks with same title and length but different sample rates.
+
+    These tests verify that:
+    - Sample rate differences don't cause false mismatches when other
+      metadata matches
+    - The matching logic correctly identifies tracks even with different
+      audio quality
+    - Sample rate is not used as a distinguishing factor in the distance
+      calculation (as it's not part of the distance formula)
+    """
+
+    @pytest.fixture(autouse=True)
+    def config(self, config):
+        config["match"]["track_length_grace"] = 10
+        config["match"]["track_length_max"] = 30
+        config["match"]["distance_weights"]["track_length"] = 2.0
+        config["match"]["distance_weights"]["track_title"] = 3.0
+        config["match"]["distance_weights"]["track_artist"] = 2.0
+
+    def test_same_name_length_different_samplerate_44100_vs_48000(self):
+        """Test tracks with same name/length, different sample rates (44.1 vs 48 kHz).
+
+        This is a common scenario when comparing CD-quality (44.1 kHz)
+        and professional/studio quality (48 kHz) versions of the same track.
+        """
+        item = Item(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+            samplerate=44100,
+            bitrate=320000,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+        assert dist["track_title"] == 0.0
+        assert dist["track_artist"] == 0.0
+        assert float(dist) == 0.0
+
+    def test_same_name_length_different_samplerate_96000(self):
+        """Test high-res audio (96 kHz) vs standard quality.
+
+        Verify that high-resolution versions of the same track
+        are correctly matched.
+        """
+        item = Item(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+            samplerate=96000,
+            bitrate=1411200,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert float(dist) == 0.0
+
+    def test_same_name_length_different_samplerate_192000(self):
+        """Test ultra high-res (192 kHz) vs standard quality."""
+        item = Item(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+            samplerate=192000,
+            bitrate=2822400,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert float(dist) == 0.0
+
+    def test_same_name_length_different_bitrate(self):
+        """Test tracks with different bitrates but same metadata.
+
+        MP3 128kbps vs 320kbps versions of the same track
+        should match perfectly.
+        """
+        item_low_quality = Item(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+            samplerate=44100,
+            bitrate=128000,
+        )
+        item_high_quality = Item(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+            samplerate=44100,
+            bitrate=320000,
+        )
+        info = TrackInfo(
+            title="Same Song",
+            artist="Same Artist",
+            length=200.0,
+        )
+
+        dist_low = track_distance(item_low_quality, info, incl_artist=True)
+        dist_high = track_distance(item_high_quality, info, incl_artist=True)
+
+        assert float(dist_low) == float(dist_high) == 0.0
+
+    def test_same_name_length_different_samplerate_with_other_differences(self):
+        """Test that sample rate differences don't mask actual metadata differences.
+
+        When tracks have different titles/artists, they should still
+        produce a non-zero distance regardless of sample rate.
+        """
+        item = Item(
+            title="Song A",
+            artist="Artist A",
+            length=200.0,
+            samplerate=44100,
+        )
+        info = TrackInfo(
+            title="Song B",
+            artist="Artist B",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+        assert dist["track_title"] > 0.0
+        assert dist["track_artist"] > 0.0
+        assert float(dist) > 0.0
+
+    def test_multiple_tracks_same_name_length_different_samplerate(self):
+        """Test assigning multiple tracks with varying sample rates.
+
+        When assigning tracks in an album, sample rate differences
+        should not interfere with correct track assignment.
+        """
+        items = [
+            Item(
+                title=f"Track {i}",
+                artist="Artist",
+                length=180.0 + i * 10,
+                samplerate=samplerate,
+            )
+            for i, samplerate in enumerate([44100, 48000, 96000])
+        ]
+        tracks = [
+            TrackInfo(
+                title=f"Track {i}",
+                artist="Artist",
+                length=180.0 + i * 10,
+                index=i + 1,
+            )
+            for i in range(3)
+        ]
+
+        from beets.autotag.match import assign_items
+
+        mapping, extra_items, extra_tracks = assign_items(items, tracks)
+
+        assert len(mapping) == 3
+        assert len(extra_items) == 0
+        assert len(extra_tracks) == 0
+        for item, track in mapping:
+            assert item.title == track.title
+
+    def test_same_name_length_different_samplerate_album_distance(self):
+        """Test album-level distance calculation with mixed sample rates.
+
+        When matching an album where individual tracks have different
+        sample rates, the overall album distance should still be zero
+        for a perfect metadata match.
+        """
+        from beets.autotag.distance import distance
+        from beets.autotag.hooks import AlbumInfo
+
+        items = [
+            Item(
+                title=f"Track {i}",
+                artist="Artist",
+                album="Album",
+                length=200.0,
+                samplerate=samplerate,
+                track=i + 1,
+            )
+            for i, samplerate in enumerate([44100, 48000, 96000])
+        ]
+        tracks = [
+            TrackInfo(
+                title=f"Track {i}",
+                artist="Artist",
+                length=200.0,
+                index=i + 1,
+            )
+            for i in range(3)
+        ]
+        info = AlbumInfo(
+            tracks,
+            artist="Artist",
+            album="Album",
+            va=False,
+        )
+
+        item_info_pairs = list(zip(items, tracks))
+        dist = distance(items, info, item_info_pairs)
+
+        assert float(dist) == 0.0
+        for track_dist in dist.tracks.values():
+            assert float(track_dist) == 0.0
+
+    def test_samplerate_not_in_distance_keys(self):
+        """Verify that samplerate is not used as a distance penalty key.
+
+        The distance calculation should not include sample rate as a
+        penalty factor, since it's an audio quality attribute rather
+        than a metadata attribute.
+        """
+        item = Item(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+            samplerate=44100,
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert "samplerate" not in dist.keys()
+        assert "sample_rate" not in dist.keys()
+
+    def test_same_name_length_88200_vs_96000(self):
+        """Test 88.2 kHz vs 96 kHz sample rate differences."""
+        item_88 = Item(
+            title="High-Res Song",
+            artist="High-Res Artist",
+            length=300.0,
+            samplerate=88200,
+            bitrate=1411200,
+        )
+        item_96 = Item(
+            title="High-Res Song",
+            artist="High-Res Artist",
+            length=300.0,
+            samplerate=96000,
+            bitrate=1536000,
+        )
+        info = TrackInfo(
+            title="High-Res Song",
+            artist="High-Res Artist",
+            length=300.0,
+        )
+
+        dist_88 = track_distance(item_88, info, incl_artist=True)
+        dist_96 = track_distance(item_96, info, incl_artist=True)
+
+        assert float(dist_88) == 0.0
+        assert float(dist_96) == 0.0
+        assert float(dist_88) == float(dist_96)
+
+    def test_same_name_length_different_samplerate_with_grace_period(self):
+        """Test that length grace period works with different sample rates.
+
+        Even with slightly different lengths (within grace period),
+        sample rate differences should not affect the match.
+        """
+        item = Item(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+            samplerate=44100,
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=205.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+        assert float(dist) == 0.0
+
+    def test_lossless_vs_lossy_same_name_length(self):
+        """Test lossless (FLAC) vs lossy (MP3) versions of the same track.
+
+        Lossless and lossy versions often have the same metadata but
+        different audio quality characteristics. They should match
+        perfectly.
+        """
+        item_lossless = Item(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+            samplerate=44100,
+            bitrate=1411200,
+            format="FLAC",
+        )
+        item_lossy = Item(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+            samplerate=44100,
+            bitrate=320000,
+            format="MP3",
+        )
+        info = TrackInfo(
+            title="Song",
+            artist="Artist",
+            length=200.0,
+        )
+
+        dist_lossless = track_distance(item_lossless, info, incl_artist=True)
+        dist_lossy = track_distance(item_lossy, info, incl_artist=True)
+
+        assert float(dist_lossless) == 0.0
+        assert float(dist_lossy) == 0.0
+        assert float(dist_lossless) == float(dist_lossy)
+
+    def test_same_name_length_different_samplerate_va_album(self):
+        """Test sample rate differences in Various Artists albums.
+
+        In VA albums, track artist comparison is enabled. Sample rate
+        differences should not interfere with correct matching even
+        when track artists vary.
+        """
+        item = Item(
+            title="Compilation Track",
+            artist="Various Artists",
+            length=250.0,
+            samplerate=48000,
+            comp=True,
+        )
+        info = TrackInfo(
+            title="Compilation Track",
+            artist="Specific Artist",
+            length=250.0,
+        )
+
+        dist = track_distance(item, info, incl_artist=True)
+        assert dist["track_length"] == 0.0
+        assert dist["track_title"] == 0.0

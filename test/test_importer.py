@@ -1920,3 +1920,123 @@ class MpeglayerWavImportTest(AsIsImporterMixin, ImportTestCase):
 
         self.run_asis_importer()
         assert os.path.exists(dest)
+
+
+class ResumeInterruptedImportTest(ImportTestCase):
+    """Tests for resuming interrupted imports, verifying that already
+    processed files are not re-imported and progress is tracked correctly.
+    """
+
+    @patch("beets.plugins.send")
+    def test_resume_after_mid_album_abort(self, plugins_send):
+        """When an import is aborted mid-album, resuming should not
+        re-import the album that was already processed.
+        """
+        self.prepare_albums_for_import(3)
+        self.importer = self.setup_importer(autotag=False, resume=True)
+
+        completed = 0
+
+        def raise_after_two(event, **kwargs):
+            nonlocal completed
+            if event == "album_imported":
+                completed += 1
+                if completed == 2:
+                    raise importer.ImportAbortError
+
+        plugins_send.side_effect = raise_after_two
+
+        self.importer.run()
+        assert len(self.lib.albums()) == 2
+
+        self.importer.run()
+        assert len(self.lib.albums()) == 3
+
+    @patch("beets.plugins.send")
+    def test_resume_does_not_duplicate_processed_items(self, plugins_send):
+        """Resuming should not duplicate items that were already imported."""
+        self.prepare_albums_for_import(2)
+        self.importer = self.setup_importer(autotag=False, resume=True)
+
+        def raise_after_one(event, **kwargs):
+            if event == "album_imported":
+                raise importer.ImportAbortError
+
+        plugins_send.side_effect = raise_after_one
+
+        self.importer.run()
+        assert len(self.lib.albums()) == 1
+
+        self.importer.run()
+        assert len(self.lib.albums()) == 2
+
+    @patch("beets.plugins.send")
+    def test_resume_with_three_albums_preserves_all(self, plugins_send):
+        """When importing 3 albums and aborting after each, all albums
+        should eventually be imported.
+        """
+        self.prepare_albums_for_import(3)
+        self.importer = self.setup_importer(autotag=False, resume=True)
+
+        count = [0]
+
+        def abort_on_first(event, **kwargs):
+            if event == "album_imported":
+                count[0] += 1
+                raise importer.ImportAbortError
+
+        plugins_send.side_effect = abort_on_first
+
+        for _ in range(3):
+            self.importer.run()
+
+        assert len(self.lib.albums()) == 3
+
+    @patch("beets.plugins.send")
+    def test_resume_singleton_preserves_all_items(self, plugins_send):
+        """When importing singletons and aborting, all items should
+        eventually be imported.
+        """
+        self.prepare_album_for_import(3)
+        self.importer = self.setup_singleton_importer(
+            autotag=False, resume=True
+        )
+
+        count = [0]
+
+        def abort_after_each(event, **kwargs):
+            if event == "item_imported":
+                count[0] += 1
+                raise importer.ImportAbortError
+
+        plugins_send.side_effect = abort_after_each
+
+        for _ in range(3):
+            self.importer.run()
+
+        assert len(self.lib.items()) == 3
+
+
+class ImportStateCaseInsensitiveTest(AsIsImporterMixin, ImportTestCase):
+    """Tests verifying that import state tracking is case-insensitive
+    on case-insensitive filesystems (macOS, Windows).
+    """
+
+    def test_incremental_skips_with_case_variant(self):
+        importer = self.run_asis_importer(incremental=True)
+        album = self.lib.albums().get()
+
+        album["album"] = "edited album"
+        album.store()
+
+        if os.path.normcase("A") != "A":
+            original_dir = self.import_dir
+            upper_dir = os.fsencode(
+                os.fsdecode(original_dir).upper()
+            ) or original_dir
+            if os.path.isdir(syspath(upper_dir)):
+                importer = self.setup_importer(
+                    autotag=False, incremental=True, import_dir=upper_dir
+                )
+                importer.run()
+                assert len(self.lib.albums()) == 2

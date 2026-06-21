@@ -408,14 +408,20 @@ class ImportTask(BaseImportTask):
         dup_query = tmp_album.duplicates_query(keys)
 
         # Don't count albums with the same files as duplicates.
-        task_paths = {i.path for i in self.items if i}
+        # Use case-insensitive path comparison so that re-imports
+        # on case-insensitive filesystems are not falsely flagged.
+        task_paths = {
+            os.path.normcase(os.fsdecode(i.path))
+            for i in self.items
+            if i
+        }
 
         duplicates = []
         for album in lib.albums(dup_query):
-            # Check whether the album paths are all present in the task
-            # i.e. album is being completely re-imported by the task,
-            # in which case it is not a duplicate (will be replaced).
-            album_paths = {i.path for i in album.items()}
+            album_paths = {
+                os.path.normcase(os.fsdecode(i.path))
+                for i in album.items()
+            }
             if not (album_paths <= task_paths):
                 duplicates.append(album)
 
@@ -724,8 +730,9 @@ class SingletonImportTask(ImportTask):
 
         found_items = []
         for other_item in lib.items(dup_query):
-            # Existing items not considered duplicates.
-            if other_item.path != self.item.path:
+            if os.path.normcase(
+                os.fsdecode(other_item.path)
+            ) != os.path.normcase(os.fsdecode(self.item.path)):
                 found_items.append(other_item)
         return found_items
 

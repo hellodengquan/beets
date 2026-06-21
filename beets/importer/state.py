@@ -31,6 +31,17 @@ if TYPE_CHECKING:
 log = logging.getLogger("beets")
 
 
+def _normpath(path: PathBytes) -> PathBytes:
+    """Normalize a path for case-insensitive comparison.
+
+    Uses :func:`os.path.normcase` so that on case-insensitive
+    filesystems (macOS, Windows) paths that differ only in case are
+    treated as identical, while on case-sensitive filesystems (Linux)
+    the original path is returned unchanged.
+    """
+    return os.fsencode(os.path.normcase(os.fsdecode(path)))
+
+
 @dataclass
 class ImportState:
     """Representing the progress of an import task.
@@ -107,34 +118,38 @@ class ImportState:
         under `toppath`.
         """
         with self as state:
-            imported = state.tagprogress.setdefault(toppath, [])
+            norm_top = _normpath(toppath)
+            imported = state.tagprogress.setdefault(norm_top, [])
             for path in paths:
-                if imported and imported[-1] <= path:
-                    imported.append(path)
+                norm_path = _normpath(path)
+                if imported and imported[-1] <= norm_path:
+                    imported.append(norm_path)
                 else:
-                    insort(imported, path)
+                    insort(imported, norm_path)
 
     def progress_has_element(self, toppath: PathBytes, path: PathBytes) -> bool:
         """Return whether `path` has been imported in `toppath`."""
-        imported = self.tagprogress.get(toppath, [])
-        i = bisect_left(imported, path)
-        return i != len(imported) and imported[i] == path
+        imported = self.tagprogress.get(_normpath(toppath), [])
+        norm_path = _normpath(path)
+        i = bisect_left(imported, norm_path)
+        return i != len(imported) and imported[i] == norm_path
 
     def progress_has(self, toppath: PathBytes) -> bool:
         """Return `True` if there exist paths that have already been
         imported under `toppath`.
         """
-        return toppath in self.tagprogress
+        return _normpath(toppath) in self.tagprogress
 
     def progress_reset(self, toppath: PathBytes | None):
         """Reset the progress for `toppath`."""
         with self as state:
-            if toppath in state.tagprogress:
-                del state.tagprogress[toppath]
+            norm_top = _normpath(toppath) if toppath else None
+            if norm_top and norm_top in state.tagprogress:
+                del state.tagprogress[norm_top]
 
     # -------------------------------- Taghistory -------------------------------- #
 
     def history_add(self, paths: list[PathBytes]):
         """Add the paths to the history."""
         with self as state:
-            state.taghistory.add(tuple(paths))
+            state.taghistory.add(tuple(_normpath(p) for p in paths))

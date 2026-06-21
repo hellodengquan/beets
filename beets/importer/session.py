@@ -22,7 +22,7 @@ from beets.importer.tasks import Action
 from beets.util import displayable_path, normpath, pipeline, syspath
 
 from . import stages as stagefuncs
-from .state import ImportState
+from .state import ImportState, _normpath
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -251,7 +251,9 @@ class ImportSession:
             [ImportState().progress_has_element(toppath, p) for p in paths]
         ):
             return True
-        if self.config["incremental"] and tuple(paths) in self.history_dirs:
+        if self.config["incremental"] and tuple(
+            _normpath(p) for p in paths
+        ) in self.history_dirs:
             return True
 
         return False
@@ -270,7 +272,12 @@ class ImportSession:
         during previous tasks.
         """
         for path in paths:
-            if path not in self._merged_items and path not in self._merged_dirs:
+            norm = _normpath(path)
+            if norm not in {
+                _normpath(p) for p in self._merged_items
+            } and norm not in {
+                _normpath(d) for d in self._merged_dirs
+            }:
                 return False
         return True
 
