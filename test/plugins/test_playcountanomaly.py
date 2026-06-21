@@ -304,3 +304,295 @@ class TestPlayCountAnomalyPlugin(PluginMixin, TestHelper, IOMixin):
 
         out = self.run_with_output("anomalies", "--type", "new_song_burst")
         assert "burst_song" in out
+
+    def test_device_id_detection(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_id"] = "test-device-123"
+        plugin.config["device_name"] = "Test Device"
+
+        assert plugin._get_device_id() == "test-device-123"
+        assert plugin._get_device_name() == "Test Device"
+
+    def test_device_id_auto_detect(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_id"] = ""
+        plugin.config["device_name"] = ""
+
+        device_id = plugin._get_device_id()
+        device_name = plugin._get_device_name()
+
+        assert isinstance(device_id, str)
+        assert len(device_id) > 0
+        assert "@" in device_id
+        assert isinstance(device_name, str)
+        assert len(device_name) > 0
+
+    def test_record_play_api(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["enable_history_tracking"] = True
+
+        item = self._create_item_with_plays(5, title="test_record")
+
+        result = plugin.record_play(
+            item,
+            delta=1,
+            source="test_api",
+            device_id="test-device",
+            device_name="Test Device",
+        )
+        assert result is True
+
+        result_zero = plugin.record_play(item, delta=0)
+        assert result_zero is False
+
+        result_neg = plugin.record_play(item, delta=-1)
+        assert result_neg is False
+
+    def test_play_history_table_exists(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin._ensure_play_history_table(self.lib)
+
+        db = self.lib._db
+        result = db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("play_count_history",),
+        )
+        tables = [row["name"] for row in result]
+        assert "play_count_history" in tables
+
+    def test_daily_spike_detection(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["daily_spike_threshold"] = 3.0
+        plugin.config["daily_spike_min_plays"] = 5
+        plugin.config["min_plays_for_anomaly"] = 1
+
+        now = int(time.time())
+        one_day = 86400
+
+        history = []
+        for i in range(10):
+            day_offset = (i + 1) * one_day
+            history.append({
+                "play_time": now - day_offset,
+                "play_count_delta": 2,
+                "device_id": "device1",
+                "source": "test",
+            })
+
+        spike_day = now - 5 * one_day
+        for i in range(15):
+            history.append({
+                "play_time": spike_day + i * 60,
+                "play_count_delta": 1,
+                "device_id": "device1",
+                "source": "test",
+            })
+
+        item = Item(title="spike_test", play_count=35)
+        anomaly = plugin._check_daily_spike(item, history, float(now))
+
+        assert anomaly is not None
+        assert anomaly.type == "daily_spike"
+        assert anomaly.score > 0
+        assert "spike" in anomaly.description
+
+    def test_no_daily_spike_normal(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["daily_spike_threshold"] = 5.0
+        plugin.config["daily_spike_min_plays"] = 5
+
+        now = int(time.time())
+        one_day = 86400
+
+        history = []
+        for i in range(14):
+            day_offset = (i + 1) * one_day
+            history.append({
+                "play_time": now - day_offset,
+                "play_count_delta": 2,
+                "device_id": "device1",
+                "source": "test",
+            })
+
+        item = Item(title="normal", play_count=28)
+        anomaly = plugin._check_daily_spike(item, history, float(now))
+
+        assert anomaly is None
+
+    def test_concurrent_play_detection(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["concurrent_window_seconds"] = 300
+        plugin.config["concurrent_min_plays"] = 3
+        plugin.config["concurrent_device_count"] = 2
+
+        now = int(time.time())
+
+        history = []
+        devices = ["device_a", "device_b", "device_c"]
+        for i, device in enumerate(devices):
+            history.append({
+                "play_time": now + i * 10,
+                "play_count_delta": 2,
+                "device_id": device,
+                "source": "test",
+            })
+
+        item = Item(title="concurrent_test", play_count=10)
+        anomaly = plugin._check_concurrent_play(item, history, float(now))
+
+        assert anomaly is not None
+        assert anomaly.type == "concurrent_play"
+        assert "concurrent" in anomaly.description
+
+    def test_no_concurrent_play_single_device(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["concurrent_window_seconds"] = 300
+        plugin.config["concurrent_min_plays"] = 3
+        plugin.config["concurrent_device_count"] = 2
+
+        now = int(time.time())
+
+        history = []
+        for i in range(5):
+            history.append({
+                "play_time": now + i * 10,
+                "play_count_delta": 1,
+                "device_id": "only_device",
+                "source": "test",
+            })
+
+        item = Item(title="single_device", play_count=5)
+        anomaly = plugin._check_concurrent_play(item, history, float(now))
+
+        assert anomaly is None
+
+    def test_device_anomaly_detection(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_anomaly_threshold"] = 3.0
+        plugin.config["min_plays_for_anomaly"] = 5
+
+        now = int(time.time())
+        one_day = 86400
+
+        history = []
+        for i in range(50):
+            history.append({
+                "play_time": now - i * one_day,
+                "play_count_delta": 1,
+                "device_id": "normal_device",
+                "source": "test",
+            })
+
+        for i in range(50):
+            history.append({
+                "play_time": now - i * 3600,
+                "play_count_delta": 1,
+                "device_id": "suspicious_device",
+                "source": "test",
+            })
+
+        item = Item(title="device_test", play_count=100)
+        stats = {"mean": 10.0, "stddev": 5.0}
+        anomaly = plugin._check_device_anomaly(item, history, stats, float(now))
+
+        assert anomaly is not None
+        assert anomaly.type == "device_anomaly"
+        assert "device" in anomaly.description
+
+    def test_no_device_anomaly_balanced(self):
+        plugin = PlayCountAnomalyPlugin()
+        plugin.config["device_anomaly_threshold"] = 3.0
+        plugin.config["min_plays_for_anomaly"] = 5
+
+        now = int(time.time())
+
+        history = []
+        for i in range(25):
+            history.append({
+                "play_time": now - i * 3600,
+                "play_count_delta": 1,
+                "device_id": "device_a",
+                "source": "test",
+            })
+        for i in range(25):
+            history.append({
+                "play_time": now - i * 3600,
+                "play_count_delta": 1,
+                "device_id": "device_b",
+                "source": "test",
+            })
+
+        item = Item(title="balanced", play_count=50)
+        stats = {"mean": 10.0, "stddev": 5.0}
+        anomaly = plugin._check_device_anomaly(item, history, stats, float(now))
+
+        assert anomaly is None
+
+    def test_get_daily_play_counts(self):
+        plugin = PlayCountAnomalyPlugin()
+
+        now = int(time.time())
+        day1 = now - 86400
+        day2 = now - 2 * 86400
+
+        history = [
+            {
+                "play_time": now,
+                "play_count_delta": 2,
+                "device_id": "d1",
+                "source": "s1",
+            },
+            {
+                "play_time": now,
+                "play_count_delta": 3,
+                "device_id": "d2",
+                "source": "s1",
+            },
+            {
+                "play_time": day1,
+                "play_count_delta": 5,
+                "device_id": "d1",
+                "source": "s2",
+            },
+            {
+                "play_time": day2,
+                "play_count_delta": 1,
+                "device_id": "d1",
+                "source": "s1",
+            },
+        ]
+
+        daily = plugin._get_daily_play_counts(history)
+        today_str = time.strftime("%Y-%m-%d", time.localtime(now))
+        day1_str = time.strftime("%Y-%m-%d", time.localtime(day1))
+
+        assert today_str in daily
+        assert daily[today_str]["count"] == 5
+        assert len(daily[today_str]["devices"]) == 2
+        assert day1_str in daily
+        assert daily[day1_str]["count"] == 5
+        assert len(daily) == 3
+
+    def test_item_types_include_new_fields(self):
+        plugin = PlayCountAnomalyPlugin()
+
+        assert "anomaly_score" in plugin.item_types
+        assert "anomaly_types" in plugin.item_types
+        assert "anomaly_reviewed" in plugin.item_types
+        assert "anomaly_resolution" in plugin.item_types
+        assert "anomaly_notes" in plugin.item_types
+        assert "fake_play_count" in plugin.item_types
+        assert "play_history" in plugin.item_types
+        assert "daily_play_stats" in plugin.item_types
+
+    def test_anomaly_types_constant(self):
+        from beetsplug.playcountanomaly import ANOMALY_TYPES
+
+        assert "zscore_deviation" in ANOMALY_TYPES
+        assert "new_song_burst" in ANOMALY_TYPES
+        assert "impossible_count" in ANOMALY_TYPES
+        assert "sudden_zero" in ANOMALY_TYPES
+        assert "daily_spike" in ANOMALY_TYPES
+        assert "concurrent_play" in ANOMALY_TYPES
+        assert "device_anomaly" in ANOMALY_TYPES
+        assert len(ANOMALY_TYPES) == 7

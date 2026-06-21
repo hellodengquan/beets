@@ -21,9 +21,28 @@ This plugin identifies songs with suspicious play count patterns, such as:
 - Songs with recent plays but zero or very low play counts (suggesting resets)
 - Single-day play count spikes far above the personal average
 - Concurrent plays across multiple devices suggesting duplicate counting
+- Disproportionate play counts from specific devices
 
 Users can review anomalies and choose to correct, ignore, or mark them as fake.
 A detailed play history is maintained to enable accurate anomaly detection.
+
+Data Sources & Device Identification
+-------------------------------------
+The plugin collects play history from multiple sources:
+
+1. **Automatic tracking**: Monitors database changes to play_count fields and
+   automatically records each play event with device context.
+
+2. **Device identification**:
+   - Configured via `playcountanomaly.device_id` and `device_name` config options
+   - Auto-detection falls back to `username@hostname` pattern
+   - Supports cross-device scenarios in shared/multi-device libraries
+
+3. **Programmatic API**: Other plugins can use ``record_play(item, delta, **kwargs)``
+   to report plays from external sources with device and timestamp information.
+
+4. **History table**: All play events are stored in the ``play_count_history``
+   database table for anomaly analysis and audit trails.
 """
 
 from __future__ import annotations
@@ -277,19 +296,37 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
         item.store()
 
     def _get_device_id(self) -> str:
-        """Get a unique identifier for the current device."""
+        """Get a unique identifier for the current device.
+
+        Resolution order:
+        1. Explicit ``device_id`` config value
+        2. ``BEETS_DEVICE_ID`` environment variable
+        3. Auto-generated ``username@hostname`` pattern
+        """
         device_id = self.config["device_id"].as_str()
         if device_id:
             return device_id
+        env_device_id = os.environ.get("BEETS_DEVICE_ID", "")
+        if env_device_id:
+            return env_device_id
         hostname = socket.gethostname()
         username = os.environ.get("USER", "unknown")
         return f"{username}@{hostname}"
 
     def _get_device_name(self) -> str:
-        """Get the display name for the current device."""
+        """Get the display name for the current device.
+
+        Resolution order:
+        1. Explicit ``device_name`` config value
+        2. ``BEETS_DEVICE_NAME`` environment variable
+        3. System hostname
+        """
         device_name = self.config["device_name"].as_str()
         if device_name:
             return device_name
+        env_device_name = os.environ.get("BEETS_DEVICE_NAME", "")
+        if env_device_name:
+            return env_device_name
         return socket.gethostname()
 
     def _on_library_opened(self, lib: Library) -> None:
@@ -353,11 +390,14 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
         play_count: int,
         delta: int,
         source: str = "database",
+        device_id: str | None = None,
+        device_name: str | None = None,
+        play_time: int | None = None,
     ) -> None:
         """Record a play event to the history table."""
-        now = int(time.time())
-        device_id = self._get_device_id()
-        device_name = self._get_device_name()
+        timestamp = play_time if play_time else int(time.time())
+        dev_id = device_id if device_id else self._get_device_id()
+        dev_name = device_name if device_name else self._get_device_name()
         insert_sql = f"""
         INSERT INTO {PLAY_HISTORY_TABLE}
         (item_id, play_time, play_count, play_count_delta,
@@ -370,17 +410,80 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
                 insert_sql,
                 (
                     item.id,
-                    now,
+                    timestamp,
                     play_count,
                     delta,
-                    device_id,
-                    device_name,
+                    dev_id,
+                    dev_name,
                     source,
                     float(item.length or 0),
                 ),
             )
         except Exception as e:
             self._log.debug("Failed to record play history: {}", e)
+
+    def record_play(
+        self,
+        item: Item,
+        delta: int = 1,
+        source: str = "api",
+        device_id: str | None = None,
+        device_name: str | None = None,
+        play_time: int | None = None,
+    ) -> bool:
+        """Record a play event from an external source.
+
+        This is the public API for other plugins or integrations to report
+        play events with device and timestamp information for accurate
+        cross-device anomaly detection.
+
+        Args:
+            item: The item that was played.
+            delta: Number of plays to record (default: 1).
+            source: Identifier for the data source (e.g., "mpd", "lastfm", "api").
+            device_id: Unique device identifier. If None, uses auto-detection.
+            device_name: Human-readable device name. If None, uses auto-detection.
+            play_time: Unix timestamp of the play event. If None, uses current time.
+
+        Returns:
+            True if the play was recorded successfully, False otherwise.
+
+        Example::
+
+            from beets.plugins import find_plugins
+
+            plugin = next(
+                p for p in find_plugins()
+                if p.name == "playcountanomaly"
+            )
+            plugin.record_play(
+                item,
+                delta=1,
+                source="my_player",
+                device_id="phone-abc123",
+                device_name="My iPhone",
+            )
+        """
+        if delta <= 0:
+            return False
+        if not self.config["enable_history_tracking"].get(bool):
+            return False
+
+        lib = item._db  # type: ignore[attr-defined]
+        if lib is None:
+            return False
+        play_count = self._get_play_count(item) + delta
+        self._record_play(
+            lib,
+            item,
+            play_count,
+            delta,
+            source=source,
+            device_id=device_id,
+            device_name=device_name,
+            play_time=play_time,
+        )
+        return True
 
     def _get_play_history(
         self, lib: Library, item_id: int, days: int | None = None
@@ -394,7 +497,7 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
         if days:
             cutoff = int(time.time()) - days * 86400
             query += " AND play_time >= ?"
-            params = list(params) + [cutoff]
+            params = [*list(params), cutoff]
         query += " ORDER BY play_time DESC"
         db = lib._db  # type: ignore[attr-defined]
         try:
@@ -742,7 +845,11 @@ class PlayCountAnomalyPlugin(plugins.BeetsPlugin):
         return None
 
     def _check_device_anomaly(
-        self, item: Item, history: list[dict[str, Any]], stats: dict[str, Any], now: float
+        self,
+        item: Item,
+        history: list[dict[str, Any]],
+        stats: dict[str, Any],
+        now: float,
     ) -> Anomaly | None:
         """Check for unusual play patterns from specific devices.
 
