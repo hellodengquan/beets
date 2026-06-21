@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from beets import config, logging, plugins, util
@@ -34,6 +35,39 @@ if TYPE_CHECKING:
 
 
 QUEUE_SIZE = 128
+
+
+@dataclass
+class DuplicateConflict:
+    """Represents a duplicate conflict detected during import."""
+
+    task: ImportTask
+    found_duplicates: list
+    similarity: float = 0.0
+    suggested_action: str = "ask"
+    resolved: bool = False
+    resolution: str | None = None
+
+
+@dataclass
+class ConflictQueue:
+    """A queue to collect duplicate conflicts for batch processing."""
+
+    conflicts: list[DuplicateConflict] = field(default_factory=list)
+
+    def add(self, conflict: DuplicateConflict) -> None:
+        """Add a conflict to the queue."""
+        self.conflicts.append(conflict)
+
+    def __len__(self) -> int:
+        return len(self.conflicts)
+
+    def __iter__(self):
+        return iter(self.conflicts)
+
+    def pending(self) -> list[DuplicateConflict]:
+        """Return all unresolved conflicts."""
+        return [c for c in self.conflicts if not c.resolved]
 
 # Global logger.
 log = logging.getLogger("beets")
@@ -57,6 +91,7 @@ class ImportSession:
     _is_resuming: dict[bytes, bool]
     _merged_items: set[PathBytes]
     _merged_dirs: set[PathBytes]
+    conflict_queue: ConflictQueue
 
     def __init__(
         self,
@@ -85,6 +120,7 @@ class ImportSession:
         self._is_resuming = {}
         self._merged_items = set()
         self._merged_dirs = set()
+        self.conflict_queue = ConflictQueue()
 
         # Normalize the paths.
         self.paths = list(map(normpath, paths or []))
@@ -185,6 +221,16 @@ class ImportSession:
     def resolve_duplicate(self, task: ImportTask, found_duplicates):
         raise NotImplementedError
 
+    def resolve_duplicate_batch(self, conflicts: list[DuplicateConflict]):
+        """Resolve multiple duplicate conflicts in batch.
+
+        Subclasses should implement this method to provide a batch
+        resolution interface. The method should iterate over the conflicts
+        and set their `resolved` and `resolution` attributes, and update
+        the corresponding tasks accordingly.
+        """
+        raise NotImplementedError
+
     def choose_item(self, task: ImportTask):
         raise NotImplementedError
 
@@ -239,6 +285,59 @@ class ImportSession:
                 pl.run_sequential()
         except ImportAbortError:
             # User aborted operation. Silently stop.
+            pass
+
+        # Process any pending duplicate conflicts in batch mode
+        pending_conflicts = self.conflict_queue.pending()
+        if pending_conflicts:
+            log.info(
+                "Found {} pending duplicate conflicts, starting batch resolution...",
+                len(pending_conflicts),
+            )
+            self.resolve_duplicate_batch(pending_conflicts)
+
+            # After batch resolution, re-run affected tasks through the pipeline
+            resolved_tasks = []
+            for conflict in pending_conflicts:
+                if conflict.resolved and conflict.resolution != "skip":
+                    resolved_tasks.append(conflict.task)
+
+            if resolved_tasks:
+                log.info(
+                    "Re-processing {} resolved tasks...", len(resolved_tasks)
+                )
+                self._process_resolved_tasks(resolved_tasks)
+
+    def _process_resolved_tasks(self, tasks: list[ImportTask]):
+        """Process tasks that have had their duplicate conflicts resolved."""
+        from . import stages as stagefuncs
+
+        resolve_stages = [
+            iter(tasks),
+        ]
+
+        if self.config["autotag"]:
+            resolve_stages += [
+                stagefuncs.lookup_candidates(self),
+                stagefuncs.user_query(self),
+            ]
+        else:
+            resolve_stages += [stagefuncs.import_asis(self)]
+
+        for stage_func in plugins.early_import_stages():
+            resolve_stages.append(stagefuncs.plugin_stage(self, stage_func))
+        for stage_func in plugins.import_stages():
+            resolve_stages.append(stagefuncs.plugin_stage(self, stage_func))
+
+        resolve_stages += [stagefuncs.manipulate_files(self)]
+
+        pl = pipeline.Pipeline(resolve_stages)
+        try:
+            if config["threaded"]:
+                pl.run_parallel(QUEUE_SIZE)
+            else:
+                pl.run_sequential()
+        except ImportAbortError:
             pass
 
     # Incremental and resumed imports

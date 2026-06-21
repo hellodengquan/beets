@@ -52,6 +52,10 @@ import:
         item: artist title
     duplicate_action: ask
     duplicate_verbose_prompt: no
+    batch_duplicate_resolution: no
+    duplicate_auto_suggest: yes
+    duplicate_similarity_high: 0.9
+    duplicate_similarity_medium: 0.7
     bell: no
     set_fields: {}
     ignored_alias_types: []

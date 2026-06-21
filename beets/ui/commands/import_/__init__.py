@@ -346,4 +346,39 @@ import_cmd.parser.add_option(
     metavar="FIELD=VALUE",
     help="set the given fields to the supplied values",
 )
+import_cmd.parser.add_option(
+    "-B",
+    "--batch-duplicates",
+    dest="batch_duplicate_resolution",
+    action="store_true",
+    default=None,
+    help="collect duplicate conflicts and resolve them in batch after scanning",
+)
+import_cmd.parser.add_option(
+    "--no-batch-duplicates",
+    dest="batch_duplicate_resolution",
+    action="store_false",
+    help="resolve duplicate conflicts immediately (opposite of -B)",
+)
+import_cmd.parser.add_option(
+    "--duplicate-similarity-high",
+    type="float",
+    dest="duplicate_similarity_high",
+    metavar="THRESHOLD",
+    help="threshold for high similarity (suggest replace old, default: 0.9)",
+)
+import_cmd.parser.add_option(
+    "--duplicate-similarity-medium",
+    type="float",
+    dest="duplicate_similarity_medium",
+    metavar="THRESHOLD",
+    help="threshold for medium similarity (suggest keep both, default: 0.7)",
+)
+import_cmd.parser.add_option(
+    "--no-duplicate-auto-suggest",
+    dest="duplicate_auto_suggest",
+    action="store_false",
+    default=None,
+    help="disable automatic action suggestion based on similarity",
+)
 import_cmd.func = import_func

@@ -193,7 +193,21 @@ def user_query(session: ImportSession, task: ImportTask):
             user_query(session),
         )
 
+    # Check if this task has a pending conflict in the queue
+    batch_mode = config["import"]["batch_duplicate_resolution"].get(bool)
+
     _resolve_duplicates(session, task)
+
+    # In batch mode, if the conflict was added to the queue,
+    # skip processing for now - it will be handled in batch later
+    if batch_mode:
+        for conflict in session.conflict_queue.pending():
+            if conflict.task is task:
+                log.debug(
+                    "Task {} queued for batch duplicate resolution",
+                    displayable_path(task.paths),
+                )
+                return task
 
     if task.should_merge_duplicates:
         # Create a new task for tagging the current items
@@ -231,7 +245,22 @@ def import_asis(session: ImportSession, task: ImportTask):
 
     log.info("{}", displayable_path(task.paths))
     task.set_choice(Action.ASIS)
+
+    batch_mode = config["import"]["batch_duplicate_resolution"].get(bool)
+
     _resolve_duplicates(session, task)
+
+    # In batch mode, if the conflict was added to the queue,
+    # skip processing for now - it will be handled in batch later
+    if batch_mode:
+        for conflict in session.conflict_queue.pending():
+            if conflict.task is task:
+                log.debug(
+                    "Task {} queued for batch duplicate resolution",
+                    displayable_path(task.paths),
+                )
+                return
+
     _apply_choice(session, task)
 
 
@@ -333,14 +362,163 @@ def _apply_choice(session: ImportSession, task: ImportTask):
         task.set_fields(session.lib)
 
 
+def _calculate_field_similarity(
+    val1: str | int | float | None,
+    val2: str | int | float | None,
+) -> float:
+    """Calculate similarity between two field values.
+
+    Returns a value between 0.0 (completely different) and 1.0 (identical).
+    """
+    if val1 is None or val2 is None:
+        return 0.5
+
+    if isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
+        if val1 == val2:
+            return 1.0
+        if val1 == 0 or val2 == 0:
+            return 0.0
+        return 1.0 - abs(val1 - val2) / max(abs(val1), abs(val2))
+
+    str1 = str(val1).lower().strip()
+    str2 = str(val2).lower().strip()
+
+    if str1 == str2:
+        return 1.0
+    if not str1 or not str2:
+        return 0.0
+
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, str1, str2).ratio()
+
+
+def _calculate_item_similarity(item1, item2) -> float:
+    """Calculate similarity between two music items.
+
+    Considers multiple attributes: title, artist, length, bitrate, etc.
+    Returns a value between 0.0 (completely different) and 1.0 (identical).
+    """
+    fields = [
+        ("title", 3.0),
+        ("artist", 2.5),
+        ("album", 2.0),
+        ("length", 2.0),
+        ("bitrate", 1.0),
+        ("track", 1.0),
+        ("disc", 0.5),
+        ("year", 1.0),
+    ]
+
+    total_weight = 0.0
+    weighted_sum = 0.0
+
+    for field, weight in fields:
+        val1 = getattr(item1, field, None)
+        val2 = getattr(item2, field, None)
+        sim = _calculate_field_similarity(val1, val2)
+        weighted_sum += sim * weight
+        total_weight += weight
+
+    return weighted_sum / total_weight if total_weight > 0 else 0.0
+
+
+def _calculate_similarity(task: ImportTask, duplicates: list) -> float:
+    """Calculate overall similarity between a task and its duplicates.
+
+    For album tasks, compares all items. For singleton tasks, compares
+    the single item. Returns the average similarity across all pairs.
+    """
+    if not duplicates:
+        return 0.0
+
+    task_items = task.imported_items()
+    similarities = []
+
+    for dup in duplicates:
+        if task.is_album:
+            dup_items = list(dup.items())
+            for task_item in task_items:
+                best_sim = 0.0
+                for dup_item in dup_items:
+                    sim = _calculate_item_similarity(task_item, dup_item)
+                    if sim > best_sim:
+                        best_sim = sim
+                similarities.append(best_sim)
+        else:
+            task_item = task_items[0] if task_items else None
+            if task_item:
+                sim = _calculate_item_similarity(task_item, dup)
+                similarities.append(sim)
+
+    return sum(similarities) / len(similarities) if similarities else 0.0
+
+
+def _suggest_action(
+    similarity: float,
+    high_threshold: float = 0.9,
+    medium_threshold: float = 0.7,
+) -> str:
+    """Suggest a default action based on similarity score.
+
+    - High similarity (>= high_threshold): Suggest "remove" (replace old)
+    - Medium similarity (>= medium_threshold): Suggest "keep" (keep both)
+    - Low similarity: Suggest "ask" (let user decide)
+    """
+    if similarity >= high_threshold:
+        return "r"
+    elif similarity >= medium_threshold:
+        return "k"
+    else:
+        return "a"
+
+
 def _resolve_duplicates(session: ImportSession, task: ImportTask):
     """Check if a task conflicts with items or albums already imported
     and ask the session to resolve this.
+
+    If batch duplicate resolution is enabled, conflicts are collected
+    into a queue for later batch processing instead of being resolved
+    immediately.
     """
+    from .session import DuplicateConflict
+
     if task.choice_flag in (Action.ASIS, Action.APPLY, Action.RETAG):
         found_duplicates = task.find_duplicates(session.lib)
         if found_duplicates:
             log.debug("found duplicates: {}", [o.id for o in found_duplicates])
+
+            # Calculate similarity and suggest action
+            similarity = _calculate_similarity(task, found_duplicates)
+            high_threshold = config["import"][
+                "duplicate_similarity_high"
+            ].get(float)
+            medium_threshold = config["import"][
+                "duplicate_similarity_medium"
+            ].get(float)
+            suggested_action = _suggest_action(
+                similarity, high_threshold, medium_threshold
+            )
+
+            # Check if batch mode is enabled
+            batch_mode = config["import"]["batch_duplicate_resolution"].get(
+                bool
+            )
+
+            if batch_mode:
+                # Add to conflict queue for batch processing
+                conflict = DuplicateConflict(
+                    task=task,
+                    found_duplicates=found_duplicates,
+                    similarity=similarity,
+                    suggested_action=suggested_action,
+                )
+                session.conflict_queue.add(conflict)
+                log.debug(
+                    "Added duplicate conflict to queue (similarity: {:.2f})",
+                    similarity,
+                )
+                return
 
             # Get the default action to follow from config.
             duplicate_action = config["import"]["duplicate_action"].as_choice(
@@ -352,6 +530,7 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
                     "ask": "a",
                 }
             )
+
             log.debug("default action for duplicates: {}", duplicate_action)
 
             if duplicate_action == "s":
@@ -368,6 +547,9 @@ def _resolve_duplicates(session: ImportSession, task: ImportTask):
                 task.should_merge_duplicates = True
             else:
                 # No default action set; ask the session.
+                # Store similarity on the task for potential use by the session
+                task._duplicate_similarity = similarity
+                task._duplicate_suggested_action = suggested_action
                 session.resolve_duplicate(task, found_duplicates)
 
             session.log_choice(task, True)

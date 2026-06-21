@@ -146,10 +146,38 @@ class TerminalImportSession(importer.ImportSession):
             ("album" if task.is_album else "item"),
         )
 
+        # Get similarity information if available
+        similarity = getattr(task, "_duplicate_similarity", None)
+        suggested_action = getattr(task, "_duplicate_suggested_action", None)
+
+        if similarity is not None and config["import"]["duplicate_auto_suggest"].get(bool):
+            sim_color = (
+                "text_success"
+                if similarity >= 0.9
+                else "text_warning"
+                if similarity >= 0.7
+                else "text_error"
+            )
+            ui.print_(
+                f"Similarity: {colorize(sim_color, f'{similarity:.2f}')} "
+                f"(suggested: {self._action_to_string(suggested_action)})"
+            )
+
         if config["import"]["quiet"]:
-            # In quiet mode, don't prompt -- just skip.
-            log.info("Skipping.")
-            sel = "s"
+            # In quiet mode, use suggested action if available, otherwise skip
+            if (
+                config["import"]["duplicate_auto_suggest"].get(bool)
+                and suggested_action
+            ):
+                log.info(
+                    "Quiet mode: using suggested action '{}' (similarity: {:.2f})",
+                    suggested_action,
+                    similarity or 0.0,
+                )
+                sel = suggested_action
+            else:
+                log.info("Skipping.")
+                sel = "s"
         else:
             # Print some detail about the existing and new items so the
             # user can make an informed decision.
@@ -180,9 +208,17 @@ class TerminalImportSession(importer.ImportSession):
                 for item in task.imported_items():
                     print(f"  {item}")
 
-            sel = ui.input_options(
-                ("Skip new", "Keep all", "Remove old", "Merge all")
-            )
+            options = ["Skip new", "Keep all", "Remove old", "Merge all"]
+            if (
+                config["import"]["duplicate_auto_suggest"].get(bool)
+                and suggested_action
+            ):
+                options.append("Use suggested")
+
+            sel = ui.input_options(options)
+
+            if sel == "u":
+                sel = suggested_action
 
         if sel == "s":
             # Skip new.
@@ -197,6 +233,224 @@ class TerminalImportSession(importer.ImportSession):
             task.should_merge_duplicates = True
         else:
             assert False
+
+    def resolve_duplicate_batch(self, conflicts: list):
+        """Resolve multiple duplicate conflicts in batch mode."""
+        from beets.importer.session import DuplicateConflict
+
+        ui.print_()
+        ui.print_(
+            colorize(
+                "action_default",
+                f"=== Batch Duplicate Resolution ({len(conflicts)} conflicts) ===",
+            )
+        )
+        ui.print_()
+
+        if config["import"]["quiet"]:
+            # In quiet mode, apply suggested actions automatically
+            log.info("Quiet mode: applying suggested actions for all conflicts")
+            for conflict in conflicts:
+                self._apply_conflict_resolution(conflict, conflict.suggested_action)
+            return
+
+        # Group conflicts by similarity for better presentation
+        high_sim = [c for c in conflicts if c.similarity >= 0.9]
+        medium_sim = [c for c in conflicts if 0.7 <= c.similarity < 0.9]
+        low_sim = [c for c in conflicts if c.similarity < 0.7]
+
+        if high_sim:
+            ui.print_(
+                colorize(
+                    "text_success",
+                    f"High similarity (>= 0.9): {len(high_sim)} items",
+                )
+            )
+        if medium_sim:
+            ui.print_(
+                colorize(
+                    "text_warning",
+                    f"Medium similarity (0.7-0.9): {len(medium_sim)} items",
+                )
+            )
+        if low_sim:
+            ui.print_(
+                colorize(
+                    "text_error",
+                    f"Low similarity (< 0.7): {len(low_sim)} items",
+                )
+            )
+        ui.print_()
+
+        # Ask user for batch action strategy
+        ui.print_("Choose a batch resolution strategy:")
+        strategy = ui.input_options(
+            (
+                "Apply suggested actions",
+                "Review each conflict",
+                "Skip all new",
+                "Keep all (both versions)",
+                "Replace all old",
+                "Merge all",
+            )
+        )
+
+        if strategy == "a":
+            # Apply suggested actions based on similarity
+            ui.print_("Applying suggested actions...")
+            for conflict in conflicts:
+                self._apply_conflict_resolution(
+                    conflict, conflict.suggested_action
+                )
+
+        elif strategy == "r":
+            # Review each conflict individually
+            for i, conflict in enumerate(conflicts, 1):
+                self._review_single_conflict(conflict, i, len(conflicts))
+
+        elif strategy == "s":
+            # Skip all new
+            for conflict in conflicts:
+                self._apply_conflict_resolution(conflict, "s")
+
+        elif strategy == "k":
+            # Keep all
+            for conflict in conflicts:
+                self._apply_conflict_resolution(conflict, "k")
+
+        elif strategy == "e":
+            # Replace all old
+            for conflict in conflicts:
+                self._apply_conflict_resolution(conflict, "r")
+
+        elif strategy == "m":
+            # Merge all
+            for conflict in conflicts:
+                self._apply_conflict_resolution(conflict, "m")
+
+    def _review_single_conflict(
+        self, conflict: DuplicateConflict, index: int, total: int
+    ):
+        """Review and resolve a single conflict during batch processing."""
+        task = conflict.task
+        found_duplicates = conflict.found_duplicates
+
+        ui.print_()
+        ui.print_(
+            colorize(
+                "action_default",
+                f"--- Conflict {index}/{total} ---",
+            )
+        )
+        ui.print_(
+            f"Path: {colorize('import_path', displayable_path(task.paths))}"
+        )
+        ui.print_(
+            f"Similarity: {colorize(conflict.similarity >= 0.9 and 'text_success' or conflict.similarity >= 0.7 and 'text_warning' or 'text_error', f'{conflict.similarity:.2f}')}"
+        )
+        ui.print_(
+            f"Suggested action: {self._action_to_string(conflict.suggested_action)}"
+        )
+        ui.print_()
+
+        # Print details
+        for duplicate in found_duplicates:
+            ui.print_(
+                "Old: "
+                + summarize_items(
+                    (
+                        list(duplicate.items())
+                        if task.is_album
+                        else [duplicate]
+                    ),
+                    not task.is_album,
+                )
+            )
+            if config["import"]["duplicate_verbose_prompt"]:
+                if task.is_album:
+                    for dup in duplicate.items():
+                        print(f"  {dup}")
+                else:
+                    print(f"  {duplicate}")
+
+        ui.print_(
+            "New: "
+            + summarize_items(task.imported_items(), not task.is_album)
+        )
+        if config["import"]["duplicate_verbose_prompt"]:
+            for item in task.imported_items():
+                print(f"  {item}")
+
+        ui.print_()
+        sel = ui.input_options(
+            (
+                "Skip new",
+                "Keep all",
+                "Remove old",
+                "Merge all",
+                "Use suggested",
+                "Apply suggested to all remaining",
+            )
+        )
+
+        if sel == "u":
+            sel = conflict.suggested_action
+        elif sel == "a":
+            # Apply suggested to all remaining
+            for remaining_conflict in self.conflict_queue.pending():
+                if remaining_conflict.resolved:
+                    continue
+                self._apply_conflict_resolution(
+                    remaining_conflict, remaining_conflict.suggested_action
+                )
+            return
+
+        self._apply_conflict_resolution(conflict, sel)
+
+    def _apply_conflict_resolution(
+        self, conflict: DuplicateConflict, action: str
+    ):
+        """Apply a resolution action to a conflict."""
+        task = conflict.task
+        found_duplicates = conflict.found_duplicates
+
+        conflict.resolved = True
+        conflict.resolution = action
+
+        if action == "s":
+            task.set_choice(importer.Action.SKIP)
+            log.debug(
+                "Batch resolution: skipping {}", displayable_path(task.paths)
+            )
+        elif action == "k":
+            pass
+        elif action == "r":
+            task.should_remove_duplicates = True
+            log.debug(
+                "Batch resolution: replacing old for {}",
+                displayable_path(task.paths),
+            )
+        elif action == "m":
+            task.should_merge_duplicates = True
+            log.debug(
+                "Batch resolution: merging {}", displayable_path(task.paths)
+            )
+        else:
+            # Default to skip for unknown actions
+            task.set_choice(importer.Action.SKIP)
+
+        self.log_choice(task, True)
+
+    def _action_to_string(self, action: str) -> str:
+        """Convert action code to human-readable string."""
+        action_map = {
+            "s": "Skip new",
+            "k": "Keep both",
+            "r": "Replace old",
+            "m": "Merge",
+            "a": "Ask user",
+        }
+        return action_map.get(action, f"Unknown ({action})")
 
     def should_resume(self, path):
         return ui.input_yn(
