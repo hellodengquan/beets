@@ -2021,6 +2021,159 @@ class SimilarityCalculationTest(unittest.TestCase):
         assert _suggest_action(0.55, high_threshold=0.8, medium_threshold=0.6) == "a"
 
 
+class SimilarityBoundaryTest(unittest.TestCase):
+    """Precise boundary value tests for similarity calculations.
+
+    These tests target exact boundary conditions: 0.0, 1.0, and the
+    exact default thresholds (0.7, 0.9), plus epsilon-delta values
+    just above and below each boundary.
+    """
+
+    def test_suggest_action_exact_zero(self):
+        """Similarity exactly 0.0 should suggest 'ask'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.0) == "a"
+
+    def test_suggest_action_exact_one(self):
+        """Similarity exactly 1.0 should suggest 'remove'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(1.0) == "r"
+
+    def test_suggest_action_exact_high_threshold(self):
+        """Similarity exactly equal to high_threshold (0.9) should suggest 'remove'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.9) == "r"
+        assert _suggest_action(0.9, high_threshold=0.9) == "r"
+
+    def test_suggest_action_just_above_high_threshold(self):
+        """Similarity just above high_threshold should suggest 'remove'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.9 + 1e-9) == "r"
+        assert _suggest_action(0.90001) == "r"
+
+    def test_suggest_action_just_below_high_threshold(self):
+        """Similarity just below high_threshold should suggest 'keep'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.9 - 1e-9) == "k"
+        assert _suggest_action(0.89999) == "k"
+
+    def test_suggest_action_exact_medium_threshold(self):
+        """Similarity exactly equal to medium_threshold (0.7) should suggest 'keep'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.7) == "k"
+        assert _suggest_action(0.7, medium_threshold=0.7) == "k"
+
+    def test_suggest_action_just_above_medium_threshold(self):
+        """Similarity just above medium_threshold should suggest 'keep'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.7 + 1e-9) == "k"
+        assert _suggest_action(0.70001) == "k"
+
+    def test_suggest_action_just_below_medium_threshold(self):
+        """Similarity just below medium_threshold should suggest 'ask'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.7 - 1e-9) == "a"
+        assert _suggest_action(0.69999) == "a"
+
+    def test_suggest_action_midpoint_between_thresholds(self):
+        """Similarity exactly midway between medium and high thresholds should suggest 'keep'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.8) == "k"
+        assert _suggest_action((0.7 + 0.9) / 2) == "k"
+
+    def test_suggest_action_high_equals_medium_threshold_zero(self):
+        """Both thresholds set to 0.0: any positive similarity suggests 'remove'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.0, high_threshold=0.0, medium_threshold=0.0) == "r"
+        assert _suggest_action(0.00001, high_threshold=0.0, medium_threshold=0.0) == "r"
+        assert _suggest_action(1.0, high_threshold=0.0, medium_threshold=0.0) == "r"
+
+    def test_suggest_action_high_equals_medium_threshold_one(self):
+        """Both thresholds set to 1.0: only exact 1.0 suggests 'remove'."""
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.99999, high_threshold=1.0, medium_threshold=1.0) == "a"
+        assert _suggest_action(1.0, high_threshold=1.0, medium_threshold=1.0) == "r"
+
+    def test_suggest_action_custom_high_boundary(self):
+        """Custom high_threshold boundary values."""
+        from beets.importer.stages import _suggest_action
+
+        # Using 0.95 as high threshold
+        assert _suggest_action(0.94999, high_threshold=0.95, medium_threshold=0.7) == "k"
+        assert _suggest_action(0.95, high_threshold=0.95, medium_threshold=0.7) == "r"
+        assert _suggest_action(0.95001, high_threshold=0.95, medium_threshold=0.7) == "r"
+
+    def test_suggest_action_custom_medium_boundary(self):
+        """Custom medium_threshold boundary values."""
+        from beets.importer.stages import _suggest_action
+
+        # Using 0.8 as medium threshold
+        assert _suggest_action(0.79999, high_threshold=0.95, medium_threshold=0.8) == "a"
+        assert _suggest_action(0.8, high_threshold=0.95, medium_threshold=0.8) == "k"
+        assert _suggest_action(0.80001, high_threshold=0.95, medium_threshold=0.8) == "k"
+
+    def test_field_similarity_exact_zero_string(self):
+        """Field similarity exactly 0.0 for completely non-overlapping strings."""
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("abc", "xyz") == 0.0
+        assert _calculate_field_similarity("", "nonempty") == 0.0
+        assert _calculate_field_similarity("nonempty", "") == 0.0
+
+    def test_field_similarity_exact_one_string(self):
+        """Field similarity exactly 1.0 for identical strings."""
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("exact match", "exact match") == 1.0
+        assert _calculate_field_similarity("", "") == 1.0
+        assert _calculate_field_similarity("  padded  ", "padded") == 1.0
+        assert _calculate_field_similarity("CASE", "case") == 1.0
+
+    def test_field_similarity_exact_zero_number(self):
+        """Field similarity exactly 0.0 when one number is zero and other isn't."""
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(0, 100) == 0.0
+        assert _calculate_field_similarity(100, 0) == 0.0
+        assert _calculate_field_similarity(0, -50) == 0.0
+
+    def test_field_similarity_exact_one_number(self):
+        """Field similarity exactly 1.0 for identical numbers."""
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(0, 0) == 1.0
+        assert _calculate_field_similarity(100, 100) == 1.0
+        assert _calculate_field_similarity(3.14159, 3.14159) == 1.0
+
+    def test_field_similarity_exact_half_number(self):
+        """Field similarity exactly 0.5 when one value is half the other."""
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(50, 100) == 0.5
+        assert _calculate_field_similarity(100, 50) == 0.5
+        assert _calculate_field_similarity(25, 50) == 0.5
+
+    def test_field_similarity_exact_half_none(self):
+        """Field similarity exactly 0.5 for None values."""
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(None, None) == 0.5
+        assert _calculate_field_similarity("value", None) == 0.5
+        assert _calculate_field_similarity(None, "value") == 0.5
+        assert _calculate_field_similarity(None, 123) == 0.5
+
+
 class BatchDuplicateResolutionTest(AsIsImporterMixin, ImportTestCase):
     """Test batch duplicate resolution functionality."""
 
