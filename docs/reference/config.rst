@@ -842,6 +842,80 @@ is applied, which would, considering the default, look like this:
 
 Default: ``no``.
 
+.. _batch_duplicate_resolution:
+
+batch_duplicate_resolution
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When enabled, duplicate conflicts detected during import are collected into a
+queue instead of being resolved immediately. After the entire directory scan
+is complete, the user is presented with a batch resolution interface where
+all conflicts can be handled at once. This is especially useful for large
+imports where many duplicates are expected.
+
+In batch mode, the user can choose from several strategies:
+- Apply suggested actions based on similarity scores
+- Review each conflict individually
+- Skip all new items
+- Keep both versions for all conflicts
+- Replace all old items
+- Merge all duplicates
+
+Default: ``no``.
+
+.. _duplicate_auto_suggest:
+
+duplicate_auto_suggest
+~~~~~~~~~~~~~~~~~~~~~~
+
+Enables automatic action suggestions based on similarity calculations when
+duplicates are detected. The system compares metadata fields (title, artist,
+album, length, bitrate, etc.) between the new items and existing duplicates
+to compute a similarity score. Based on this score:
+
+- High similarity (>= :ref:`duplicate_similarity_high`): suggests removing
+  the old item (replace)
+- Medium similarity (>= :ref:`duplicate_similarity_medium`): suggests keeping
+  both items
+- Low similarity: prompts the user to decide
+
+This setting works both in immediate and batch duplicate resolution modes.
+In immediate mode, a "Use suggested" option is added to the prompt. In quiet
+mode, the suggested action is applied automatically.
+
+Default: ``yes``.
+
+.. _duplicate_similarity_high:
+
+duplicate_similarity_high
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The similarity threshold (between 0.0 and 1.0) above which the system
+considers new and existing items to be nearly identical. When similarity
+reaches this threshold, the suggested action is to remove the old item and
+replace it with the new one.
+
+This is appropriate for files that are likely different encodes or re-rips of
+the same recording, where the new version might have better quality or more
+complete metadata.
+
+Default: ``0.9``.
+
+.. _duplicate_similarity_medium:
+
+duplicate_similarity_medium
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The similarity threshold (between 0.0 and 1.0) above which items are considered
+related but not identical. The suggested action in this range is to keep both
+versions, as they may be different recordings, live versions, covers, or
+remixes that share similar metadata.
+
+Items below this threshold are considered dissimilar enough to require manual
+user decision.
+
+Default: ``0.7``.
+
 .. _bell:
 
 bell

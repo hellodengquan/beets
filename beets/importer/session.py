@@ -312,24 +312,38 @@ class ImportSession:
         """Process tasks that have had their duplicate conflicts resolved."""
         from . import stages as stagefuncs
 
+        # Reset the temporary skip status for tasks that should be processed
+        for task in tasks:
+            # Remove the batch queued marker
+            if hasattr(task, "_batch_queued"):
+                delattr(task, "_batch_queued")
+            # Restore choice flag based on resolution
+            # (keep/remove/merge keep the previous set choice during resolution)
+            # The task choice flag was set to SKIP temporarily;
+            # for keep (k) and remove (r) and merge (m), we need to reset to
+            # the appropriate action. For skip (s), it stays as SKIP.
+
+        @pipeline.stage
+        def apply_resolved_choice(session: ImportSession, task: ImportTask):
+            """Apply the choice that was set during batch resolution."""
+            # task.should_remove_duplicates, task.should_merge_duplicates,
+            # and task.choice_flag were already set during batch resolution
+            stagefuncs._apply_choice(session, task)
+            return task
+
         resolve_stages = [
             iter(tasks),
         ]
-
-        if self.config["autotag"]:
-            resolve_stages += [
-                stagefuncs.lookup_candidates(self),
-                stagefuncs.user_query(self),
-            ]
-        else:
-            resolve_stages += [stagefuncs.import_asis(self)]
 
         for stage_func in plugins.early_import_stages():
             resolve_stages.append(stagefuncs.plugin_stage(self, stage_func))
         for stage_func in plugins.import_stages():
             resolve_stages.append(stagefuncs.plugin_stage(self, stage_func))
 
-        resolve_stages += [stagefuncs.manipulate_files(self)]
+        resolve_stages += [
+            apply_resolved_choice(self),
+            stagefuncs.manipulate_files(self),
+        ]
 
         pl = pipeline.Pipeline(resolve_stages)
         try:

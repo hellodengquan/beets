@@ -417,21 +417,30 @@ class TerminalImportSession(importer.ImportSession):
         conflict.resolved = True
         conflict.resolution = action
 
+        # Remove the batch queued marker if present
+        if hasattr(task, "_batch_queued"):
+            delattr(task, "_batch_queued")
+
         if action == "s":
             task.set_choice(importer.Action.SKIP)
             log.debug(
                 "Batch resolution: skipping {}", displayable_path(task.paths)
             )
         elif action == "k":
-            pass
+            # Reset to ASIS so _apply_choice processes it
+            task.set_choice(importer.Action.ASIS)
         elif action == "r":
             task.should_remove_duplicates = True
+            # Reset to ASIS so _apply_choice processes it
+            task.set_choice(importer.Action.ASIS)
             log.debug(
                 "Batch resolution: replacing old for {}",
                 displayable_path(task.paths),
             )
         elif action == "m":
             task.should_merge_duplicates = True
+            # Reset to ASIS so _apply_choice processes it
+            task.set_choice(importer.Action.ASIS)
             log.debug(
                 "Batch resolution: merging {}", displayable_path(task.paths)
             )

@@ -691,6 +691,47 @@ class ImportSessionFixture(ImportSession):
         elif res == self.Resolution.MERGE:
             task.should_merge_duplicates = True
 
+    def resolve_duplicate_batch(self, conflicts):
+        """Resolve duplicate conflicts in batch mode for testing.
+
+        Uses the same resolution strategy as resolve_duplicate but
+        applies it to all queued conflicts at once.
+        """
+        from beets.importer.session import DuplicateConflict
+
+        for conflict in conflicts:
+            if conflict.resolved:
+                continue
+
+            try:
+                res = self._resolutions.pop(0)
+            except IndexError:
+                res = self.default_resolution
+
+            conflict.resolved = True
+
+            # Remove the batch queued marker if present
+            if hasattr(conflict.task, "_batch_queued"):
+                delattr(conflict.task, "_batch_queued")
+
+            if res == self.Resolution.SKIP:
+                conflict.resolution = "s"
+                # Keep SKIP choice
+            elif res == self.Resolution.REMOVE:
+                conflict.resolution = "r"
+                conflict.task.should_remove_duplicates = True
+                # Reset to ASIS so _apply_choice processes it
+                conflict.task.set_choice(importer.Action.ASIS)
+            elif res == self.Resolution.MERGE:
+                conflict.resolution = "m"
+                conflict.task.should_merge_duplicates = True
+                # Reset to ASIS so _apply_choice processes it
+                conflict.task.set_choice(importer.Action.ASIS)
+            elif res == self.Resolution.KEEPBOTH:
+                conflict.resolution = "k"
+                # Reset to ASIS so _apply_choice processes it
+                conflict.task.set_choice(importer.Action.ASIS)
+
 
 class TerminalImportSessionFixture(TerminalImportSession):
     def __init__(self, *args, **kwargs):

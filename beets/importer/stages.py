@@ -207,6 +207,10 @@ def user_query(session: ImportSession, task: ImportTask):
                     "Task {} queued for batch duplicate resolution",
                     displayable_path(task.paths),
                 )
+                # Mark task as skipped temporarily to avoid passing
+                # it through manipulate_files before batch resolution
+                task._batch_queued = True
+                task.set_choice(Action.SKIP)
                 return task
 
     if task.should_merge_duplicates:
@@ -259,6 +263,10 @@ def import_asis(session: ImportSession, task: ImportTask):
                     "Task {} queued for batch duplicate resolution",
                     displayable_path(task.paths),
                 )
+                # Mark task as skipped temporarily to avoid passing
+                # it through manipulate_files before batch resolution
+                task._batch_queued = True
+                task.set_choice(Action.SKIP)
                 return
 
     _apply_choice(session, task)

@@ -149,6 +149,22 @@ Optional command flags:
 
     beet import --set genres="Alternative Rock" --set mood="emotional"
 
+- When importing large collections with many potential duplicates, use the
+  ``-B`` (``--batch-duplicates``) flag to collect all duplicate conflicts
+  during the initial scan and resolve them in one batch at the end. This
+  avoids interrupting the import flow for each duplicate. The opposite is
+  ``--no-batch-duplicates``, which resolves conflicts immediately as they
+  are found (the default behavior).
+- Adjust the similarity thresholds used for suggesting duplicate actions
+  with ``--duplicate-similarity-high FLOAT`` and
+  ``--duplicate-similarity-medium FLOAT``. The high threshold (default 0.9)
+  suggests replacing old items when files are nearly identical, while the
+  medium threshold (default 0.7) suggests keeping both versions when files
+  are related but distinct.
+- Disable the automatic suggestion of duplicate actions based on similarity
+  by using ``--no-duplicate-auto-suggest``. This is useful if you prefer
+  to manually evaluate every duplicate without pre-filled recommendations.
+
 .. _py7zr: https://pypi.org/project/py7zr/
 
 .. _rarfile: https://pypi.org/project/rarfile/

@@ -1920,3 +1920,285 @@ class MpeglayerWavImportTest(AsIsImporterMixin, ImportTestCase):
 
         self.run_asis_importer()
         assert os.path.exists(dest)
+
+
+class SimilarityCalculationTest(unittest.TestCase):
+    """Unit tests for similarity calculation functions."""
+
+    def test_field_similarity_identical_strings(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("hello", "hello") == 1.0
+        assert _calculate_field_similarity("Same Song", "Same Song") == 1.0
+
+    def test_field_similarity_completely_different_strings(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("abc", "xyz") == 0.0
+        assert _calculate_field_similarity("Totally Different", "Hello World") < 0.5
+
+    def test_field_similarity_none_values(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(None, None) == 0.5
+        assert _calculate_field_similarity("value", None) == 0.5
+        assert _calculate_field_similarity(None, "value") == 0.5
+
+    def test_field_similarity_empty_strings(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("", "") == 1.0
+        assert _calculate_field_similarity("test", "") == 0.0
+        assert _calculate_field_similarity("", "test") == 0.0
+
+    def test_field_similarity_case_insensitive(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("HELLO", "hello") == 1.0
+        assert _calculate_field_similarity("MiXeD", "mixed") == 1.0
+
+    def test_field_similarity_identical_numbers(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(100, 100) == 1.0
+        assert _calculate_field_similarity(0, 0) == 1.0
+        assert _calculate_field_similarity(0.5, 0.5) == 1.0
+
+    def test_field_similarity_zero_numbers(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(0, 100) == 0.0
+        assert _calculate_field_similarity(100, 0) == 0.0
+
+    def test_field_similarity_different_numbers(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity(50, 100) == 0.5
+        assert _calculate_field_similarity(100, 150) > 0.6
+
+    def test_field_similarity_whitespace(self):
+        from beets.importer.stages import _calculate_field_similarity
+
+        assert _calculate_field_similarity("  hello  ", "hello") == 1.0
+        assert _calculate_field_similarity("song title", "song  title") > 0.9
+
+    def test_suggest_action_high_similarity(self):
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(1.0) == "r"
+        assert _suggest_action(0.95) == "r"
+        assert _suggest_action(0.9) == "r"
+        assert _suggest_action(0.9, high_threshold=0.95) == "k"
+
+    def test_suggest_action_medium_similarity(self):
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.85) == "k"
+        assert _suggest_action(0.7) == "k"
+        assert _suggest_action(0.75) == "k"
+        assert _suggest_action(0.7, medium_threshold=0.75) == "a"
+
+    def test_suggest_action_low_similarity(self):
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.0) == "a"
+        assert _suggest_action(0.5) == "a"
+        assert _suggest_action(0.69) == "a"
+        assert _suggest_action(0.69) == "a"
+
+    def test_suggest_action_boundary_conditions(self):
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.0, high_threshold=0.0) == "r"
+        assert _suggest_action(1.0, medium_threshold=1.0) == "r"
+        assert _suggest_action(0.5, high_threshold=0.5, medium_threshold=0.5) == "r"
+
+    def test_suggest_action_custom_thresholds(self):
+        from beets.importer.stages import _suggest_action
+
+        assert _suggest_action(0.95, high_threshold=0.8, medium_threshold=0.6) == "r"
+        assert _suggest_action(0.75, high_threshold=0.8, medium_threshold=0.6) == "k"
+        assert _suggest_action(0.55, high_threshold=0.8, medium_threshold=0.6) == "a"
+
+
+class BatchDuplicateResolutionTest(AsIsImporterMixin, ImportTestCase):
+    """Test batch duplicate resolution functionality."""
+
+    def add_album_fixture(self, **kwargs):
+        album = super().add_album_fixture()
+        album.update(kwargs)
+        album.store()
+        for item in album.items():
+            item.update(kwargs)
+            item.store()
+        return album
+
+    def setUp(self):
+        super().setUp()
+        self.add_album_fixture(albumartist="artist", album="album")
+        self.prepare_album_for_import(1)
+
+        config["import"]["batch_duplicate_resolution"] = True
+        config["import"]["autotag"] = False
+
+        self.importer = self.setup_importer(
+            duplicate_keys={"album": "albumartist album"},
+            autotag=False,
+        )
+
+    def test_batch_mode_queues_duplicates(self):
+        from beets.importer.session import DuplicateConflict
+
+        album = self.lib.albums().get()
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = album.albumartist
+        import_file_obj.albumartist = album.albumartist
+        import_file_obj.album = album.album
+        import_file_obj.title = "new title"
+        import_file_obj.save()
+
+        self.importer.default_resolution = self.importer.Resolution.REMOVE
+        self.importer.run()
+
+        assert len(self.importer.conflict_queue) > 0
+        for conflict in self.importer.conflict_queue:
+            assert isinstance(conflict, DuplicateConflict)
+            assert conflict.resolved
+            assert hasattr(conflict, "similarity")
+            assert 0.0 <= conflict.similarity <= 1.0
+
+    def test_batch_suggested_action_populated(self):
+        album = self.lib.albums().get()
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = album.albumartist
+        import_file_obj.albumartist = album.albumartist
+        import_file_obj.album = album.album
+        import_file_obj.title = "new title"
+        import_file_obj.save()
+
+        self.importer.run()
+
+        for conflict in self.importer.conflict_queue:
+            assert conflict.suggested_action in ("s", "k", "r", "m", "a")
+            assert hasattr(conflict, "found_duplicates")
+            assert len(conflict.found_duplicates) > 0
+
+    def test_batch_duplicate_similarity_calculated(self):
+        album = self.lib.albums().get()
+        item = self.lib.items().get()
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = album.albumartist
+        import_file_obj.albumartist = album.albumartist
+        import_file_obj.album = album.album
+        import_file_obj.title = item.title
+        import_file_obj.track = item.track
+        try:
+            import_file_obj.year = item.year
+        except Exception:
+            pass
+        import_file_obj.save()
+
+        self.importer.run()
+
+        for conflict in self.importer.conflict_queue:
+            assert conflict.similarity >= 0.8
+
+    def test_batch_similarity_low_for_different_metadata(self):
+        album = self.lib.albums().get()
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = "Completely Different Artist"
+        import_file_obj.albumartist = "Completely Different Artist"
+        import_file_obj.album = "Totally Different Album"
+        import_file_obj.title = "Unrelated Song Title"
+        import_file_obj.save()
+
+        self.importer.run()
+
+        for conflict in self.importer.conflict_queue:
+            assert conflict.similarity < 0.8
+
+    def test_batch_queue_resolve_skip_all(self):
+        album = self.lib.albums().get()
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = album.albumartist
+        import_file_obj.albumartist = album.albumartist
+        import_file_obj.album = album.album
+        import_file_obj.title = "new title"
+        import_file_obj.save()
+
+        self.importer.default_resolution = self.importer.Resolution.SKIP
+        self.importer.run()
+
+        conflicts = list(self.importer.conflict_queue)
+        assert len(conflicts) > 0
+        assert all(c.resolved for c in conflicts)
+        assert all(c.resolution == "s" for c in conflicts)
+        assert len(self.lib.albums()) == 1
+
+    def test_batch_queue_resolve_remove_old(self):
+        album = self.lib.albums().get()
+        item = self.lib.items().get()
+        old_path = item.filepath
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = album.albumartist
+        import_file_obj.albumartist = album.albumartist
+        import_file_obj.album = album.album
+        import_file_obj.title = "new title"
+        import_file_obj.save()
+
+        self.importer.default_resolution = self.importer.Resolution.REMOVE
+        self.importer.run()
+
+        conflicts = list(self.importer.conflict_queue)
+        assert len(conflicts) > 0
+        assert all(c.resolved for c in conflicts)
+        assert all(c.resolution == "r" for c in conflicts)
+        assert not old_path.exists()
+        assert len(self.lib.albums()) == 1
+
+    def test_batch_queue_resolve_keep_both(self):
+        album = self.lib.albums().get()
+
+        import_file = os.path.join(
+            self.importer.paths[0], b"album", b"track_1.mp3"
+        )
+        import_file_obj = MediaFile(import_file)
+        import_file_obj.artist = album.albumartist
+        import_file_obj.albumartist = album.albumartist
+        import_file_obj.album = album.album
+        import_file_obj.title = "new title"
+        import_file_obj.save()
+
+        self.importer.default_resolution = self.importer.Resolution.KEEPBOTH
+        self.importer.run()
+
+        conflicts = list(self.importer.conflict_queue)
+        assert len(conflicts) > 0
+        assert all(c.resolved for c in conflicts)
+        assert all(c.resolution == "k" for c in conflicts)
+        assert len(self.lib.albums()) == 2
+        assert len(self.lib.items()) == 2
